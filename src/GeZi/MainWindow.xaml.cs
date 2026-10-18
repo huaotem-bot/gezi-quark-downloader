@@ -657,7 +657,7 @@ namespace GeZi
                     return;
                 }
 
-                double speed = active.Sum(t => t.Speed);
+                double speed = active.Where(t => string.IsNullOrEmpty(t.Phase)).Sum(t => t.Speed);
                 long done = active.Sum(t => t.Done);
                 long total = active.Sum(t => t.Total);
                 int running = active.Count(t => t.State == JobState.Downloading);

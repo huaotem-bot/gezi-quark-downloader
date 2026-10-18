@@ -100,7 +100,7 @@ namespace GeZi
                 return;
             }
 
-            double speed = active.Sum(t => t.Speed);          // 字节/秒
+            double speed = active.Where(t => string.IsNullOrEmpty(t.Phase)).Sum(t => t.Speed); // 仅下载吞吐，不计本地合并
             TotalSpeedText.Text = speed > 0 ? Util.FormatSize((long)speed) + "/s" : "0 B/s";
         }
 
