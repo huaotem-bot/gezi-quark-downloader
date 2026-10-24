@@ -1,15 +1,15 @@
-﻿// GeZi —— 夸克网盘下载器 (Quark netdisk downloader)
+// GeZi —— 多网盘下载器 (Multi-cloud downloader)
 // Copyright (C) 2026  Yi Yuan
 // This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
+// it under the terms of the GNU Affero General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 // This program is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU General Public License for more details.
-// You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+// GNU Affero General Public License for more details.
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/agpl-3.0>.
 
 using System;
 using System.Collections.Generic;
@@ -99,7 +99,7 @@ namespace GeZi.Core.Api
         /// 而不是假装还在等待 —— 免得下次接口又加新状态码时用户又看到"卡住"。
         /// </summary>
         public async Task<QrPollResult> PollForTicketWithStatusAsync(
-            string token, int timeoutSeconds = 300,
+            string token, int timeoutSeconds = 180,
             IProgress<QrPollResult> onState = null,
             CancellationToken cancel = default)
         {
@@ -108,15 +108,20 @@ namespace GeZi.Core.Api
             while (DateTime.UtcNow < deadline)
             {
                 cancel.ThrowIfCancellationRequested();
-                await Task.Delay(1200, cancel).ConfigureAwait(false);
+                // 与官方网页版一致：2 秒一轮（官网 setInterval(..., 2e3)）。
+                // 原来用 1200ms，比官网密 40%，除了多打请求没有任何收益。
+                await Task.Delay(2000, cancel).ConfigureAwait(false);
 
                 long status = -1;
                 string message = null;
                 string ticket = null;
                 try
                 {
-                    string url = QuarkConstants.QrLoginGetTicket + "?client_id=532&v=1.2&token="
-                        + Uri.EscapeDataString(token) + "&request_id=" + Guid.NewGuid().ToString("N");
+                    // 与官方一致：**只传 token**（官网 queryLoginSt 的 params 就只有一个 token）。
+                    // 早先还带了 client_id / v / request_id，官方并不需要，去掉可少一层
+                    // 「参数是否被服务端当成不同客户端」的变量。
+                    string url = QuarkConstants.QrLoginGetTicket + "?token="
+                        + Uri.EscapeDataString(token);
                     var res = await GetJsonAsync(url).ConfigureAwait(false);
                     status = AsLong(Get(AsDict(res), "status"));
                     message = AsString(Get(AsDict(res), "message"));

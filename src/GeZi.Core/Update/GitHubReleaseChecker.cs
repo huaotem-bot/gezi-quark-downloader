@@ -1,15 +1,15 @@
-﻿// GeZi —— 夸克网盘下载器 (Quark netdisk downloader)
+﻿// GeZi —— 多网盘下载器 (Multi-cloud downloader)
 // Copyright (C) 2026  Yi Yuan
 // This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
+// it under the terms of the GNU Affero General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 // This program is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU General Public License for more details.
-// You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+// GNU Affero General Public License for more details.
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/agpl-3.0>.
 
 using System;
 using System.Collections.Generic;
@@ -158,19 +158,19 @@ namespace GeZi.Core.Update
         [DataContract]
         internal sealed class ReleaseDto
         {
-            [DataMember(Name = "tag_name")] public string tag_name;
-            [DataMember(Name = "name")] public string name;
-            [DataMember(Name = "body")] public string body;
-            [DataMember(Name = "html_url")] public string html_url;
-            [DataMember(Name = "published_at")] public string published_at;
-            [DataMember(Name = "assets")] public List<AssetDto> assets;
+            [DataMember(Name = "tag_name")] public string tag_name = null;
+            [DataMember(Name = "name")] public string name = null;
+            [DataMember(Name = "body")] public string body = null;
+            [DataMember(Name = "html_url")] public string html_url = null;
+            [DataMember(Name = "published_at")] public string published_at = null;
+            [DataMember(Name = "assets")] public List<AssetDto> assets = null;
         }
 
         [DataContract]
         internal sealed class AssetDto
         {
-            [DataMember(Name = "name")] public string name;
-            [DataMember(Name = "size")] public long size;
+            [DataMember(Name = "name")] public string name = null;
+            [DataMember(Name = "size")] public long size = 0;
         }
     }
 }

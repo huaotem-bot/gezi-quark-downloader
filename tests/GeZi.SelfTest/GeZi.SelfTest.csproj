@@ -1,0 +1,32 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    零 NuGet 的自测宿主。
+    项目约定「clone 下来直接 build、不联网还原」，所以不引入 xUnit/NUnit，
+    而是用控制台断言 + 退出码：0 = 全过，1 = 有失败。
+    CI 与本地都用 dotnet run 指向 tests/GeZi.SelfTest 驱动。
+  -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net48</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>disable</Nullable>
+    <AssemblyName>GeZi.SelfTest</AssemblyName>
+    <RootNamespace>GeZi.SelfTest</RootNamespace>
+    <PlatformTarget>x64</PlatformTarget>
+    <Prefer32Bit>false</Prefer32Bit>
+    <!-- 测试进程不写自己的 PDB 路径，避免把本机用户名带进产物。 -->
+    <PathMap>$(MSBuildProjectDirectory)=/_/</PathMap>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\GeZi.Core\GeZi.Core.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- 自测要拆开诊断包 zip 校验条目 -->
+    <Reference Include="System.IO.Compression" />
+    <Reference Include="System.IO.Compression.FileSystem" />
+  </ItemGroup>
+
+</Project>

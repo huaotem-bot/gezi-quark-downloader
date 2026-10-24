@@ -1,15 +1,15 @@
-﻿// GeZi —— 夸克网盘下载器 (Quark netdisk downloader)
+// GeZi —— 多网盘下载器 (Multi-cloud downloader)
 // Copyright (C) 2026  Yi Yuan
 // This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
+// it under the terms of the GNU Affero General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 // This program is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU General Public License for more details.
-// You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+// GNU Affero General Public License for more details.
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/agpl-3.0>.
 
 namespace GeZi.Core.Support
 {
@@ -18,6 +18,14 @@ namespace GeZi.Core.Support
     {
         public const string ApiBase = "https://drive-pc.quark.cn";
         public const string AccountUrl = "https://pan.quark.cn/account/info";
+
+        /// <summary>
+        /// 会话刷新接口：去掉 <c>__puus</c> 请求它，服务端会在 <c>Set-Cookie</c>
+        /// 里重新下发新鲜的 <c>__puus</c>。与 UC 的
+        /// <see cref="UcConstants.ConfigUrl"/> 同款机制（见 YunX
+        /// <c>QuarkApi.refreshPuus</c>）。
+        /// </summary>
+        public const string ConfigUrl = "https://drive-pc.quark.cn/1/clouddrive/config?pr=ucpro&fr=pc";
         public const string Referer = "https://pan.quark.cn/";
         public const string Origin = "https://pan.quark.cn";
 

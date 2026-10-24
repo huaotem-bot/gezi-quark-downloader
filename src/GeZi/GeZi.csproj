@@ -1,4 +1,4 @@
-﻿<Project Sdk="Microsoft.NET.Sdk.WindowsDesktop">
+<Project Sdk="Microsoft.NET.Sdk.WindowsDesktop">
 
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
@@ -9,9 +9,26 @@
     <Nullable>disable</Nullable>
     <AssemblyName>GeZi</AssemblyName>
     <RootNamespace>GeZi</RootNamespace>
+    <!--
+      ⚠️ 必须显式指定 x64（2026-10 修复）。
+
+      改前：没写 PlatformTarget → 默认 AnyCPU + Prefer32Bit=true
+            → 在 64 位系统上**实际以 32 位进程运行**。
+      后果：引入 WebView2 后，x64 的 WebView2Loader.dll 无法被 32 位进程加载，
+            点「内嵌登录」直接报 HRESULT 0x8007000B（ERROR_BAD_FORMAT，"格式不正确"）。
+            这个错误信息完全指不出"位数不匹配"，极难定位。
+
+      为什么现在才暴露：项目此前只依赖托管程序集与 OpenSSL 的 x64 DLL
+      （OpenSSL 那套是通过 P/Invoke 按需加载，32 位进程加载 x64 DLL 也会失败，
+       但只有扫码登录路径才会触发，所以一直没被发现）。
+
+      同时必须保证 GeZi.Core 与自测工程也是 x64 —— 混用会导致同样的加载失败。
+    -->
+    <PlatformTarget>x64</PlatformTarget>
+    <Prefer32Bit>false</Prefer32Bit>
     <Product>鸽子下载</Product>
     <AssemblyTitle>鸽子下载</AssemblyTitle>
-    <Version>2.3.1</Version>
+    <Version>2.4.0</Version>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <StartupObject>GeZi.App</StartupObject>
     <!-- 应用图标：exe 文件图标 + 任务栏/Alt-Tab 图标。
@@ -40,6 +57,43 @@
   <ItemGroup>
     <ProjectReference Include="..\GeZi.Core\GeZi.Core.csproj" />
   </ItemGroup>
+
+  <ItemGroup>
+    <!--
+      ⚠️ 本项目**唯一**的 NuGet 依赖（2026-10 引入，用于多网盘内嵌登录）。
+
+      为什么必须引：
+        UC/阿里/迅雷没有可用的扫码登录接口，官方客户端与同类开源项目
+        （YunX、wenxi 的 Windows 版）一律用「内嵌浏览器打开登录页 → 读 Cookie」。
+        Windows 上能做这件事的只有 WebView2；WPF 自带的 WebBrowser 是 IE 内核，
+        实测打开 drive.uc.cn 会被跳转到 /u/upgrade「浏览器升级」页，根本登不上。
+
+      体积代价：托管 DLL 共 +0.87 MB 解压后 / +0.26 MB 压缩后。
+
+      运行时依赖：需要机器上有 WebView2 Runtime。
+        - Windows 11：系统预装
+        - Windows 10：绝大多数已有（Edge 会顺带装）
+        - 缺失时本程序**不会崩**：内嵌登录入口置灰并提示安装，
+          手动粘贴 Cookie 的通道始终可用（见 WebView2Runtime 检测）。
+    -->
+    <PackageReference Include="Microsoft.Web.WebView2" Version="1.0.3351.48" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- 只保留真正需要的 WebView2 文件：
+         · WinForms 版 —— 本项目用 WPF 控件，不需要
+         ⚠️ **不要删 runtimes/ 下的 loader**：WebView2 按进程位数挑 loader，
+            删掉对应架构的那份会让程序报 HRESULT 0x8007000B（"格式不正确"）。
+            本项曾误删 x86 目录、而主程序当时恰好是 32 位进程，导致内嵌登录直接崩溃。 -->
+    <Reference Remove="Microsoft.Web.WebView2.WinForms" />
+  </ItemGroup>
+
+  <Target Name="TrimWebView2Payload" AfterTargets="Build">
+    <ItemGroup>
+      <_Wv2Junk Include="$(OutputPath)Microsoft.Web.WebView2.WinForms.dll" />
+    </ItemGroup>
+    <Delete Files="@(_Wv2Junk)" ContinueOnError="true" />
+  </Target>
 
   <ItemGroup>
     <!-- 零 NuGet：JSON 用框架自带的 DataContractJsonSerializer（历史记录/未完成任务持久化）。

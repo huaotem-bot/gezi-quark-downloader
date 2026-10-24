@@ -1,15 +1,15 @@
-﻿// GeZi —— 夸克网盘下载器 (Quark netdisk downloader)
+// GeZi —— 多网盘下载器 (Multi-cloud downloader)
 // Copyright (C) 2026  Yi Yuan
 // This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
+// it under the terms of the GNU Affero General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 // This program is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU General Public License for more details.
-// You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+// GNU Affero General Public License for more details.
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/agpl-3.0>.
 
 using System;
 using System.Collections.Generic;
@@ -17,6 +17,7 @@ using System.IO;
 using System.Runtime.Serialization;
 using System.Runtime.Serialization.Json;
 using System.Text;
+using GeZi.Core.Support;
 
 namespace GeZi
 {
@@ -127,6 +128,9 @@ namespace GeZi
                             if (s.Records == null) s.Records = new List<HistoryRecord>();
                             if (s.Pending == null) s.Pending = new List<PendingTask>();
                             if (s.Shares == null) s.Shares = new List<ShareHistoryEntry>();
+                            // 状态文件里存的 Url/Token/Stoken/Passcode 是 DPAPI 密文；
+                            // 内存中恢复成明文，UI 与续传逻辑无需感知加密细节。
+                            DecryptSecrets(s);
                             return s;
                         }
                     }
@@ -143,20 +147,128 @@ namespace GeZi
 
         private static void Save(State s)
         {
+            string tmp = null;
+            Action restore = null;
             try
             {
                 string path = StatePath;
-                string tmp = path + ".tmp";
-                // 原子写：先写临时文件再替换，避免写一半留下半截 JSON 导致下次读崩。
-                using (var fs = File.Create(tmp))
+                // 唯一临时文件 + Flush(true) + 一次 Replace：
+                // 旧实现“删原文件再 Move”，删除与移动之间断电会同时丢掉旧记录和新记录。
+                tmp = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
+                // 落盘前把敏感字段临时换成密文；finally 里立刻恢复内存明文。
+                restore = EncryptSecrets(s);
+                using (var fs = new FileStream(tmp, FileMode.CreateNew, FileAccess.Write, FileShare.None))
                 {
                     var ser = new DataContractJsonSerializer(typeof(State));
                     ser.WriteObject(fs, s);
+                    fs.Flush(true);
                 }
-                if (File.Exists(path)) File.Delete(path);
-                File.Move(tmp, path);
+                if (File.Exists(path))
+                    File.Replace(tmp, path, null);
+                else
+                    File.Move(tmp, path);
             }
-            catch { }
+            catch
+            {
+                try { if (!string.IsNullOrEmpty(tmp)) File.Delete(tmp); } catch { }
+            }
+            finally
+            {
+                if (restore != null)
+                {
+                    try { restore(); } catch { }
+                }
+            }
+        }
+
+        // ---------------- 敏感字段加解密 ----------------
+        //
+        // 状态文件里 Url/Token/Stoken/Passcode 是可以直接换链的凭证，等价于密码；
+        // 用与 Cookie 相同的 DPAPI（CurrentUser）加密。内存中保持明文，
+        // 只在序列化那一刻临时替换，序列化结束立即还原。
+
+        /// <summary>把密文字段解回明文。旧版明文（无 enc: 前缀）原样保留。</summary>
+        private static void DecryptSecrets(State s)
+        {
+            if (s == null) return;
+            if (s.Pending != null)
+            {
+                foreach (var p in s.Pending)
+                {
+                    if (p == null) continue;
+                    p.Url = SecretProtector.UnprotectField(p.Url);
+                    p.Token = SecretProtector.UnprotectField(p.Token);
+                    p.Stoken = SecretProtector.UnprotectField(p.Stoken);
+                    p.Passcode = SecretProtector.UnprotectField(p.Passcode);
+                }
+            }
+            if (s.Shares != null)
+            {
+                foreach (var h in s.Shares)
+                {
+                    if (h == null) continue;
+                    h.Passcode = SecretProtector.UnprotectField(h.Passcode);
+                }
+            }
+        }
+
+        /// <summary>
+        /// 把敏感字段临时加密，返回“还原内存明文”的动作。
+        /// 加密失败时字段置空 —— fail-closed：宁可不保存这条记录，也不落明文。
+        /// </summary>
+        private static Action EncryptSecrets(State s)
+        {
+            var restore = new List<Action>();
+            if (s == null)
+                return () => { };
+
+            if (s.Pending != null)
+            {
+                foreach (var p in s.Pending)
+                {
+                    if (p == null) continue;
+                    var item = p;
+                    string url = item.Url, token = item.Token, stoken = item.Stoken, passcode = item.Passcode;
+                    restore.Add(() =>
+                    {
+                        item.Url = url;
+                        item.Token = token;
+                        item.Stoken = stoken;
+                        item.Passcode = passcode;
+                    });
+                    item.Url = SecureField(url);
+                    item.Token = SecureField(token);
+                    item.Stoken = SecureField(stoken);
+                    item.Passcode = SecureField(passcode);
+                }
+            }
+
+            if (s.Shares != null)
+            {
+                foreach (var h in s.Shares)
+                {
+                    if (h == null) continue;
+                    var item = h;
+                    string passcode = item.Passcode;
+                    restore.Add(() => { item.Passcode = passcode; });
+                    item.Passcode = SecureField(passcode);
+                }
+            }
+
+            return () =>
+            {
+                foreach (var r in restore)
+                {
+                    try { r(); } catch { }
+                }
+            };
+        }
+
+        private static string SecureField(string plain)
+        {
+            if (string.IsNullOrEmpty(plain)) return plain;
+            try { return SecretProtector.ProtectField(plain); }
+            catch { return ""; }   // DPAPI 不可用 → 不写明文
         }
 
         // ---------------- 历史记录 ----------------
@@ -366,8 +478,20 @@ namespace GeZi
         /// </summary>
         [DataMember(Order = 16)] public string ShareRelDir { get; set; }
 
+        /// <summary>内容哈希；重启后续传仍用同一组期望值校验。</summary>
+        [DataMember(Order = 17)] public string Md5 { get; set; }
+        [DataMember(Order = 18)] public string Sha1 { get; set; }
+        [DataMember(Order = 19)] public string Sha256 { get; set; }
+
         /// <summary>写入模式是否为"边下边播"（独立分片+边合并）。</summary>
         [DataMember(Order = 14)] public bool StreamPlayMode { get; set; }
+
+        /// <summary>
+        /// 该任务来自哪个网盘。旧记录没有这个字段 → 反序列化得到 0 = 夸克，
+        /// 正好是历史数据的真实来源，所以天然向后兼容。
+        /// <para>续传时据此决定用哪个客户端重取直链，避免拿夸克客户端去请求 UC/阿里/迅雷。</para>
+        /// </summary>
+        [DataMember(Order = 20)] public int PanKindValue { get; set; }
 
         /// <summary>
         /// 是否具备"可自动重取链"的完整信息。

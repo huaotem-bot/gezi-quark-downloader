@@ -16,12 +16,20 @@ cookie*.txt
 .claude/
 .cursor/
 
-# ---------- 本地开发文档 ----------
-docs/
+# ---------- 本地开发文档（正式文档单独放行） ----------
+docs/*
+!docs/TESTING.md
+!docs/RELEASE-CHECKLIST.md
+!docs/OPTIMIZATION-STATUS.md
+!docs/MULTI-PAN.md
 AGENTS.md
 
 # ---------- 根目录临时脚本（实际源码在 src/ 下，不受影响） ----------
 /*.py
+
+# ---------- 发布打包与自测临时产物 ----------
+artifacts/
+gezi-selftest-*/
 
 # ---------- 构建产物 ----------
 bin/

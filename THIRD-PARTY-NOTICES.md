@@ -3,10 +3,10 @@
 **鸽子下载（GeZi）** 在开发与分发过程中使用了以下第三方开源组件。
 本文件汇总各组件的来源、版本、许可证，并附上许可证全文（见文末附录）。
 
-> 本项目的自有代码以 **GNU General Public License v3.0**（见根目录 `LICENSE`）发布，
+> 本项目的自有代码以 **GNU Affero General Public License v3.0**（见根目录 `LICENSE`）发布，
 > 版权归 **Yi Yuan** 所有（Copyright (C) 2026 Yi Yuan）。
-> 下列第三方组件的许可证均与 GPL-3.0 **兼容**（Apache-2.0 是宽松许可，
-> 允许被 GPL-3.0 项目包含）。
+> 下列第三方组件的许可证均与 AGPL-3.0 **兼容**（Apache-2.0 是宽松许可，
+> 允许被 AGPL-3.0 项目包含）。
 
 ---
 
@@ -18,6 +18,12 @@
 | [OpenSSL](#3-openssl) | 3.5.7 | Apache-2.0 | 扫码登录 / 账号信息通道（P/Invoke） | `src/GeZi.Core/lib/OpenSSL/libssl-3-x64.dll`、`libcrypto-3-x64.dll` |
 | [.NET Framework](#4-microsoft-组件) | 4.8 | 微软系统组件 | 应用运行时 | 目标框架（用户系统自带） |
 | [Microsoft VC++ 运行时](#4-microsoft-组件) | 14.x | 微软可再分发条款 | OpenSSL 的 C 运行时 | `src/GeZi.Core/lib/OpenSSL/vcruntime140*.dll` |
+| [Microsoft.Web.WebView2](#5-microsoftwebwebview2) | 1.0.3351.48 | MIT | 多网盘内嵌登录（UC 等） | `Microsoft.Web.WebView2.Core.dll`、`Microsoft.Web.WebView2.Wpf.dll`、`WebView2Loader.dll`（**不含 Runtime**） |
+
+> ⚠️ **本项目不再是「零 NuGet 依赖」**：2026-10 引入 `Microsoft.Web.WebView2`（唯一的 NuGet 包），
+> 用于多网盘内嵌登录。构建需要能还原该包。
+> 运行时侧不打包：机器上没有 WebView2 Runtime 时，内嵌登录入口会自动降级，
+> 手动粘贴凭证的通道始终可用 —— 程序不会因此无法启动。
 
 ---
 
@@ -295,3 +301,28 @@
 
 
 ---
+
+---
+
+## 5. Microsoft.Web.WebView2
+
+- **许可证**：MIT
+- **版本**：1.0.3351.48
+- **项目地址**：<https://github.com/MicrosoftEdge/WebView2Samples>
+- **NuGet**：<https://www.nuget.org/packages/Microsoft.Web.WebView2>
+- **用途**：多网盘内嵌登录（在程序内打开官方登录页，读取 Cookie）
+
+**分发内容**：仅托管程序集与加载器
+
+| 文件 | 说明 |
+|---|---|
+| `Microsoft.Web.WebView2.Core.dll` | 核心托管 API |
+| `Microsoft.Web.WebView2.Wpf.dll` | WPF 控件封装 |
+| `WebView2Loader.dll` | 原生加载器（x64） |
+
+**不包含**：WebView2 Runtime 本体（由微软随 Edge / Windows 分发，用户系统自带或另行安装）。
+本项目在运行时检测其存在性；缺失时自动降级为「手动粘贴凭证」，不影响其他功能。
+
+> 本项目**未修改** WebView2 的源代码，仅以二进制程序集形式引用。
+
+**MIT 许可证要点**：允许商业使用、修改、分发，需保留版权声明与许可声明。

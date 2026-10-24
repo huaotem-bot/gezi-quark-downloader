@@ -1,18 +1,18 @@
-// GeZi —— 夸克网盘下载器 (Quark netdisk downloader)
+// GeZi —— 多网盘下载器 (Multi-cloud downloader)
 // Copyright (C) 2026  Yi Yuan
 //
 // This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
+// it under the terms of the GNU Affero General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 //
 // This program is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU General Public License for more details.
+// GNU Affero General Public License for more details.
 //
-// You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/agpl-3.0>.
 
 using System;
 using System.Collections.Generic;
@@ -21,6 +21,7 @@ using System.Net.Http;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
+using GeZi.Core.Api;
 
 namespace GeZi.Core.Support
 {
@@ -52,8 +53,21 @@ namespace GeZi.Core.Support
 
         public HttpClient Http => _http;
 
+        /// <summary>
+        /// 这个会话服务的网盘。夸克与 UC 共用同一套 ucpro 协议，
+        /// 差别只在域名、UA 与 Cookie 域 —— 用 Kind 一次性切换，
+        /// 避免复制两份几乎相同的 HTTP 底座（Cookie 解析、节流、退避重试都只有一份）。
+        /// </summary>
+        public PanKind Kind { get; private set; }
+
         public QuarkSession(string cookie = null, DecompressionMethods decompression = DecompressionMethods.None)
+            : this(cookie, decompression, PanKind.Quark)
         {
+        }
+
+        public QuarkSession(string cookie, DecompressionMethods decompression, PanKind kind)
+        {
+            Kind = kind;
             _jar = new CookieContainer { Capacity = 500, PerDomainCapacity = 200 };
             if (!string.IsNullOrEmpty(cookie))
                 SeedCookies(cookie);
@@ -82,12 +96,35 @@ namespace GeZi.Core.Support
 
         // ---------------- Cookie ----------------
 
-        private static readonly string[] CookieDomains =
+        // 夸克与 UC 的 Cookie 域互不重叠：夸克登录态在 .quark.cn，
+        // UC 登录态在 .uc.cn（两者用同一个 Cookie 名 __puus，但值不同、不能混用）。
+        private static readonly string[] QuarkCookieDomains =
         {
             "https://pan.quark.cn", "https://drive-pc.quark.cn", "https://drive-m.quark.cn",
             "https://drive.quark.cn", "https://drive-h.quark.cn", "https://uop.quark.cn",
             "https://su.quark.cn", "https://quark.cn",
         };
+
+        private static readonly string[] UcCookieDomains =
+        {
+            // 网页前端
+            "https://drive.uc.cn", "https://fast.uc.cn", "https://pc.uc.cn",
+            "https://uc.cn", "https://www.uc.cn",
+            // API 主机（实测：UC 的业务接口在 pc-api.uc.cn 上）
+            "https://pc-api.uc.cn",
+        };
+
+        /// <summary>当前网盘对应的 Cookie 域集合。</summary>
+        private string[] CookieDomains
+        {
+            get { return Kind == PanKind.Uc ? UcCookieDomains : QuarkCookieDomains; }
+        }
+
+        /// <summary>写入 Cookie 时用的域后缀。</summary>
+        private string CookieDomainSuffix
+        {
+            get { return Kind == PanKind.Uc ? ".uc.cn" : ".quark.cn"; }
+        }
 
         public static Dictionary<string, string> ParseCookies(string s)
         {
@@ -116,12 +153,101 @@ namespace GeZi.Core.Support
             {
                 try
                 {
-                    _jar.Add(new Cookie(kv.Key, kv.Value, "/", ".quark.cn"));
+                    _jar.Add(new Cookie(kv.Key, kv.Value, "/", CookieDomainSuffix));
                 }
                 catch
                 {
                     // 单个 Cookie 格式异常不影响整体
                 }
+            }
+        }
+
+        /// <summary>
+        /// 读取指定名字的 Cookie 值（在当前网盘的 Cookie 域里找）。
+        /// UC 的 <c>ctoken</c>（CSRF token）需要这样取出来放进请求头。
+        /// </summary>
+        public string GetCookieValue(string name)
+        {
+            if (string.IsNullOrEmpty(name))
+                return null;
+            foreach (var d in CookieDomains)
+            {
+                CookieCollection cookies;
+                try
+                {
+                    cookies = _jar.GetCookies(new Uri(d));
+                }
+                catch
+                {
+                    continue;
+                }
+                foreach (Cookie c in cookies)
+                {
+                    if (string.Equals(c.Name, name, StringComparison.OrdinalIgnoreCase))
+                        return c.Value;
+                }
+            }
+            return null;
+        }
+
+        /// <summary>
+        /// 删除指定名字的 Cookie（在所有相关域里）。
+        /// <para>
+        /// 用途：刷新 <c>__puus</c> 时必须先把它摘掉再请求 <c>/config</c>，
+        /// 否则服务端看到旧的 <c>__puus</c> 不会重新下发 —— 这是 AList
+        /// <c>refreshPuus</c> / YunX <c>withoutPuus</c> 的核心手法。
+        /// </para>
+        /// </summary>
+        public void RemoveCookie(string name)
+        {
+            if (string.IsNullOrEmpty(name))
+                return;
+            foreach (var d in CookieDomains)
+            {
+                CookieCollection cookies;
+                try
+                {
+                    cookies = _jar.GetCookies(new Uri(d));
+                }
+                catch
+                {
+                    continue;
+                }
+                foreach (Cookie c in cookies)
+                {
+                    if (!string.Equals(c.Name, name, StringComparison.OrdinalIgnoreCase))
+                        continue;
+                    try
+                    {
+                        // 用一个已过期的同名 Cookie 覆盖，CookieContainer 会把它清掉
+                        _jar.Add(new Cookie(c.Name, "", c.Path ?? "/", CookieDomainSuffix)
+                        {
+                            Expires = DateTime.Now.AddDays(-1),
+                        });
+                    }
+                    catch
+                    {
+                        // 单个 Cookie 异常不影响整体
+                    }
+                }
+            }
+        }
+
+        /// <summary>
+        /// 覆盖写入单个 Cookie（同名同域直接替换，没有则新增）。
+        /// 用于把刷新拿到的 <c>__puus</c>/<c>__pus</c> 合并回会话。
+        /// </summary>
+        public void SetCookie(string name, string value)
+        {
+            if (string.IsNullOrEmpty(name))
+                return;
+            try
+            {
+                _jar.Add(new Cookie(name, value ?? "", "/", CookieDomainSuffix));
+            }
+            catch
+            {
+                // 值里含非法字符时忽略，不影响已有会话
             }
         }
 
@@ -180,6 +306,97 @@ namespace GeZi.Core.Support
             Set(req, "Sec-Fetch-Dest", api ? "empty" : "document");
             Set(req, "Sec-Fetch-Mode", api ? "cors" : "navigate");
             Set(req, "Sec-Fetch-Site", sameOrigin ? "same-origin" : "same-site");
+        }
+
+        /// <summary>
+        /// 按 <see cref="Kind"/> 注入对应网盘的请求头。
+        /// 夸克走原实现（行为完全不变）；UC 换 UA / Referer / Origin / same-origin 判据。
+        /// </summary>
+        public void ApplyHeadersForKind(HttpRequestMessage req, string url, bool api = true)
+        {
+            if (Kind != PanKind.Uc)
+            {
+                ApplyHeaders(req, url, api);
+                return;
+            }
+
+            Set(req, "User-Agent", UcUa(url, api));
+            Set(req, "Accept", api
+                ? "application/json, text/plain, */*"
+                : "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8");
+            Set(req, "Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8");
+            Set(req, "Referer", UcConstants.Referer);
+            Set(req, "Origin", UcConstants.Origin);
+            Set(req, "Cache-Control", "no-cache");
+            Set(req, "Pragma", "no-cache");
+            Set(req, "DNT", "1");
+            Set(req, "Connection", "keep-alive");
+
+            bool sameOrigin = url != null && url.IndexOf("uc.cn", StringComparison.OrdinalIgnoreCase) >= 0;
+            Set(req, "Sec-Fetch-Dest", api ? "empty" : "document");
+            Set(req, "Sec-Fetch-Mode", api ? "cors" : "navigate");
+            Set(req, "Sec-Fetch-Site", sameOrigin ? "same-origin" : "same-site");
+        }
+
+        /// <summary>
+        /// UC 的两个域认不同的 UA：<c>pc-api.uc.cn</c> 只认客户端 UA，
+        /// <c>drive.uc.cn</c> 的 <c>account/info</c> 只认网页 UA（见 <see cref="UcConstants.WebUa"/>）。
+        /// </summary>
+        private static string UcUa(string url, bool api)
+        {
+            if (!api)
+                return UcConstants.DlUa;
+            if (url != null && url.IndexOf("drive.uc.cn", StringComparison.OrdinalIgnoreCase) >= 0)
+                return UcConstants.WebUa;
+            return UcConstants.ApiUa;
+        }
+
+        /// <summary>
+        /// 按 <see cref="Kind"/> 生成字典形式的完整请求头，供自建 OpenSSL 通道使用。
+        /// </summary>
+        /// <remarks>
+        /// 必须与 <see cref="ApplyHeadersForKind"/> 取同一套值：UC 的 <c>pc-api.uc.cn</c>
+        /// 与 <c>pan.quark.cn</c> 一样按 TLS ClientHello 指纹过滤，只能走 OpenSSL 通道；
+        /// 两条通道的头不一致，就等于给 WAF 送了两个不同的指纹。
+        /// </remarks>
+        public Dictionary<string, string> BuildHeadersForKind(string url, bool api = true)
+        {
+            var d = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            if (Kind == PanKind.Uc)
+            {
+                d["User-Agent"] = UcUa(url, api);
+                d["Accept"] = api
+                    ? "application/json, text/plain, */*"
+                    : "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8";
+                d["Accept-Language"] = "zh-CN,zh;q=0.9,en;q=0.8";
+                d["Referer"] = UcConstants.Referer;
+                d["Origin"] = UcConstants.Origin;
+                bool sameOrigin = url != null && url.IndexOf("uc.cn", StringComparison.OrdinalIgnoreCase) >= 0;
+                d["Sec-Fetch-Dest"] = api ? "empty" : "document";
+                d["Sec-Fetch-Mode"] = api ? "cors" : "navigate";
+                d["Sec-Fetch-Site"] = sameOrigin ? "same-origin" : "same-site";
+            }
+            else
+            {
+                d["User-Agent"] = api ? QuarkConstants.ApiUa : QuarkConstants.DlUa;
+                d["Accept"] = api
+                    ? "application/json, text/plain, */*"
+                    : "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8";
+                d["Accept-Language"] = "zh-CN,zh;q=0.9,en;q=0.8";
+                d["Referer"] = QuarkConstants.Referer;
+                d["Origin"] = "https://pan.quark.cn";
+                bool sameOrigin = url != null && url.IndexOf("pan.quark.cn", StringComparison.OrdinalIgnoreCase) >= 0;
+                d["Sec-Fetch-Dest"] = api ? "empty" : "document";
+                d["Sec-Fetch-Mode"] = api ? "cors" : "navigate";
+                d["Sec-Fetch-Site"] = sameOrigin ? "same-origin" : "same-site";
+            }
+            d["Cache-Control"] = "no-cache";
+            d["Pragma"] = "no-cache";
+            d["DNT"] = "1";
+            // 每条请求各开一条 TLS 连接，必须显式 close，否则对端会等 Content-Length。
+            d["Connection"] = "close";
+            d["Cookie"] = BuildCookieString();
+            return d;
         }
 
         private static void Set(HttpRequestMessage req, string name, string value)

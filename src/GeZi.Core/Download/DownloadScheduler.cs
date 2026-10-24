@@ -1,18 +1,18 @@
-// GeZi —— 夸克网盘下载器 (Quark netdisk downloader)
+// GeZi —— 多网盘下载器 (Multi-cloud downloader)
 // Copyright (C) 2026  Yi Yuan
 //
 // This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
+// it under the terms of the GNU Affero General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 //
 // This program is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU General Public License for more details.
+// GNU Affero General Public License for more details.
 //
-// You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/agpl-3.0>.
 
 using System;
 using System.Collections.Concurrent;
@@ -66,6 +66,16 @@ namespace GeZi.Core.Download
     {
         private readonly SemaphoreSlim _sem;
 
+        /// <summary>
+        /// 全局连接预算租约。UI 的「按文件大小分配」只是每个任务的**期望值**，
+        /// 这里才是**硬上限**：多个批次（续传批次 + 新下载批次）、甚至多个
+        /// <see cref="DownloadScheduler"/> 实例同时存在时，所有在飞任务的连接额度
+        /// 合计也不会超过 <see cref="ThreadAllocator.DefaultBudget"/>。
+        /// 刻意做成静态：目标是账号级总连接数，不是某个调度器实例的局部预算。
+        /// </summary>
+        private static readonly SemaphoreSlim GlobalConnLease =
+            new SemaphoreSlim(ThreadAllocator.DefaultBudget, ThreadAllocator.DefaultBudget);
+
         /// <summary>诊断日志出口（转给每个 SegmentedDownloader）。</summary>
         public Action<string> Log { get; set; }
 
@@ -102,6 +112,12 @@ namespace GeZi.Core.Download
             NetworkConfig.Apply(connBudget);
         }
 
+        /// <summary>全局连接预算上限。仅供诊断/日志。</summary>
+        public int ConnectionBudget => ThreadAllocator.DefaultBudget;
+
+        /// <summary>当前已被在飞任务占用的连接额度（跨实例）。仅供诊断/日志。</summary>
+        public int LeasedConnections => ThreadAllocator.DefaultBudget - GlobalConnLease.CurrentCount;
+
         public async Task RunAllAsync(IReadOnlyList<DownloadJob> jobs, IProgress<JobUpdate> progress, CancellationToken globalCancel)
         {
             var tasks = jobs.Select(job => RunOneAsync(job, _sem, progress, globalCancel)).ToArray();
@@ -121,6 +137,7 @@ namespace GeZi.Core.Download
             // 互斥等于失效 —— 那比不做还危险（会给出"已保护"的假象）。
             string destKey = DestKey(job.Dest);
             bool owned = false;
+            int leased = 0;
             try
             {
                 if (!_activeDests.TryAdd(destKey, 0))
@@ -130,11 +147,24 @@ namespace GeZi.Core.Download
                 }
                 owned = true;
 
+                // ---- 全局连接预算租约 ----
+                // 申请“期望值”个额度；额度不足就在这里等前一个任务释放，
+                // 而不是让三个任务各开 256 路把账号连接数顶穿。
+                int want = job.Threads > 0 ? job.Threads : QuarkConstants.DownloadThreads;
+                if (want > ThreadAllocator.DefaultBudget) want = ThreadAllocator.DefaultBudget;
+                for (int i = 0; i < want; i++)
+                {
+                    await GlobalConnLease.WaitAsync(globalCancel).ConfigureAwait(false);
+                    leased++;
+                }
+
                 using (var linked = CancellationTokenSource.CreateLinkedTokenSource(globalCancel, job.Cancel.Token))
                 {
                     Report(progress, job, JobState.Downloading);
-                    using (var dl = new SegmentedDownloader(threads: job.Threads, cookie: job.Cookie,
-                               partsRoot: job.PartsRoot))
+                    using (var dl = new SegmentedDownloader(threads: leased, cookie: job.Cookie,
+                               referer: job.Referer, partsRoot: job.PartsRoot,
+                               ua: job.UserAgent, origin: job.Origin,
+                               useOpenSsl: job.UseOpenSsl))
                     {
                         dl.Log = Log;
                         dl.Diagnostics = Diagnostics;
@@ -142,10 +172,13 @@ namespace GeZi.Core.Download
                         // 免转存任务：失败文案不能说"可续传"（stoken 过期就取不到新链）
                         dl.ResumeCannotRefresh = job.ResumeCannotRefresh;
                         var perFile = new JobProgressAdapter(job, progress);
-                        var res = await dl.DownloadAsync(job.Url, job.Dest, perFile, linked.Token, job.Pause).ConfigureAwait(false);
+                        var res = await dl.DownloadAsync(job.Url, job.Dest, perFile, linked.Token, job.Pause,
+                            job.Md5, job.Sha1, job.Sha256).ConfigureAwait(false);
 
                         if (res.Ok)
-                            Report(progress, job, JobState.Completed);
+                            // 把校验结果带到 UI：完成不等于“已验证”，用户要能一眼看到
+                            // “内容校验通过”还是“未校验（接口没给哈希）”。
+                            Report(progress, job, JobState.Completed, res.Message);
                         else if (linked.IsCancellationRequested)
                             Report(progress, job, JobState.Cancelled, res.Message);
                         else
@@ -155,6 +188,9 @@ namespace GeZi.Core.Download
             }
             finally
             {
+                // 先还连接额度，再放并发槽：下一个任务一进来就能拿到刚释放的额度。
+                if (leased > 0)
+                    GlobalConnLease.Release(leased);
                 // 下载结束（含成功/失败/取消/异常）必然走到这里，
                 // 立即释放目标路径，供"删除后重下"继续。
                 if (owned)

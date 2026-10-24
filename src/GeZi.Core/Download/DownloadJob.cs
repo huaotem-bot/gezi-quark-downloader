@@ -1,15 +1,15 @@
-﻿// GeZi —— 夸克网盘下载器 (Quark netdisk downloader)
+// GeZi —— 多网盘下载器 (Multi-cloud downloader)
 // Copyright (C) 2026  Yi Yuan
 // This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
+// it under the terms of the GNU Affero General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 // This program is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU General Public License for more details.
-// You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+// GNU Affero General Public License for more details.
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/agpl-3.0>.
 
 using System;
 using System.Threading;
@@ -25,8 +25,55 @@ namespace GeZi.Core.Download
         public string Url { get; set; } = "";
         public string Dest { get; set; } = "";
         public string Cookie { get; set; } = "";
+
+        /// <summary>
+        /// 下载请求的 Referer。空 = 沿用下载器的默认值（夸克）。
+        /// <para>
+        /// <b>阿里云盘必须显式给</b>：它的 OSS 直链在签名时把 Referer 也算进去了
+        /// （URL 里带 <c>x-oss-additional-headers=referer</c>），取值必须是
+        /// <c>https://www.alipan.com/</c>。带夸克 Referer 会被判
+        /// <c>SignatureDoesNotMatch</c>（403），不带则 <c>AuthorizationArgumentError</c>（400）。
+        /// </para>
+        /// </summary>
+        public string Referer { get; set; }
+
+        /// <summary>
+        /// 下载请求的 User-Agent。空 = 沿用下载器的默认值（夸克客户端 UA）。
+        /// <para>
+        /// <b>UC 必须显式给</b>：UC 的 CDN 与夸克是两套防盗链，
+        /// 拿夸克的 UA 去请求 UC 直链会被判 403。见 <c>UcConstants.DlUa</c>。
+        /// </para>
+        /// </summary>
+        public string UserAgent { get; set; }
+
+        /// <summary>
+        /// 下载请求的 Origin。空 = 沿用下载器的默认值（<c>https://pan.quark.cn</c>）。
+        /// <para>
+        /// 与 <see cref="Referer"/> 必须成对匹配，否则头集合不自洽
+        /// （真实浏览器发请求时这两个同源，混搭本身就是异常特征）。
+        /// </para>
+        /// </summary>
+        public string Origin { get; set; }
+
+        /// <summary>
+        /// 下载数据面是否走 OpenSSL 桥。
+        /// <para>
+        /// <b>UC 必须为 true</b>：UC 的下载 CDN <c>dl-pc-sz-cf.pds.uc.cn</c> 按 TLS
+        /// ClientHello 指纹过滤，Windows 自带的 SChannel 一律回
+        /// <c>403 RequestDeniedByCallback / require login [auth not found]</c>；
+        /// 同一个直链、同一份 Cookie 换到 OpenSSL 通道立刻回 <c>206</c>（实测）。
+        /// 夸克 / 阿里 / 迅雷的 CDN 不查这个指纹，保持 false 走 HttpClient 即可。
+        /// </para>
+        /// </summary>
+        public bool UseOpenSsl { get; set; }
+
         /// <summary>0 表示用默认线程数。</summary>
         public int Threads { get; set; } = 0;
+
+        /// <summary>内容哈希（取链接口有就带；没有则完成时标记“未校验”）。</summary>
+        public string Md5 { get; set; }
+        public string Sha1 { get; set; }
+        public string Sha256 { get; set; }
 
         /// <summary>
         /// 分片/续传元数据的根目录覆盖。null/空 = 与目标文件同级（默认）。
@@ -95,6 +142,12 @@ namespace GeZi.Core.Download
         public string Token { get; set; }
         /// <summary>是否来自分享（否则为"我的网盘"）。</summary>
         public bool FromShare { get; set; }
+
+        /// <summary>
+        /// 来源网盘（0 = 夸克）。续传时据此选客户端：
+        /// 拿夸克客户端去请求 UC/阿里/迅雷必然失败，所以这个字段必须随任务持久化。
+        /// </summary>
+        public int PanKind { get; set; }
         /// <summary>相对目录（含尾部分隔符时也算合法），用于重建目标路径。</summary>
         public string RelDir { get; set; }
         /// <summary>分享进入目录 fid（带 fid 的分享链接才有意义，普通分享是 "0"）。
@@ -109,6 +162,11 @@ namespace GeZi.Core.Download
         public string Dest { get; set; }
         /// <summary>文件总大小（0 = 未知）。</summary>
         public long Size { get; set; }
+
+        /// <summary>内容哈希；跨重启续传后仍用同一组期望值校验。</summary>
+        public string Md5 { get; set; }
+        public string Sha1 { get; set; }
+        public string Sha256 { get; set; }
 
         /// <summary>是否具备重取链所需的全部信息。</summary>
         public bool CanResume

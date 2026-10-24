@@ -1,21 +1,22 @@
-// GeZi —— 夸克网盘下载器 (Quark netdisk downloader)
+// GeZi —— 多网盘下载器 (Multi-cloud downloader)
 // Copyright (C) 2026  Yi Yuan
 //
 // This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
+// it under the terms of the GNU Affero General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 //
 // This program is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU General Public License for more details.
+// GNU Affero General Public License for more details.
 //
-// You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/agpl-3.0>.
 
 using System;
 using System.Collections.Generic;
+using GeZi.Core.Models;
 
 namespace GeZi
 {
@@ -42,6 +43,9 @@ namespace GeZi
         private sealed class Entry
         {
             public string Url;
+            public string Md5;
+            public string Sha1;
+            public string Sha256;
             public DateTime Stamp;
         }
 
@@ -51,6 +55,13 @@ namespace GeZi
 
         /// <summary>命中且未过期时返回直链，否则返回 null。</summary>
         public string Get(string fid)
+        {
+            var link = GetLink(fid);
+            return link == null ? null : link.DownloadUrl;
+        }
+
+        /// <summary>命中且未过期时返回带哈希的完整取链结果，否则返回 null。</summary>
+        public DownloadLink GetLink(string fid)
         {
             if (string.IsNullOrEmpty(fid))
                 return null;
@@ -64,17 +75,39 @@ namespace GeZi
                     _map.Remove(fid);
                     return null;
                 }
-                return e.Url;
+                return new DownloadLink
+                {
+                    Fid = fid,
+                    DownloadUrl = e.Url,
+                    Md5 = e.Md5,
+                    Sha1 = e.Sha1,
+                    Sha256 = e.Sha256,
+                };
             }
         }
 
         /// <summary>写入（或刷新）一条直链。</summary>
         public void Put(string fid, string url)
         {
-            if (string.IsNullOrEmpty(fid) || string.IsNullOrEmpty(url))
+            PutLink(new DownloadLink { Fid = fid, DownloadUrl = url });
+        }
+
+        /// <summary>写入（或刷新）一条完整取链结果，保留内容哈希。</summary>
+        public void PutLink(DownloadLink link)
+        {
+            if (link == null || string.IsNullOrEmpty(link.Fid) || string.IsNullOrEmpty(link.DownloadUrl))
                 return;
             lock (_lock)
-                _map[fid] = new Entry { Url = url, Stamp = DateTime.UtcNow };
+            {
+                _map[link.Fid] = new Entry
+                {
+                    Url = link.DownloadUrl,
+                    Md5 = link.Md5,
+                    Sha1 = link.Sha1,
+                    Sha256 = link.Sha256,
+                    Stamp = DateTime.UtcNow,
+                };
+            }
         }
 
         /// <summary>清空缓存。切换账号、重新解析分享时必须调用 —— 否则会拿旧账号的链。</summary>

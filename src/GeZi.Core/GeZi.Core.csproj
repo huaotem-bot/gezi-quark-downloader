@@ -1,4 +1,4 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
     <TargetFramework>net48</TargetFramework>
@@ -8,7 +8,13 @@
     <RootNamespace>GeZi.Core</RootNamespace>
     <Product>鸽子下载</Product>
     <AssemblyTitle>鸽子下载</AssemblyTitle>
-    <Version>2.3.1</Version>
+    <Version>2.4.0</Version>
+    <!-- 与主程序保持一致：统一 x64。
+         纯托管库其实 AnyCPU 也能用，但混用位数是 0x8007000B（"格式不正确"）这类
+         错误的温床 —— 主程序曾因默认 AnyCPU 而实际以 32 位运行，
+         加载 x64 的 WebView2Loader.dll 时直接失败。 -->
+    <PlatformTarget>x64</PlatformTarget>
+    <Prefer32Bit>false</Prefer32Bit>
     <GenerateDocumentationFile>false</GenerateDocumentationFile>
     <!-- PathMap：别让编译机的绝对路径（含用户名）进产物。
          不加 → `C:\Users\<用户名>\Desktop\GeZi\src\...\GeZi.Core.pdb` 被写进 dll
@@ -22,6 +28,12 @@
     <Reference Include="System.Web.Extensions" />
     <!-- DPAPI（ProtectedData）加密 Cookie -->
     <Reference Include="System.Security" />
+    <!-- 诊断包 zip（ZipArchive） -->
+    <Reference Include="System.IO.Compression" />
+    <!-- 阿里云盘设备签名（secp256k1）用 BigInteger 做点运算与 recovery id 推导。
+         ECDSA 本身交给 ECDsaCng（Windows CNG 原生支持 secp256k1），
+         只有「从签名反推公钥点」这一步需要手写模运算。 -->
+    <Reference Include="System.Numerics" />
   </ItemGroup>
 
   <ItemGroup>

@@ -1,15 +1,15 @@
-﻿// GeZi —— 夸克网盘下载器 (Quark netdisk downloader)
+// GeZi —— 多网盘下载器 (Multi-cloud downloader)
 // Copyright (C) 2026  Yi Yuan
 // This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
+// it under the terms of the GNU Affero General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 // This program is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU General Public License for more details.
-// You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+// GNU Affero General Public License for more details.
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/agpl-3.0>.
 
 using System;
 using System.Collections.Generic;
@@ -88,6 +88,106 @@ namespace GeZi
         /// 序列化到磁盘时由 Save/Load 做 DPAPI 加解密，字段本身不感知。
         /// </summary>
         public string Cookie { get; set; } = "";
+
+        // ---------------- 多网盘凭证 ----------------
+        // 这三个与夸克 Cookie 一样：内存明文，落盘时由 Save/Load 统一 DPAPI 加密。
+        // 放在 AppSettings 而不是账号表里，是因为它们还没有扫码登录流程，
+        // 只能由用户手动粘贴 —— 单账号足够，多账号等有了登录方式再说。
+
+        /// <summary>UC 网盘登录 Cookie（需含 __puus）。</summary>
+        public string UcCookie { get; set; } = "";
+
+        /// <summary>
+        /// 当前启用的是哪个网盘的账号（<c>PanKind</c> 的整数值：0 夸克、1 UC）。
+        /// <para>
+        /// 存成 int 而不是枚举，是为了让配置文件在"将来枚举增删"时不会因为
+        /// 反序列化失败而整份作废 —— 旧版本读到不认识的值会落到默认值。
+        /// </para>
+        /// <para>
+        /// 只有夸克和 UC 会用到这里：两者同属 ucpro 后端，账号可以互相切换；
+        /// 阿里/迅雷的凭证是另一种形态（refresh_token / pan_token），不走这条。
+        /// </para>
+        /// </summary>
+        public int ActivePanKind { get; set; } = 0;
+
+        /// <summary>阿里云盘 refresh_token。</summary>
+        public string AliyunRefreshToken { get; set; } = "";
+
+        /// <summary>
+        /// 阿里云盘短期 access_token（网页登录只给这个时使用）。
+        /// <para>
+        /// 与 <see cref="AliyunRefreshToken"/> 互斥：有 refresh_token 时它为空。
+        /// 单独存一份是因为阿里新版网页的 sessionStorage 里只有 access_token，
+        /// 没有它就只能让用户每次重启都重新登录。
+        /// </para>
+        /// </summary>
+        public string AliyunAccessToken { get; set; } = "";
+
+        /// <summary>迅雷云盘 pan_token（Authorization: Bearer 后面的那段）。</summary>
+        public string XunleiPanToken { get; set; } = "";
+
+        /// <summary>
+        /// 阿里云盘设备 ID（32 hex）。
+        /// <para>
+        /// 阿里新版要求「设备会话签名」才能列目录/查容量，而设备身份必须稳定 ——
+        /// 每次重启都换新设备会被官网「登录设备」列表堆满，也可能触发风控。
+        /// 与 <see cref="AliyunDevicePrivateKey"/> 成对保存，走 DPAPI 加密。
+        /// </para>
+        /// </summary>
+        public string AliyunDeviceId { get; set; } = "";
+
+        /// <summary>阿里云盘设备私钥（64 hex secp256k1），与 <see cref="AliyunDeviceId"/> 成对。</summary>
+        public string AliyunDevicePrivateKey { get; set; } = "";
+
+        /// <summary>迅雷云盘的极验验证码 token（x-captcha-token），会过期，属于临时值。</summary>
+        public string XunleiCaptchaToken { get; set; } = "";
+
+        /// <summary>
+        /// 迅雷云盘 refresh_token（账号登录才有）。
+        /// <para>
+        /// 账号登录（手机号 + 短信）走安卓客户端协议，同时返回 refresh_token，
+        /// 可以长期换新的 access_token。走 DPAPI 加密保存。
+        /// </para>
+        /// </summary>
+        public string XunleiRefreshToken { get; set; } = "";
+
+        /// <summary>
+        /// 迅雷云盘 refresh_token（**网页登录**那套，扫码 / 网页里登录得到的）。
+        /// <para>
+        /// 与 <see cref="XunleiRefreshToken"/> 分开存：两者属于不同的 OAuth 客户端，
+        /// 网页 token 只能用网页 client_id 刷新，且刷新请求的形态也不同
+        /// （JSON body + 桌面 UA + Origin/Referer，不带 client_secret）。
+        /// 混用会被服务端直接拒绝。走 DPAPI 加密保存。
+        /// </para>
+        /// </summary>
+        public string XunleiWebRefreshToken { get; set; } = "";
+
+        /// <summary>
+        /// 网页登录的子账号标识（localStorage 的 <c>current_sub</c>）。
+        /// <para>
+        /// 多账号时网页把登录态写在 <c>credentials_&lt;clientId&gt;@&lt;sub&gt;</c> 下，
+        /// 记住它能保证下次读到的还是同一个账号。不是秘密，明文保存。
+        /// </para>
+        /// </summary>
+        public string XunleiWebSub { get; set; } = "";
+
+        /// <summary>
+        /// 网页登录的设备标识（来自 Cookie 里的 <c>deviceid</c>）。
+        /// <para>
+        /// 刷新网页令牌时要作为 <c>X-Device-Id</c> 原样带上；
+        /// 与 <see cref="XunleiDeviceId"/>（账号登录那套）不是同一个值。明文保存。
+        /// </para>
+        /// </summary>
+        public string XunleiWebDeviceId { get; set; } = "";
+
+        /// <summary>
+        /// 迅雷账号登录用的设备标识（32 hex）。
+        /// <para>
+        /// 必须稳定复用 —— 它参与 <c>devicesign</c> 与 <c>captcha_sign</c> 的计算，
+        /// 每次登录都换新设备会被服务端判定为异常设备。
+        /// </para>
+        /// </summary>
+        public string XunleiDeviceId { get; set; } = "";
 
         public string Who { get; set; } = "";
 
@@ -300,6 +400,17 @@ namespace GeZi
 
             // 兼容旧版明文 Cookie：解出来是明文就原样用，下次 Save 时会被自动加密
             s.Cookie = SecretProtector.Unprotect(s.Cookie);
+            // 多网盘凭证同样处理：这些是「能登我账号」的东西，绝不能明文落盘。
+            s.UcCookie = SecretProtector.Unprotect(s.UcCookie);
+            s.AliyunRefreshToken = SecretProtector.Unprotect(s.AliyunRefreshToken);
+            s.AliyunAccessToken = SecretProtector.Unprotect(s.AliyunAccessToken);
+            s.XunleiPanToken = SecretProtector.Unprotect(s.XunleiPanToken);
+            s.XunleiCaptchaToken = SecretProtector.Unprotect(s.XunleiCaptchaToken);
+            s.XunleiRefreshToken = SecretProtector.Unprotect(s.XunleiRefreshToken);
+            // 网页登录那套 refresh_token 同样是长期凭证，一样加密。
+            s.XunleiWebRefreshToken = SecretProtector.Unprotect(s.XunleiWebRefreshToken);
+            // 阿里设备私钥等同于「这台机器的设备身份」，能签出有效设备会话，同样加密保存。
+            s.AliyunDevicePrivateKey = SecretProtector.Unprotect(s.AliyunDevicePrivateKey);
             // 并发上限与核心层的 MaxRealConcurrency 保持一致。
             // 旧配置里可能存着 512/8192 这类超出范围的值，读进来时夹到有效范围，
             // 免得 UI 上落不到任何一个合法档位。上限取自核心层常量，避免两处失配。
@@ -326,10 +437,28 @@ namespace GeZi
                 return;
 
             string rawCookie = s.Cookie;   // 内存中始终明文，落盘前临时加密
-            var tmpPath = FilePath + ".tmp";
+            // 多网盘凭证：同样「内存明文、落盘加密」，Save 后必须原样还原，
+            // 否则调用方手里的对象会被污染（下次再 Save 就会二次加密，解不回来）。
+            string rawUcCookie = s.UcCookie;
+            string rawAliToken = s.AliyunRefreshToken;
+            string rawAliAccess = s.AliyunAccessToken;
+            string rawXlToken = s.XunleiPanToken;
+            string rawXlCaptcha = s.XunleiCaptchaToken;
+            string rawXlRefresh = s.XunleiRefreshToken;
+            string rawXlWebRefresh = s.XunleiWebRefreshToken;
+            string rawAliDeviceKey = s.AliyunDevicePrivateKey;
+            string tmpPath = FilePath + "." + Guid.NewGuid().ToString("N") + ".tmp";
             try
             {
                 s.Cookie = SecretProtector.Protect(rawCookie);
+                s.UcCookie = SecretProtector.Protect(rawUcCookie);
+                s.AliyunRefreshToken = SecretProtector.Protect(rawAliToken);
+                s.AliyunAccessToken = SecretProtector.Protect(rawAliAccess);
+                s.XunleiPanToken = SecretProtector.Protect(rawXlToken);
+                s.XunleiCaptchaToken = SecretProtector.Protect(rawXlCaptcha);
+                s.XunleiRefreshToken = SecretProtector.Protect(rawXlRefresh);
+                s.XunleiWebRefreshToken = SecretProtector.Protect(rawXlWebRefresh);
+                s.AliyunDevicePrivateKey = SecretProtector.Protect(rawAliDeviceKey);
                 // 落过盘就置位：下次 Load 才能区分"用户主动关掉了"与"老配置里没这个节点"
                 // （见 ClipboardAutoParseSet 的注释）。放在这里而不是各个调用点，
                 // 是为了覆盖所有写盘路径，避免漏一处就退回"默认关"。
@@ -337,12 +466,17 @@ namespace GeZi
 
                 // 先写临时文件再原子替换：避免写一半断电/异常留下半截 XML，
                 // 下次启动 Load 直接抛异常、用户设置全丢。
-                using (var fs = File.Create(tmpPath))
+                using (var fs = new FileStream(tmpPath, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+                {
                     Ser.Serialize(fs, s);
+                    fs.Flush(true);
+                }
 
+                // 一次 Replace，不再“先删后移”：删除与移动之间断电会同时丢旧配置。
                 if (File.Exists(FilePath))
-                    File.Delete(FilePath);
-                File.Move(tmpPath, FilePath);
+                    File.Replace(tmpPath, FilePath, null);
+                else
+                    File.Move(tmpPath, FilePath);
             }
             catch (Exception ex)
             {
@@ -352,6 +486,14 @@ namespace GeZi
             finally
             {
                 s.Cookie = rawCookie;   // 还原内存明文，调用方拿到的对象不被污染
+                s.UcCookie = rawUcCookie;
+                s.AliyunRefreshToken = rawAliToken;
+                s.AliyunAccessToken = rawAliAccess;
+                s.XunleiPanToken = rawXlToken;
+                s.XunleiCaptchaToken = rawXlCaptcha;
+                s.XunleiRefreshToken = rawXlRefresh;
+                s.XunleiWebRefreshToken = rawXlWebRefresh;
+                s.AliyunDevicePrivateKey = rawAliDeviceKey;
             }
         }
     }

@@ -1,15 +1,15 @@
-﻿// GeZi —— 夸克网盘下载器 (Quark netdisk downloader)
+// GeZi —— 多网盘下载器 (Multi-cloud downloader)
 // Copyright (C) 2026  Yi Yuan
 // This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
+// it under the terms of the GNU Affero General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 // This program is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU General Public License for more details.
-// You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+// GNU Affero General Public License for more details.
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/agpl-3.0>.
 
 using System;
 using System.Collections.Generic;
@@ -38,9 +38,43 @@ namespace GeZi.Core.Api
 
         private static readonly Random Rng = new Random();
 
+        /// <summary>
+        /// 这个客户端服务的网盘。
+        /// <para>
+        /// 夸克与 UC **是同一套 ucpro 后端**（接口路径、返回结构、错误码全部一致），
+        /// 差别只有三处：域名、<c>pr</c> 参数、以及 UA/Referer/Origin 请求头。
+        /// 所以这里用 Kind 一次性切换，而不是复制一份 UcClient —— 复制出来的那份
+        /// 迟早会和这边跑偏（节流、鉴权重试、错误码映射都要维护两遍）。
+        /// </para>
+        /// </summary>
+        public PanKind Kind { get { return _kind; } }
+
+        private readonly PanKind _kind;
+
+        /// <summary>API 根地址：夸克 <c>drive-pc.quark.cn</c>，UC <c>pc-api.uc.cn</c>。</summary>
+        private readonly string _apiBase;
+
+        /// <summary>ucpro 协议的 <c>pr</c> 参数：夸克 <c>ucpro</c>，UC <c>UCBrowser</c>。</summary>
+        private readonly string _pr;
+
+        /// <summary>账号信息地址：夸克 <c>pan.quark.cn/account/info</c>，UC <c>drive.uc.cn/account/info</c>。</summary>
+        private readonly string _accountUrl;
+
         public QuarkClient(string cookie)
+            : this(cookie, PanKind.Quark)
         {
-            _session = new QuarkSession(cookie);
+        }
+
+        public QuarkClient(string cookie, PanKind kind)
+        {
+            _kind = kind;
+            bool uc = kind == PanKind.Uc;
+            _apiBase = uc ? UcConstants.ApiBase : QuarkConstants.ApiBase;
+            _pr = uc ? UcConstants.Pr : "ucpro";
+            _accountUrl = uc ? UcConstants.AccountInfoUrl : QuarkConstants.AccountUrl;
+            // 会话层按 Kind 注入对应的 UA / Referer / Origin / Sec-Fetch-Site，
+            // 同时保留原有的节流与退避重试（两条网盘共用同一份底座）。
+            _session = new QuarkSession(cookie, DecompressionMethods.None, kind);
         }
 
         // ---------------- Cookie ----------------
@@ -52,6 +86,9 @@ namespace GeZi.Core.Api
 
         private Timer _keepAliveTimer;
         private readonly object _keepAliveLock = new object();
+
+        /// <summary>上次尝试续期 <c>__puus</c> 的时刻（UTC），用于按 90 分钟节流。</summary>
+        private DateTime _lastPuusRefreshAt = DateTime.MinValue;
 
         /// <summary>
         /// 对外请求入口：在底层请求之上增加了 401/412 鉴权重试与重新校验。
@@ -76,6 +113,11 @@ namespace GeZi.Core.Api
                     // 鉴权退避：2–4 秒，避免紧接重试撞上风控窗口
                     await Task.Delay(2000 + Rng.Next(0, 2000)).ConfigureAwait(false);
 
+                    // 401/412 最常见的真实原因是 __puus 到期（约 3 小时）。
+                    // 先静默续期一次：能续上就直接重试，用户完全无感；
+                    // 续不上再判失效，避免"用了两小时突然要求重新登录"。
+                    await RefreshPuusAsync().ConfigureAwait(false);
+
                     bool stillValid = await QuickValidateAsync().ConfigureAwait(false);
                     if (!stillValid)
                     {
@@ -88,6 +130,74 @@ namespace GeZi.Core.Api
                     // Cookie 仍有效，重试原请求
                     continue;
                 }
+            }
+        }
+
+        /// <summary>
+        /// 这条请求是否必须走自建 OpenSSL 通道。
+        /// </summary>
+        /// <remarks>
+        /// UC 的 <c>pc-api.uc.cn</c> 前置 ALB 按 TLS ClientHello 指纹过滤：同一份有效 Cookie，
+        /// 用 OpenSSL 发 HTTP 200 正常返回，用 .NET 的 SChannel 发则一律被 RST
+        /// （表现为「发送请求时出错」）。所以 UC 的 API 全部改走 <see cref="OpenSslTls"/>。
+        /// 夸克的 <c>drive-pc.quark.cn</c> 不过滤，保持原生 HttpClient 不动，避免无谓的行为变化。
+        /// </remarks>
+        private bool NeedsOpenSsl(string url)
+        {
+            if (_kind != PanKind.Uc || url == null)
+                return false;
+            // pc-api.uc.cn：全部业务接口；drive.uc.cn：只有 account/info 走这里。
+            // 两个域都是同一套前置 ALB，.NET 的 SChannel 握手一律被 RST。
+            return url.IndexOf("pc-api.uc.cn", StringComparison.OrdinalIgnoreCase) >= 0
+                || url.IndexOf("drive.uc.cn", StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        /// <summary>走自建 OpenSSL 通道发一个 API 请求，并把 Set-Cookie 合并回会话。</summary>
+        private async Task<object> RequestViaOpenSslAsync(HttpMethod method, string url,
+            object body, int timeoutSeconds)
+        {
+            Uri uri = new Uri(url);
+            var headers = _session.BuildHeadersForKind(url, api: true);
+            string json = body != null ? Serialize(body) : null;
+            if (json != null)
+                headers["Content-Type"] = "application/json;charset=UTF-8";
+
+            OpenSslTls.Response resp;
+            try
+            {
+                // OpenSslTls 是同步阻塞实现，放到线程池上跑，别卡 UI 线程
+                resp = await Task.Run(() => OpenSslTls.Send(
+                    uri.Host, method.Method, uri.PathAndQuery, headers, json,
+                    timeoutSeconds * 1000)).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                throw new QuarkApiException("网络请求失败: " + ex.Message);
+            }
+
+            // 只合并非空值：UC 在鉴权失败时会下发一串空值 Set-Cookie，
+            // 收下它们等于把用户的有效凭证清空（这正是之前 account/info 的老坑）。
+            foreach (var c in resp.Cookies)
+            {
+                if (string.IsNullOrEmpty(c.Key) || string.IsNullOrEmpty(c.Value))
+                    continue;
+                _session.SetCookie(c.Key, c.Value);
+            }
+
+            try
+            {
+                return Deserialize(resp.Body);
+            }
+            catch (Exception)
+            {
+                string hint = AuthHint(resp.StatusCode);
+                if (hint != null)
+                    throw new QuarkApiException(hint, null, null, resp.StatusCode);
+                string snippet = resp.Body ?? "";
+                if (snippet.Length > 200)
+                    snippet = snippet.Substring(0, 200);
+                throw new QuarkApiException(
+                    "HTTP " + resp.StatusCode + ": " + snippet, null, null, resp.StatusCode);
             }
         }
 
@@ -115,11 +225,17 @@ namespace GeZi.Core.Api
             {
                 try
                 {
+                    // UC 的 API 主机被按 TLS 指纹过滤，只能走 OpenSSL 通道（见 NeedsOpenSsl）
+                    if (NeedsOpenSsl(url))
+                        return await RequestViaOpenSslAsync(method, url, body, timeoutSeconds)
+                            .ConfigureAwait(false);
+
                     // 会话层负责：补全标准浏览器请求头、节流、对 5xx/408/429 指数退避重试
                     using (var resp = await _session.SendWithRetryAsync(() =>
                     {
                         var req = new HttpRequestMessage(method, url);
-                        QuarkSession.ApplyHeaders(req, url, api: true);
+                        // 按 Kind 注入：夸克走原实现（行为完全不变），UC 换 UA/Referer/Origin
+                        _session.ApplyHeadersForKind(req, url, api: true);
                         if (body != null)
                         {
                             var json = Serialize(body);
@@ -302,29 +418,20 @@ namespace GeZi.Core.Api
 
         public async Task<(bool ok, string nick)> ValidateAsync()
         {
-            try
+            // 第一轮：直接用当前 Cookie 问账号信息
+            var first = await TryAccountInfoAsync().ConfigureAwait(false);
+            if (first != null)
+                return (true, first);
+
+            // 第二轮：账号信息失败很可能是 __puus 到期 —— 先尝试静默刷新再问一次。
+            // 这一步能把「登录成功几小时后重启就提示未登录」的情况直接救回来，
+            // 不需要用户重新扫码/重新登录。
+            if (await RefreshPuusAsync().ConfigureAwait(false))
             {
-                var res = await RequestAsync(HttpMethod.Get, QuarkConstants.AccountUrl,
-                    new Dictionary<string, string> { { "fr", "pc" }, { "platform", "pc" } });
-                var data = AsDict(Get(AsDict(res), "data"));
-                if (data != null)
-                {
-                    string nick = AsString(Get(data, "nickname")) ?? "已登录用户";
-                    string sig = AsStringOrNumber(Get(data, "id"))
-                        ?? AsStringOrNumber(Get(data, "account_id"))
-                        ?? AsStringOrNumber(Get(data, "uid"))
-                        ?? AsStringOrNumber(Get(data, "user_id"))
-                        ?? nick;
-                    if (!string.IsNullOrEmpty(sig))
-                        _accountSig = sig;
-                    // 头像：能探测到就记下来，拿不到保持 null（界面回退首字头像）
-                    var av = PickAvatarUrl(data);
-                    if (!string.IsNullOrEmpty(av)) AvatarUrl = av;
-                    return (true, nick);
-                }
+                var second = await TryAccountInfoAsync().ConfigureAwait(false);
+                if (second != null)
+                    return (true, second);
             }
-            catch (QuarkApiException) { }
-            catch (Exception) { }
 
             try
             {
@@ -337,6 +444,35 @@ namespace GeZi.Core.Api
             }
         }
 
+        /// <summary>
+        /// 问一次 <c>account/info</c>，成功返回昵称（可能为 null 表示"已登录但没昵称"），
+        /// 失败返回 null。抽出来是为了让 <see cref="ValidateAsync"/> 能「刷新前/刷新后」各问一次。
+        /// </summary>
+        private async Task<string> TryAccountInfoAsync()
+        {
+            try
+            {
+                var res = await RequestAsync(HttpMethod.Get, _accountUrl,
+                    new Dictionary<string, string> { { "fr", "pc" }, { "platform", "pc" } });
+                var data = AsDict(Get(AsDict(res), "data"));
+                if (data == null || data.Count == 0)
+                    return null;      // UC 未登录时返回 {"data":{}}，不能当成成功
+                string nick = AsString(Get(data, "nickname")) ?? "已登录用户";
+                string sig = AsStringOrNumber(Get(data, "id"))
+                    ?? AsStringOrNumber(Get(data, "account_id"))
+                    ?? AsStringOrNumber(Get(data, "uid"))
+                    ?? AsStringOrNumber(Get(data, "user_id"))
+                    ?? nick;
+                if (!string.IsNullOrEmpty(sig))
+                    _accountSig = sig;
+                var av = PickAvatarUrl(data);
+                if (!string.IsNullOrEmpty(av)) AvatarUrl = av;
+                return nick;
+            }
+            catch (QuarkApiException) { return null; }
+            catch (Exception) { return null; }
+        }
+
         public string AccountSig => _accountSig ?? "";
 
         // ---------------- 容量 ----------------
@@ -345,8 +481,8 @@ namespace GeZi.Core.Api
         {
             try
             {
-                var res = await RequestAsync(HttpMethod.Get, QuarkConstants.ApiBase + "/1/clouddrive/member",
-                    new Dictionary<string, string> { { "pr", "ucpro" }, { "fr", "pc" } });
+                var res = await RequestAsync(HttpMethod.Get, _apiBase + "/1/clouddrive/member",
+                    new Dictionary<string, string> { { "pr", _pr }, { "fr", "pc" } });
                 Check(res, "查询网盘容量");
                 var data = AsDict(Get(AsDict(res), "data"));
                 long total = Pick(data, "total_capacity", "secret_total_capacity", "total");
@@ -375,8 +511,8 @@ namespace GeZi.Core.Api
 
         public async Task<string> GetStokenAsync(string pwdId, string passcode = "")
         {
-            var res = await RequestAsync(HttpMethod.Post, QuarkConstants.ApiBase + "/1/clouddrive/share/sharepage/token",
-                new Dictionary<string, string> { { "pr", "ucpro" }, { "fr", "pc" } },
+            var res = await RequestAsync(HttpMethod.Post, _apiBase + "/1/clouddrive/share/sharepage/token",
+                new Dictionary<string, string> { { "pr", _pr }, { "fr", "pc" } },
                 new { pwd_id = pwdId, passcode = passcode });
             Check(res, "获取分享凭证");
             return AsString(Get(AsDict(Get(AsDict(res), "data")), "stoken")) ?? "";
@@ -390,14 +526,14 @@ namespace GeZi.Core.Api
             {
                 var query = new Dictionary<string, string>
                 {
-                    { "pr", "ucpro" }, { "fr", "pc" },
+                    { "pr", _pr }, { "fr", "pc" },
                     { "pwd_id", pwdId }, { "stoken", stoken }, { "pdir_fid", pdirFid },
                     { "force", "0" }, { "_page", page.ToString() }, { "_size", "50" },
                     { "_fetch_banner", "0" }, { "_fetch_share", "0" }, { "_fetch_total", "1" },
                     { "_sort", "file_type:asc,updated_at:desc" },
                     { "ver", "2" }, { "fetch_share_full_path", "0" },
                 };
-                var res = await RequestAsync(HttpMethod.Get, QuarkConstants.ApiBase + "/1/clouddrive/share/sharepage/detail", query);
+                var res = await RequestAsync(HttpMethod.Get, _apiBase + "/1/clouddrive/share/sharepage/detail", query);
                 Check(res, "读取分享列表");
                 var list = AsArray(Get(AsDict(Get(AsDict(res), "data")), "list"));
                 int added = 0;
@@ -438,7 +574,7 @@ namespace GeZi.Core.Api
         {
             var query = new Dictionary<string, string>
             {
-                { "pr", "ucpro" }, { "fr", "pc" },
+                { "pr", _pr }, { "fr", "pc" },
                 { "pwd_id", pwdId }, { "stoken", stoken }, { "pdir_fid", pdirFid },
                 { "force", "0" }, { "_page", page.ToString() }, { "_size", DirPageSize.ToString() },
                 { "_fetch_banner", "0" }, { "_fetch_share", "0" }, { "_fetch_total", "1" },
@@ -446,7 +582,7 @@ namespace GeZi.Core.Api
                 { "ver", "2" }, { "fetch_share_full_path", "0" },
             };
             var res = await RequestAsync(HttpMethod.Get,
-                QuarkConstants.ApiBase + "/1/clouddrive/share/sharepage/detail", query);
+                _apiBase + "/1/clouddrive/share/sharepage/detail", query);
             Check(res, "读取分享列表");
             var one = new DirPage();
             var list = AsArray(Get(AsDict(Get(AsDict(res), "data")), "list"));
@@ -465,7 +601,7 @@ namespace GeZi.Core.Api
         {
             var query = new Dictionary<string, string>
             {
-                { "pr", "ucpro" }, { "fr", "pc" }, { "uc_param_str", "" },
+                { "pr", _pr }, { "fr", "pc" }, { "uc_param_str", "" },
                 { "pdir_fid", pdirFid }, { "_page", page.ToString() }, { "_size", DirPageSize.ToString() },
                 { "_fetch_total", "1" }, { "_fetch_sub_dirs", "0" },
                 { "_sort", "file_type:asc,updated_at:desc" },
@@ -473,7 +609,7 @@ namespace GeZi.Core.Api
                 { "fetch_risk_file_name", "1" },
             };
             var res = await RequestAsync(HttpMethod.Get,
-                QuarkConstants.ApiBase + "/1/clouddrive/file/sort", query);
+                _apiBase + "/1/clouddrive/file/sort", query);
             Check(res, "读取网盘列表");
             var one = new DirPage();
             var list = AsArray(Get(AsDict(Get(AsDict(res), "data")), "list"));
@@ -503,7 +639,7 @@ namespace GeZi.Core.Api
         {
             var query = new Dictionary<string, string>
             {
-                { "pr", "ucpro" }, { "fr", "pc" }, { "uc_param_str", "" }, { "app", "clouddrive" },
+                { "pr", _pr }, { "fr", "pc" }, { "uc_param_str", "" }, { "app", "clouddrive" },
                 { "__dt", Rng.Next(60000, 300001).ToString() },
                 { "__t", DateTimeOffset.UtcNow.ToUnixTimeMilliseconds().ToString() },
             };
@@ -517,7 +653,7 @@ namespace GeZi.Core.Api
                 pdir_fid = "0",
                 scene = "link",
             };
-            var res = await RequestAsync(HttpMethod.Post, QuarkConstants.ApiBase + "/1/clouddrive/share/sharepage/save", query, body);
+            var res = await RequestAsync(HttpMethod.Post, _apiBase + "/1/clouddrive/share/sharepage/save", query, body);
             Check(res, "转存");
             string taskId = AsString(Get(AsDict(Get(AsDict(res), "data")), "task_id"));
             if (string.IsNullOrEmpty(taskId))
@@ -539,12 +675,12 @@ namespace GeZi.Core.Api
                 ct.ThrowIfCancellationRequested();
                 var query = new Dictionary<string, string>
                 {
-                    { "pr", "ucpro" }, { "fr", "pc" }, { "uc_param_str", "" },
+                    { "pr", _pr }, { "fr", "pc" }, { "uc_param_str", "" },
                     { "task_id", taskId }, { "retry_index", retry.ToString() },
                     { "__dt", Rng.Next(60000, 300001).ToString() },
                     { "__t", DateTimeOffset.UtcNow.ToUnixTimeMilliseconds().ToString() },
                 };
-                var res = await RequestAsync(HttpMethod.Get, QuarkConstants.ApiBase + "/1/clouddrive/task", query);
+                var res = await RequestAsync(HttpMethod.Get, _apiBase + "/1/clouddrive/task", query);
                 Check(res, "查询转存任务");
                 var data = AsDict(Get(AsDict(res), "data"));
                 long status = AsLong(Get(data, "status"));
@@ -613,14 +749,14 @@ namespace GeZi.Core.Api
             {
                 var query = new Dictionary<string, string>
                 {
-                    { "pr", "ucpro" }, { "fr", "pc" }, { "uc_param_str", "" },
+                    { "pr", _pr }, { "fr", "pc" }, { "uc_param_str", "" },
                     { "pdir_fid", pdirFid }, { "_page", page.ToString() }, { "_size", "50" },
                     { "_fetch_total", "1" }, { "_fetch_sub_dirs", "0" },
                     { "_sort", "file_type:asc,updated_at:desc" },
                     { "_fetch_full_path", "0" }, { "fetch_all_file", "1" },
                     { "fetch_risk_file_name", "1" },
                 };
-                var res = await RequestAsync(HttpMethod.Get, QuarkConstants.ApiBase + "/1/clouddrive/file/sort", query);
+                var res = await RequestAsync(HttpMethod.Get, _apiBase + "/1/clouddrive/file/sort", query);
                 Check(res, "读取网盘列表");
                 var list = AsArray(Get(AsDict(Get(AsDict(res), "data")), "list"));
                 int added = 0;
@@ -642,8 +778,8 @@ namespace GeZi.Core.Api
 
         public async Task<string> PathFidAsync(string path)
         {
-            var res = await RequestAsync(HttpMethod.Post, QuarkConstants.ApiBase + "/1/clouddrive/file/info/path_list",
-                new Dictionary<string, string> { { "pr", "ucpro" }, { "fr", "pc" } },
+            var res = await RequestAsync(HttpMethod.Post, _apiBase + "/1/clouddrive/file/info/path_list",
+                new Dictionary<string, string> { { "pr", _pr }, { "fr", "pc" } },
                 new { file_path = new[] { path }, @namespace = "0" });
             Check(res, "查询目录");
             var arr = AsArray(Get(AsDict(res), "data"));
@@ -661,8 +797,8 @@ namespace GeZi.Core.Api
 
         public async Task<string> MkdirAsync(string path)
         {
-            var res = await RequestAsync(HttpMethod.Post, QuarkConstants.ApiBase + "/1/clouddrive/file",
-                new Dictionary<string, string> { { "pr", "ucpro" }, { "fr", "pc" }, { "uc_param_str", "" } },
+            var res = await RequestAsync(HttpMethod.Post, _apiBase + "/1/clouddrive/file",
+                new Dictionary<string, string> { { "pr", _pr }, { "fr", "pc" }, { "uc_param_str", "" } },
                 new { pdir_fid = "0", file_name = "", dir_path = path, dir_init_lock = false });
             Check(res, "创建文件夹");
             string fid = AsString(Get(AsDict(Get(AsDict(res), "data")), "fid"));
@@ -684,11 +820,11 @@ namespace GeZi.Core.Api
             var attempts = new[]
             {
                 // 入口 1：PC 客户端入口（常规最优）
-                new Dictionary<string, string> { { "pr", "ucpro" }, { "fr", "pc" }, { "uc_param_str", "" } },
+                new Dictionary<string, string> { { "pr", _pr }, { "fr", "pc" }, { "uc_param_str", "" } },
                 // 入口 2：网页端入口（CDN 选择策略可能不同）
-                new Dictionary<string, string> { { "pr", "ucpro" }, { "fr", "pc" }, { "uc_param_str", "" }, { "entry", "ft" } },
+                new Dictionary<string, string> { { "pr", _pr }, { "fr", "pc" }, { "uc_param_str", "" }, { "entry", "ft" } },
                 // 入口 3：移动端入口（部分网络下反而更稳）
-                new Dictionary<string, string> { { "pr", "ucpro" }, { "fr", "android" }, { "uc_param_str", "" } },
+                new Dictionary<string, string> { { "pr", _pr }, { "fr", "android" }, { "uc_param_str", "" } },
             };
 
             object lastRes = null;
@@ -700,7 +836,7 @@ namespace GeZi.Core.Api
                 try
                 {
                     var res = await RequestAsync(HttpMethod.Post,
-                        QuarkConstants.ApiBase + "/1/clouddrive/file/download", q,
+                        _apiBase + "/1/clouddrive/file/download", q,
                         new { fids = fids }).ConfigureAwait(false);
                     Check(res, "获取直链");
                     var list = ParseDownloadData(Get(AsDict(res), "data"));
@@ -733,9 +869,9 @@ namespace GeZi.Core.Api
         {
             var attempts = new[]
             {
-                new Dictionary<string, string> { { "entry", "ft" }, { "fr", "pc" }, { "pr", "ucpro" } },
-                new Dictionary<string, string> { { "pr", "ucpro" }, { "fr", "pc" }, { "uc_param_str", "" } },
-                new Dictionary<string, string> { { "pr", "ucpro" }, { "fr", "android" }, { "uc_param_str", "" } },
+                new Dictionary<string, string> { { "entry", "ft" }, { "fr", "pc" }, { "pr", _pr } },
+                new Dictionary<string, string> { { "pr", _pr }, { "fr", "pc" }, { "uc_param_str", "" } },
+                new Dictionary<string, string> { { "pr", _pr }, { "fr", "android" }, { "uc_param_str", "" } },
             };
 
             object lastRes = null;
@@ -747,7 +883,7 @@ namespace GeZi.Core.Api
                 try
                 {
                     var res = await RequestAsync(HttpMethod.Post,
-                        QuarkConstants.ApiBase + "/1/clouddrive/file/download", q,
+                        _apiBase + "/1/clouddrive/file/download", q,
                         new { fids = fids, fids_token = tokens, pwd_id = pwdId, stoken = stoken }).ConfigureAwait(false);
                     Check(res, "获取分享直链");
                     var list = ParseDownloadData(Get(AsDict(res), "data"));
@@ -840,8 +976,8 @@ namespace GeZi.Core.Api
 
         public async Task DeleteAsync(IList<string> fids)
         {
-            var res = await RequestAsync(HttpMethod.Post, QuarkConstants.ApiBase + "/1/clouddrive/file/delete",
-                new Dictionary<string, string> { { "pr", "ucpro" }, { "fr", "pc" }, { "uc_param_str", "" } },
+            var res = await RequestAsync(HttpMethod.Post, _apiBase + "/1/clouddrive/file/delete",
+                new Dictionary<string, string> { { "pr", _pr }, { "fr", "pc" }, { "uc_param_str", "" } },
                 new { action_type = 2, filelist = fids, exclude_fids = new string[0] });
             Check(res, "删除文件");
         }
@@ -852,11 +988,11 @@ namespace GeZi.Core.Api
             var records = new List<string>();
             for (int page = 1; page <= 20; page++)
             {
-                var res = await RequestAsync(HttpMethod.Get, QuarkConstants.ApiBase + "/1/clouddrive/file/recycle/list",
+                var res = await RequestAsync(HttpMethod.Get, _apiBase + "/1/clouddrive/file/recycle/list",
                     new Dictionary<string, string>
                     {
                         { "_page", page.ToString() }, { "_size", "50" },
-                        { "pr", "ucpro" }, { "fr", "pc" }, { "uc_param_str", "" },
+                        { "pr", _pr }, { "fr", "pc" }, { "uc_param_str", "" },
                     });
                 Check(res, "读取回收站");
                 var lst = AsArray(Get(AsDict(Get(AsDict(res), "data")), "list"));
@@ -881,8 +1017,8 @@ namespace GeZi.Core.Api
             }
             if (records.Count > 0)
             {
-                var res = await RequestAsync(HttpMethod.Post, QuarkConstants.ApiBase + "/1/clouddrive/file/recycle/remove",
-                    new Dictionary<string, string> { { "uc_param_str", "" }, { "fr", "pc" }, { "pr", "ucpro" } },
+                var res = await RequestAsync(HttpMethod.Post, _apiBase + "/1/clouddrive/file/recycle/remove",
+                    new Dictionary<string, string> { { "uc_param_str", "" }, { "fr", "pc" }, { "pr", _pr } },
                     new { select_mode = 2, record_list = records });
                 Check(res, "清理回收站");
             }
@@ -914,6 +1050,10 @@ namespace GeZi.Core.Api
                 DownloadUrl = AsString(Get(it, "download_url")) ?? "",
                 Name = AsString(Get(it, "file_name")) ?? "",
                 Size = AsLong(Get(it, "size")),
+                // 夸克不同接口用过的字段名不完全一致；有就带上，没有就留空。
+                Md5 = AsString(Get(it, "md5")) ?? AsString(Get(it, "file_md5")),
+                Sha1 = AsString(Get(it, "sha1")) ?? AsString(Get(it, "file_sha1")),
+                Sha256 = AsString(Get(it, "sha256")) ?? AsString(Get(it, "file_sha256")),
             };
         }
 
@@ -998,6 +1138,14 @@ namespace GeZi.Core.Api
             try
             {
                 await ListDirAsync("0", 1).ConfigureAwait(false);
+                // 保活顺便做**预防性续期**：__puus 约 3 小时到期，这里按 90 分钟
+                // 主动换一次新的，避免用户刚好在到期那一刻操作而撞上 401。
+                // 失败不影响保活结论（真失效会在下一轮请求里暴露）。
+                if (DateTime.UtcNow - _lastPuusRefreshAt
+                    > TimeSpan.FromMilliseconds(UcConstants.PuusRefreshIntervalMs))
+                {
+                    await RefreshPuusAsync().ConfigureAwait(false);
+                }
                 return true;
             }
             catch
@@ -1011,7 +1159,7 @@ namespace GeZi.Core.Api
         {
             try
             {
-                await RequestCoreAsync(HttpMethod.Get, QuarkConstants.AccountUrl,
+                await RequestCoreAsync(HttpMethod.Get, _accountUrl,
                     new Dictionary<string, string> { { "fr", "pc" }, { "platform", "pc" } },
                     null, 10).ConfigureAwait(false);
                 return true;
@@ -1026,10 +1174,10 @@ namespace GeZi.Core.Api
                 try
                 {
                     await RequestCoreAsync(HttpMethod.Get,
-                        QuarkConstants.ApiBase + "/1/clouddrive/file/sort",
+                        _apiBase + "/1/clouddrive/file/sort",
                         new Dictionary<string, string>
                         {
-                            { "pr", "ucpro" }, { "fr", "pc" },
+                            { "pr", _pr }, { "fr", "pc" },
                             { "pdir_fid", "0" }, { "_page", "1" }, { "_size", "1" },
                         }, null, 10).ConfigureAwait(false);
                     return true;
@@ -1044,6 +1192,131 @@ namespace GeZi.Core.Api
                     return true;
                 }
             }
+        }
+
+        /// <summary>
+        /// 刷新 <c>__puus</c>（会话级短命凭证），**不要求用户重新登录**。
+        /// <para>
+        /// 背景：UC 与夸克的登录态由两个 Cookie 组成 —— <c>__pus</c>（长效，随登录下发）
+        /// 与 <c>__puus</c>（约 3 小时过期）。用户「明明登录成功了，过几小时重启却显示
+        /// 未登录」的真实原因就是 <c>__puus</c> 到期，而不是账号失效。
+        /// </para>
+        /// <para>
+        /// 手法照搬 AList <c>refreshPuus</c> 与 YunX <c>UCApi.refreshSession</c>：
+        /// <b>把 <c>__puus</c> 从 Cookie 里摘掉，只带 <c>__pus</c> 去请求
+        /// <c>/1/clouddrive/config</c></b>，服务端会在 <c>Set-Cookie</c> 里
+        /// 重新下发一个新鲜的 <c>__puus</c>。拿不到就说明长效凭证也废了，
+        /// 这时才真的需要重新登录。
+        /// </para>
+        /// </summary>
+        /// <returns>成功刷新并写回会话返回 true。</returns>
+        public async Task<bool> RefreshPuusAsync()
+        {
+            // 无论成败都记一次时间：失败时不要把保活心跳变成"每次都要重试刷新"
+            _lastPuusRefreshAt = DateTime.UtcNow;
+
+            string current = CookieStr;
+            if (string.IsNullOrEmpty(current))
+                return false;
+
+            // 没有 __pus 就没有长效凭证，刷新必然失败（YunX 的 isValidCookie 同样要求它）
+            var parsed = QuarkSession.ParseCookies(current);
+            string pus;
+            if (!parsed.TryGetValue(UcConstants.CookiePus, out pus) || string.IsNullOrEmpty(pus))
+                return false;
+
+            // 摘掉 __puus 才是刷新；带着旧值去问，服务端不会重新签发
+            string stripped = StripCookie(current, UcConstants.CookiePuus);
+            if (string.IsNullOrEmpty(stripped))
+                return false;
+
+            string configUrl = _kind == PanKind.Uc ? UcConstants.ConfigUrl : QuarkConstants.ConfigUrl;
+
+            // UC 的 config 也在 pc-api.uc.cn 上，同样被 TLS 指纹拦，必须走 OpenSSL 通道。
+            // 这里不能用临时 QuarkSession（那条路是原生 HttpClient），要直接拿 stripped 拼头。
+            if (NeedsOpenSsl(configUrl))
+            {
+                try
+                {
+                    var uri = new Uri(configUrl);
+                    var hdrs = _session.BuildHeadersForKind(configUrl, api: true);
+                    // 换成摘掉 __puus 的 Cookie 串，服务端才会重新签发
+                    hdrs["Cookie"] = stripped;
+                    var resp = await Task.Run(() => OpenSslTls.Send(
+                        uri.Host, "GET", uri.PathAndQuery, hdrs, null, 20000)).ConfigureAwait(false);
+
+                    string fresh = null;
+                    foreach (var c in resp.Cookies)
+                    {
+                        if (string.IsNullOrEmpty(c.Key) || string.IsNullOrEmpty(c.Value))
+                            continue;
+                        if (string.Equals(c.Key, UcConstants.CookiePuus, StringComparison.OrdinalIgnoreCase))
+                            fresh = c.Value;
+                        else if (string.Equals(c.Key, UcConstants.CookiePus, StringComparison.OrdinalIgnoreCase))
+                            _session.SetCookie(UcConstants.CookiePus, c.Value);
+                    }
+                    if (string.IsNullOrEmpty(fresh))
+                        return false;
+                    _session.SetCookie(UcConstants.CookiePuus, fresh);
+                    return true;
+                }
+                catch
+                {
+                    return false;
+                }
+            }
+
+            QuarkSession tmp = null;
+            try
+            {
+                tmp = new QuarkSession(stripped, DecompressionMethods.None, _kind);
+                tmp.MinIntervalMs = 0;      // 刷新是一次性请求，不必节流
+                using (var resp = await tmp.SendWithRetryAsync(() =>
+                {
+                    var req = new HttpRequestMessage(HttpMethod.Get, configUrl);
+                    tmp.ApplyHeadersForKind(req, configUrl, api: true);
+                    return req;
+                }, 2, CancellationToken.None).ConfigureAwait(false))
+                {
+                    // 服务端下发的 __puus/__pus 由临时会话的 CookieContainer 自动收下
+                    string newPuus = tmp.GetCookieValue(UcConstants.CookiePuus);
+                    if (string.IsNullOrEmpty(newPuus))
+                        return false;
+
+                    _session.SetCookie(UcConstants.CookiePuus, newPuus);
+                    string newPus = tmp.GetCookieValue(UcConstants.CookiePus);
+                    if (!string.IsNullOrEmpty(newPus) && !string.Equals(newPus, pus, StringComparison.Ordinal))
+                        _session.SetCookie(UcConstants.CookiePus, newPus);
+                    return true;
+                }
+            }
+            catch
+            {
+                return false;
+            }
+            finally
+            {
+                if (tmp != null)
+                    tmp.Dispose();
+            }
+        }
+
+        /// <summary>从 Cookie 串里去掉指定名字的项（对应 YunX 的 <c>withoutPuus</c>）。</summary>
+        private static string StripCookie(string cookie, string name)
+        {
+            if (string.IsNullOrEmpty(cookie) || string.IsNullOrEmpty(name))
+                return cookie;
+            var parts = new List<string>();
+            foreach (var raw in cookie.Split(';'))
+            {
+                string p = raw.Trim();
+                if (p.Length == 0)
+                    continue;
+                if (p.StartsWith(name + "=", StringComparison.OrdinalIgnoreCase))
+                    continue;
+                parts.Add(p);
+            }
+            return string.Join("; ", parts);
         }
 
         /// <summary>启动后台保活心跳。周期带随机抖动，避免固定节奏被识别。</summary>

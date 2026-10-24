@@ -1,15 +1,15 @@
-﻿// GeZi —— 夸克网盘下载器 (Quark netdisk downloader)
+﻿// GeZi —— 多网盘下载器 (Multi-cloud downloader)
 // Copyright (C) 2026  Yi Yuan
 // This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
+// it under the terms of the GNU Affero General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 // This program is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU General Public License for more details.
-// You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+// GNU Affero General Public License for more details.
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/agpl-3.0>.
 
 using System;
 using System.Collections.Concurrent;
@@ -19,6 +19,7 @@ using System.IO;
 using System.Linq;
 using System.Net;
 using System.Net.Http;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
@@ -43,6 +44,9 @@ namespace GeZi.Core.Download
         private readonly int _threads;
         private readonly string _ua;
         private readonly string _referer;
+        /// <summary>下载请求的 Origin，与 <see cref="_referer"/> 成对匹配。</summary>
+        private readonly string _origin;
+        private readonly bool _useOpenSsl;
         private readonly string _cookie;
         private readonly CookieContainer _jar;
         private readonly HttpClient _http;
@@ -54,6 +58,13 @@ namespace GeZi.Core.Download
         /// 留空即保持原有"同级 .qparts"行为，零风险。
         /// </summary>
         private readonly string _partsRoot;
+
+        // 期望的内容哈希（由取链响应传入；没有就保持空 = 未校验）。
+        // 用实例字段而不是层层传参：AttemptAsync/DownloadSingleAsync 的签名已经很长，
+        // 且一个 downloader 实例只服务一个任务，生命周期与任务一致。
+        private string _expectedMd5;
+        private string _expectedSha1;
+        private string _expectedSha256;
 
         /// <summary>
         /// 新建分片目录时是否设为「隐藏」（对齐 Python Flet 版的 hide_parts）。
@@ -152,6 +163,19 @@ namespace GeZi.Core.Download
         /// 而 total 是 AttemptAsync 内部探测出来的，所以在这里带出来。
         /// </summary>
         private long _lastProbedTotal;
+
+        /// <summary>
+        /// 探测阶段拿到的资源指纹（ETag 优先，其次 Last-Modified），用于 If-Range。
+        /// <para>
+        /// 空字符串 = 服务端没给，退化为"不校验资源是否变更"（历史行为）。
+        /// </para>
+        /// <para>
+        /// <b>为什么必须有</b>：分片下载期间服务端文件变了，If-Range 会让服务端
+        /// 返回 200 整份新文件而不是 206；没有它的话服务端会返回"新版本的同区间字节"，
+        /// 我们照写不误，最终合并出一个长度正确但内容错乱的文件。
+        /// </para>
+        /// </summary>
+        private string _ifRange = "";
 
         /// <summary>
         /// 合并线程收到收尾信号后，还要连续多少轮读不到新数据才真的退出。
@@ -620,15 +644,17 @@ namespace GeZi.Core.Download
         }
 
         public SegmentedDownloader(int threads = 0, string ua = null, string referer = null, string cookie = "",
-            string partsRoot = null)
+            string partsRoot = null, string origin = null, bool useOpenSsl = false)
         {
             _threads = Math.Max(1, threads > 0 ? threads : QuarkConstants.DownloadThreads);
             _ua = string.IsNullOrEmpty(ua) ? QuarkConstants.DlUa : ua;
             _referer = string.IsNullOrEmpty(referer) ? QuarkConstants.Referer : referer;
+            _origin = string.IsNullOrEmpty(origin) ? QuarkConstants.Origin : origin;
+            _useOpenSsl = useOpenSsl;
             _cookie = cookie ?? "";
             _partsRoot = string.IsNullOrWhiteSpace(partsRoot) ? null : partsRoot.Trim();
             _jar = new CookieContainer { Capacity = 500, PerDomainCapacity = 200 };
-            SeedCookies(_jar, _cookie);
+            SeedCookies(_jar, _cookie, _referer);
             var handler = new HttpClientHandler
             {
                 UseCookies = true,
@@ -657,8 +683,24 @@ namespace GeZi.Core.Download
         /// 重新取一条直链，用新链接着下。**已下载的部分原样保留**，不重下。
         /// </summary>
         public async Task<DownloadResult> DownloadAsync(string url, string dest,
-            IProgress<DownloadProgress> progress = null, CancellationToken cancel = default, PauseToken pause = null)
+            IProgress<DownloadProgress> progress = null, CancellationToken cancel = default, PauseToken pause = null,
+            string expectedMd5 = null, string expectedSha1 = null, string expectedSha256 = null)
         {
+            _expectedMd5 = NormalizeHash(expectedMd5);
+            _expectedSha1 = NormalizeHash(expectedSha1);
+            _expectedSha256 = NormalizeHash(expectedSha256);
+
+            // 本地路径预检：长度、保留名、目录可写一次性问清楚，
+            // 避免分片跑到一半才因为路径问题失败（那时用户已经等了几十分钟）。
+            string pfError, pfWarning;
+            if (!PathUtil.TryPreflight(dest, out pfError, out pfWarning))
+            {
+                Log?.Invoke("路径预检未通过：" + pfError);
+                return new DownloadResult { Ok = false, Message = pfError };
+            }
+            if (!string.IsNullOrEmpty(pfWarning))
+                Log?.Invoke("路径预检提示：" + pfWarning);
+
             // 兜底：确保目标目录存在（调用方创建失败时这里再建一次）
             try
             {
@@ -688,11 +730,14 @@ namespace GeZi.Core.Download
             {
                 var (ok, m) = await AttemptAsync(url, dest, headers, progress, cancel, pause, taskStart).ConfigureAwait(false);
                 if (ok)
-                    return new DownloadResult { Ok = true };
+                    return new DownloadResult { Ok = true, Message = m };
                 msg = m;
 
-                if (LinkRefresher == null || !IsSignatureExpired(msg))
+                var refreshReason = ClassifyLinkError(msg);
+                // 非签名类错误（如磁盘满、哈希不符）：重取链没有意义，直接结束。
+                if (LinkRefresher == null || refreshReason == LinkRefreshReason.None)
                     break;
+                Log?.Invoke("直链失效原因判定：" + DescribeRefreshReason(refreshReason));
 
                 // 刷新上限**按文件大小动态算**，不再写死 5。
                 // 原来写死 5 的依据是"9MB/s 跑 17 分钟"；但速度掉到 2.5MB/s 时同一文件要 60+ 分钟，
@@ -769,23 +814,60 @@ namespace GeZi.Core.Download
                 ClearPartial(dest);
                 var (ok2, msg2) = await DownloadSingleAsync(url, dest, fb, null, progress, cancel, pause).ConfigureAwait(false);
                 if (ok2)
-                    return new DownloadResult { Ok = true };
+                {
+                    var hc = await VerifyHashAsync(dest).ConfigureAwait(false);
+                    if (!hc.Ok)
+                        return new DownloadResult { Ok = false, Message = hc.Message };
+                    return new DownloadResult { Ok = true, Message = hc.Message };
+                }
                 msg = msg + "; 兜底" + i + "(" + msg2 + ")";
             }
             return new DownloadResult { Ok = false, Message = msg };
         }
 
+        /// <summary>直链失效原因分类。只有"签名/授权类"才值得重新取链。</summary>
+        private enum LinkRefreshReason
+        {
+            None = 0,
+            /// <summary>401 未授权。</summary>
+            Unauthorized,
+            /// <summary>403 签名过期 / 防盗链。</summary>
+            Forbidden,
+            /// <summary>412 前置条件失败（夸克常用它表示签名校验不过）。</summary>
+            PreconditionFailed,
+        }
+
+        /// <summary>把错误文本分类成可判定的失效原因，而不是靠字符串包含判断。</summary>
+        private static LinkRefreshReason ClassifyLinkError(string err)
+        {
+            var m = Regex.Match(err ?? "", @"HTTP (\d+)");
+            int code;
+            if (!m.Success || !int.TryParse(m.Groups[1].Value, out code))
+                return LinkRefreshReason.None;
+            switch (code)
+            {
+                case 401: return LinkRefreshReason.Unauthorized;
+                case 403: return LinkRefreshReason.Forbidden;
+                case 412: return LinkRefreshReason.PreconditionFailed;
+                default: return LinkRefreshReason.None;
+            }
+        }
+
         /// <summary>是否是"直链签名/授权已过期"这类错误（重新取链有意义）。</summary>
         private static bool IsSignatureExpired(string err)
         {
-            var m = Regex.Match(err ?? "", @"HTTP (\d+)");
-            if (!m.Success)
-                return false;
-            int code;
-            if (!int.TryParse(m.Groups[1].Value, out code))
-                return false;
-            // 401 未授权、403 签名过期/防盗链、412 前置条件失败（夸克常用它表示签名校验不过）
-            return code == 401 || code == 403 || code == 412;
+            return ClassifyLinkError(err) != LinkRefreshReason.None;
+        }
+
+        private static string DescribeRefreshReason(LinkRefreshReason reason)
+        {
+            switch (reason)
+            {
+                case LinkRefreshReason.Unauthorized: return "HTTP 401 未授权";
+                case LinkRefreshReason.Forbidden: return "HTTP 403 签名过期/防盗链";
+                case LinkRefreshReason.PreconditionFailed: return "HTTP 412 前置条件失败";
+                default: return "非签名类错误";
+            }
         }
 
         /// <summary>
@@ -823,16 +905,35 @@ namespace GeZi.Core.Download
             Dictionary<string, string> headers, IProgress<DownloadProgress> progress,
             CancellationToken cancel, PauseToken pause, DateTime taskStart)
         {
-            var (total, supports) = await ProbeAsync(url, headers, cancel).ConfigureAwait(false);
+            var probe = await ProbeAsync(url, headers, cancel).ConfigureAwait(false);
+            long total = probe.Total;
             // 带出来给 ComputeMaxLinkRefreshes 用（刷新上限要按文件大小算，见那里）
             _lastProbedTotal = total;
-            if (supports && total > 0)
+            // 资源指纹：分片请求要带 If-Range，否则服务端文件变了会静默写坏。
+            // 每次 AttemptAsync 都重新探测，所以换链之后这里会自动跟着更新。
+            _ifRange = !string.IsNullOrEmpty(probe.ETag) ? probe.ETag : (probe.LastModified ?? "");
+            if (probe.Kind == ProbeKind.AuthFailed || probe.Kind == ProbeKind.NotFound)
+            {
+                // 鉴权/文件不存在：再走一遍单连接也只会得到同样的 4xx，
+                // 但保留单连接路径可以拿到服务端的具体错误体，便于文案。
+                Log?.Invoke(string.Format("探测判定 {0}（{1}），改用单连接尝试。",
+                    probe.Kind, probe.Error));
+            }
+            if (probe.SupportsRange && total > 0)
             {
                 // 落盘方式唯一：独立分片 + 边合并，
                 // 在 DownloadSegmentedAsync 内部统一分派，这里不再分支。
                 return await DownloadSegmentedAsync(url, dest, headers, total, progress, cancel, pause, taskStart).ConfigureAwait(false);
             }
-            return await DownloadSingleAsync(url, dest, headers, total, progress, cancel, pause).ConfigureAwait(false);
+            var single = await DownloadSingleAsync(url, dest, headers, total, progress, cancel, pause).ConfigureAwait(false);
+            if (!single.Item1)
+                return single;
+            Report(progress, total, total, 0, "正在校验内容…");
+            var hc = await VerifyHashAsync(dest).ConfigureAwait(false);
+            if (!hc.Ok)
+                return (false, hc.Message);
+            Log?.Invoke("单连接完成。" + hc.Suffix);
+            return (true, hc.Message);
         }
 
         private Dictionary<string, string> BuildHeaders()
@@ -854,7 +955,7 @@ namespace GeZi.Core.Download
             // 真实客户端发起请求时这组头是齐的，缺项本身即异常特征。
             // 参考 QuarkDownloader 在 sendFilesToMotrixRpc 中同样补了 Referer，
             // 这里把 Origin 与 Sec-Fetch-* 一并补齐，形成完整闭环。
-            h["Origin"] = QuarkConstants.Origin;
+            h["Origin"] = _origin;
             h["Accept"] = "*/*";
             h["Accept-Language"] = "zh-CN,zh;q=0.9,en;q=0.8";
             h["Sec-Fetch-Dest"] = "empty";
@@ -863,10 +964,20 @@ namespace GeZi.Core.Download
             return h;
         }
 
-        private static void SeedCookies(CookieContainer jar, string cookie)
+        /// <summary>
+        /// 把 <paramref name="cookie"/> 里的键值种进 CookieContainer。
+        /// <para>
+        /// 域**必须按 <paramref name="referer"/> 推导**：原来硬编码 <c>.quark.cn</c>，
+        /// 于是 UC 账号的 Cookie 全被种到夸克域下，对 <c>drive.uc.cn</c> 的直链
+        /// 一个都不会自动附加（阿里/迅雷同理）。显式 Cookie 头虽然也在发，
+        /// 但 CookieContainer 里存错域会在重定向换域时丢 cookie。
+        /// </para>
+        /// </summary>
+        private static void SeedCookies(CookieContainer jar, string cookie, string referer)
         {
             if (string.IsNullOrEmpty(cookie))
                 return;
+            string domain = CookieDomainOf(referer);
             foreach (var part in cookie.Split(';'))
             {
                 var p = part.Trim();
@@ -877,7 +988,7 @@ namespace GeZi.Core.Download
                     continue;
                 try
                 {
-                    jar.Add(new Cookie(p.Substring(0, eq).Trim(), p.Substring(eq + 1).Trim(), "/", ".quark.cn"));
+                    jar.Add(new Cookie(p.Substring(0, eq).Trim(), p.Substring(eq + 1).Trim(), "/", domain));
                 }
                 catch
                 {
@@ -886,17 +997,58 @@ namespace GeZi.Core.Download
             }
         }
 
-        private static IEnumerable<Dictionary<string, string>> FallbackHeaders()
+        /// <summary>
+        /// 从 Referer 推出 Cookie 该种的域：取主机名后两级（<c>drive.uc.cn</c> → <c>.uc.cn</c>）。
+        /// 推不出来就退回夸克域，保持与历史行为一致。
+        /// </summary>
+        private static string CookieDomainOf(string referer)
+        {
+            const string Fallback = ".quark.cn";
+            if (string.IsNullOrEmpty(referer))
+                return Fallback;
+            try
+            {
+                var u = new Uri(referer);
+                string host = u.Host;
+                var parts = host.Split('.');
+                if (parts.Length < 2)
+                    return Fallback;
+                return "." + parts[parts.Length - 2] + "." + parts[parts.Length - 1];
+            }
+            catch
+            {
+                return Fallback;
+            }
+        }
+
+        /// <summary>
+        /// 兜底重试的头组合。
+        /// <para>
+        /// <b>必须用本任务自己的身份</b>（<c>_ua</c>/<c>_referer</c>/<c>_origin</c>），
+        /// 不能再硬编码夸克 —— 原来 UC/阿里/迅雷的任务失败后，兜底会用夸克头再撞一次，
+        /// 必然还是 403，用户看到的就是「兜底1(HTTP 403 Forbidden)」这种无用重试。
+        /// </para>
+        /// <para>
+        /// 顺序是从「最完整」到「最少」：完整头 → 去掉 Origin（个别 CDN 对 Origin 敏感）
+        /// → 只留 UA（防盗链对 Referer 敏感时用）。
+        /// </para>
+        /// </summary>
+        private IEnumerable<Dictionary<string, string>> FallbackHeaders()
         {
             yield return new Dictionary<string, string>
             {
-                { "User-Agent", QuarkConstants.DlUa },
-                { "Referer", QuarkConstants.Referer },
-                { "Origin", QuarkConstants.Origin },
+                { "User-Agent", _ua },
+                { "Referer", _referer },
+                { "Origin", _origin },
             };
             yield return new Dictionary<string, string>
             {
-                { "User-Agent", QuarkConstants.DlUa },
+                { "User-Agent", _ua },
+                { "Referer", _referer },
+            };
+            yield return new Dictionary<string, string>
+            {
+                { "User-Agent", _ua },
             };
         }
 
@@ -911,11 +1063,16 @@ namespace GeZi.Core.Download
             return int.TryParse(m.Groups[1].Value, out code) && code >= 400 && code < 500;
         }
 
+        /// <summary>待删除标记后缀。取消/失败时目标文件先改名为它，再尝试删除。</summary>
+        public const string PendingDeleteSuffix = ".gezi-deleting";
+
         private void ClearPartial(string dest)
         {
             string pd, mp;
             ResolvePaths(dest, out pd, out mp);
             try { File.Delete(mp); } catch { }
+            // 兼容历史版本可能留下的 .bak；当前 SavePlan 不再生成。
+            try { File.Delete(mp + ".bak"); } catch { }
             // 独立分片模式会留下一个分片目录。不清理的话，用户取消一次就在
             // 下载目录里永久留一堆孤儿文件 —— 尤其是大文件，分片加起来可能好几 GB。
             try
@@ -937,33 +1094,340 @@ namespace GeZi.Core.Download
                 }
                 catch { }
             }
-            try { if (File.Exists(dest)) File.Delete(dest); } catch { }
+            // 软删除：先把目标文件改名成明确的「待删除」标记，再尝试真正删除。
+            // 直接 File.Delete 的问题是：取消瞬间可能还有 worker 持有句柄，
+            // 删除失败被吞掉 → 用户看到的是"半截文件还在原地"，下次同名下载还会撞上它。
+            // 改名后即使删不掉，也不会再和任何新下载冲突，且下次启动可被清扫。
+            try
+            {
+                if (File.Exists(dest))
+                {
+                    string pending = dest + PendingDeleteSuffix;
+                    try
+                    {
+                        if (File.Exists(pending)) File.Delete(pending);
+                        File.Move(dest, pending);
+                        File.Delete(pending);
+                    }
+                    catch
+                    {
+                        // 仍被占用：保留 .gezi-deleting，交给 SweepPendingDeletes 收尾。
+                    }
+                }
+            }
+            catch { }
+        }
+
+        /// <summary>
+        /// 清理上次运行留下的 <c>*.gezi-deleting</c> 残留。下载中删除失败的文件会留成这个后缀，
+        /// 下次启动时它们已不可能被占用，直接删掉即可。返回删除的文件数。
+        /// </summary>
+        public static int SweepPendingDeletes(IEnumerable<string> roots)
+        {
+            int removed = 0;
+            if (roots == null)
+                return 0;
+            foreach (string root in roots)
+            {
+                if (string.IsNullOrWhiteSpace(root) || !Directory.Exists(root))
+                    continue;
+                IEnumerable<string> files;
+                try { files = Directory.EnumerateFiles(root, "*" + PendingDeleteSuffix, SearchOption.AllDirectories); }
+                catch { continue; }
+                foreach (string f in files)
+                {
+                    try { File.Delete(f); removed++; }
+                    catch { }
+                }
+            }
+            return removed;
         }
 
         // ---------------- 探测 ----------------
 
-        private async Task<(long total, bool supports)> ProbeAsync(string url, Dictionary<string, string> headers,
-            CancellationToken cancel)
+        /// <summary>
+        /// 从响应头取资源指纹：ETag 优先，其次 Last-Modified。
+        /// 两者都拿不到就留空（调用方退化为不校验）。
+        /// </summary>
+        /// <summary>
+        /// 把 OpenSSL 流式读到的字节写进分片文件，同时维护进度、响应暂停与取消。
+        /// </summary>
+        /// <remarks>
+        /// <see cref="OpenSslTls.DownloadTo"/> 是同步阻塞的，跑在 <c>Task.Run</c> 里；
+        /// 每写一块就检查一次取消，粒度是单次 <c>SSL_read</c>（≤64 KiB），
+        /// 足够让"慢连接抢占"和用户取消及时生效。
+        /// </remarks>
+        private sealed class PartSink : Stream
+        {
+            private readonly Stream _inner;
+            private readonly CancellationToken _partToken;
+            private readonly CancellationToken _cancelToken;
+            private readonly PauseToken _pause;
+            private readonly Action<int> _onWritten;
+
+            public PartSink(Stream inner, CancellationToken partToken, PauseToken pause,
+                CancellationToken cancelToken, Action<int> onWritten)
+            {
+                _inner = inner;
+                _partToken = partToken;
+                _pause = pause;
+                _cancelToken = cancelToken;
+                _onWritten = onWritten;
+            }
+
+            public override bool CanRead { get { return false; } }
+            public override bool CanSeek { get { return false; } }
+            public override bool CanWrite { get { return true; } }
+            public override long Length { get { throw new NotSupportedException(); } }
+            public override long Position
+            {
+                get { throw new NotSupportedException(); }
+                set { throw new NotSupportedException(); }
+            }
+
+            public override void Flush() { _inner.Flush(); }
+            public override int Read(byte[] buffer, int offset, int count)
+            {
+                throw new NotSupportedException();
+            }
+            public override long Seek(long offset, SeekOrigin origin)
+            {
+                throw new NotSupportedException();
+            }
+            public override void SetLength(long value)
+            {
+                throw new NotSupportedException();
+            }
+
+            public override void Write(byte[] buffer, int offset, int count)
+            {
+                if (_cancelToken.IsCancellationRequested || _partToken.IsCancellationRequested)
+                    throw new OperationCanceledException();
+                // 暂停：这里已是阻塞线程，同步等待即可（恢复后原样续写，不丢不重）。
+                if (_pause != null)
+                    _pause.WaitIfPausedAsync(_cancelToken).GetAwaiter().GetResult();
+                _inner.Write(buffer, offset, count);
+                if (_onWritten != null) _onWritten(count);
+            }
+        }
+
+        /// <summary>从响应头原文里抓强 ETag / Last-Modified（OpenSSL 通道用）。</summary>
+        private static void CaptureValidatorFromHeaders(string rawHeaders, ProbeResult result)
+        {
+            if (string.IsNullOrEmpty(rawHeaders) || result == null) return;
+            string[] lines = rawHeaders.Split(new[] { "\r\n" }, StringSplitOptions.None);
+            for (int i = 0; i < lines.Length; i++)
+            {
+                string ln = lines[i];
+                int colon = ln.IndexOf(':');
+                if (colon <= 0) continue;
+                string name = ln.Substring(0, colon).Trim();
+                string value = ln.Substring(colon + 1).Trim();
+                if (string.Equals(name, "ETag", StringComparison.OrdinalIgnoreCase))
+                {
+                    // 弱 ETag（W/"..."）按 RFC 7233 不得用于 If-Range。
+                    if (value.Length > 1 && !value.StartsWith("W/", StringComparison.OrdinalIgnoreCase))
+                        result.ETag = value;
+                }
+                else if (string.Equals(name, "Last-Modified", StringComparison.OrdinalIgnoreCase))
+                {
+                    DateTime lm;
+                    if (DateTime.TryParse(value, System.Globalization.CultureInfo.InvariantCulture,
+                            System.Globalization.DateTimeStyles.AdjustToUniversal, out lm))
+                        result.LastModified = lm.ToString("R");
+                }
+            }
+        }
+
+        private static void CaptureValidator(HttpResponseMessage resp, ProbeResult result)
         {
             try
             {
-                var h = new Dictionary<string, string>(headers) { ["Range"] = "bytes=0-0" };
-                using (var req = BuildRequest(HttpMethod.Get, url, h))
-                using (var resp = await _http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, cancel).ConfigureAwait(false))
+                // 只认强 ETag。弱 ETag（W/"..."）按 RFC 7233 不得用于 If-Range，
+                // 部分 CDN 遇到弱 ETag 会直接返回 200 整份文件，那样我们会误判
+                // 「资源已变更」把任务判失败。弱 ETag 一律不用，退回 Last-Modified。
+                var et = resp.Headers.ETag;
+                if (et != null && !et.IsWeak)
+                    result.ETag = et.ToString();
+            }
+            catch
+            {
+                // ETag 解析异常不影响主流程
+            }
+            try
+            {
+                var lm = resp.Content.Headers.LastModified;
+                if (lm.HasValue)
+                    result.LastModified = lm.Value.ToUniversalTime().ToString("R");
+            }
+            catch
+            {
+                // Last-Modified 解析异常不影响主流程
+            }
+        }
+
+        /// <summary>探测结论分类。让上层能做有状态的重试，而不是一律静默降级。</summary>
+        private enum ProbeKind
+        {
+            /// <summary>206 + Content-Range，可分段下载。</summary>
+            RangeSupported,
+            /// <summary>2xx 但没有 Range 支持，只能单连接。</summary>
+            LengthOnly,
+            /// <summary>401/403：鉴权/签名问题，重试无意义。</summary>
+            AuthFailed,
+            /// <summary>404/410：文件不存在或已删除。</summary>
+            NotFound,
+            /// <summary>5xx/429：服务端临时问题，值得重试。</summary>
+            ServerError,
+            /// <summary>网络异常（超时、连接重置、DNS 等），值得重试。</summary>
+            NetworkError,
+        }
+
+        private sealed class ProbeResult
+        {
+            public long Total = -1;
+            public bool SupportsRange;
+            public ProbeKind Kind = ProbeKind.NetworkError;
+            public int StatusCode;
+            public int Attempts;
+            public string Error = "";
+
+            /// <summary>ETag 原样（含引号），可空。</summary>
+            public string ETag = "";
+            /// <summary>Last-Modified 的 RFC1123 形式，可空。</summary>
+            public string LastModified = "";
+        }
+
+        /// <summary>
+        /// 探测文件大小与 Range 支持。带状态机：5xx/429/网络异常最多重试 3 次
+        /// （300ms/600ms 退避），401/403/404/410 立即返回不浪费请求。
+        /// </summary>
+        private async Task<ProbeResult> ProbeAsync(string url, Dictionary<string, string> headers,
+            CancellationToken cancel)
+        {
+            const int MaxAttempts = 3;
+            var result = new ProbeResult();
+
+            for (int attempt = 1; attempt <= MaxAttempts; attempt++)
+            {
+                result.Attempts = attempt;
+                cancel.ThrowIfCancellationRequested();
+                try
                 {
-                    if ((int)resp.StatusCode == 206)
+                    var h = new Dictionary<string, string>(headers) { ["Range"] = "bytes=0-0" };
+                    if (_useOpenSsl)
                     {
-                        var cr = resp.Content.Headers.ContentRange;
-                        if (cr != null && cr.Length.HasValue)
-                            return (cr.Length.Value, true);
+                        // UC 的 CDN 连探测都拒 SChannel，所以探测也必须走 OpenSSL 桥。
+                        var pu = new Uri(url);
+                        var pr = await Task.Run(() => OpenSslTls.DownloadTo(
+                            pu.Host, pu.PathAndQuery, h, 1, Stream.Null, 20000), cancel)
+                            .ConfigureAwait(false);
+                        int pcode = pr.StatusCode;
+                        result.StatusCode = pcode;
+
+                        if (pcode == 206 && pr.ContentRangeTotal > 0)
+                        {
+                            result.Total = pr.ContentRangeTotal;
+                            result.SupportsRange = true;
+                            result.Kind = ProbeKind.RangeSupported;
+                            CaptureValidatorFromHeaders(pr.RawHeaders, result);
+                            return result;
+                        }
+                        if (pcode >= 200 && pcode < 300)
+                        {
+                            result.Total = pr.ContentRangeTotal > 0
+                                ? pr.ContentRangeTotal
+                                : pr.ContentLength;
+                            result.SupportsRange = false;
+                            result.Kind = ProbeKind.LengthOnly;
+                            CaptureValidatorFromHeaders(pr.RawHeaders, result);
+                            return result;
+                        }
+                        if (pcode == 401 || pcode == 403)
+                        {
+                            result.Kind = ProbeKind.AuthFailed;
+                            result.Error = "HTTP " + pcode;
+                            return result;
+                        }
+                        if (pcode == 404 || pcode == 410)
+                        {
+                            result.Kind = ProbeKind.NotFound;
+                            result.Error = "HTTP " + pcode;
+                            return result;
+                        }
+                        result.Kind = ProbeKind.ServerError;
+                        result.Error = "HTTP " + pcode;
                     }
-                    long cl = resp.Content.Headers.ContentLength ?? -1;
-                    if (cl > 0)
-                        return (cl, false);
+                    else
+                    using (var req = BuildRequest(HttpMethod.Get, url, h))
+                    using (var resp = await _http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, cancel)
+                               .ConfigureAwait(false))
+                    {
+                        int code = (int)resp.StatusCode;
+                        result.StatusCode = code;
+
+                        if (code == 206)
+                        {
+                            var cr = resp.Content.Headers.ContentRange;
+                            if (cr != null && cr.Length.HasValue)
+                            {
+                                result.Total = cr.Length.Value;
+                                result.SupportsRange = true;
+                                result.Kind = ProbeKind.RangeSupported;
+                                CaptureValidator(resp, result);
+                                return result;
+                            }
+                            // 206 但缺 Content-Range：降级为“仅长度”，下面继续按 2xx 处理
+                        }
+
+                        if (code >= 200 && code < 300)
+                        {
+                            result.Total = resp.Content.Headers.ContentLength ?? -1;
+                            result.SupportsRange = false;
+                            result.Kind = ProbeKind.LengthOnly;
+                            CaptureValidator(resp, result);
+                            return result;
+                        }
+
+                        if (code == 401 || code == 403)
+                        {
+                            result.Kind = ProbeKind.AuthFailed;
+                            result.Error = "HTTP " + code;
+                            return result;   // 签名/鉴权问题：重试也还是 403
+                        }
+                        if (code == 404 || code == 410)
+                        {
+                            result.Kind = ProbeKind.NotFound;
+                            result.Error = "HTTP " + code;
+                            return result;
+                        }
+
+                        // 其余（5xx / 429 / 其它）按可重试处理
+                        result.Kind = ProbeKind.ServerError;
+                        result.Error = "HTTP " + code;
+                    }
+                }
+                catch (OperationCanceledException) when (cancel.IsCancellationRequested)
+                {
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    result.Kind = ProbeKind.NetworkError;
+                    result.Error = ex.GetType().Name + ": " + ex.Message;
+                }
+
+                if (attempt < MaxAttempts)
+                {
+                    Log?.Invoke(string.Format("探测第 {0}/{1} 次失败（{2}），{3}ms 后重试…",
+                        attempt, MaxAttempts, result.Error, 300 * attempt));
+                    try { await Task.Delay(300 * attempt, cancel).ConfigureAwait(false); }
+                    catch (OperationCanceledException) { throw; }
                 }
             }
-            catch { }
-            return (-1, false);
+
+            Log?.Invoke(string.Format("探测失败（{0}，已重试 {1} 次）", result.Error, result.Attempts));
+            return result;
         }
 
         private HttpRequestMessage BuildRequest(HttpMethod method, string url, Dictionary<string, string> headers)
@@ -1401,6 +1865,7 @@ namespace GeZi.Core.Download
                 ResolvePaths(dest, root, out string partsDir, out string metaPath);
                 if (seen.Add(partsDir)) yield return partsDir;
                 if (seen.Add(metaPath)) yield return metaPath;
+                if (seen.Add(metaPath + ".bak")) yield return metaPath + ".bak";
 
                 // 指定了 partsRoot 时，hash 目录（分片目录的父目录）也是下载器建的，
                 // 删完 parts/meta.json 后它就成了空壳，一并回收，避免堆积。
@@ -1417,6 +1882,11 @@ namespace GeZi.Core.Download
             string legacyMeta = dest + ".qmeta";
             if (seen.Add(legacyParts)) yield return legacyParts;
             if (seen.Add(legacyMeta)) yield return legacyMeta;
+            if (seen.Add(legacyMeta + ".bak")) yield return legacyMeta + ".bak";
+
+            // 3) 上次删除失败留下的“待删除”文件也属于残留，一起回收
+            if (seen.Add(dest + PendingDeleteSuffix)) yield return dest + PendingDeleteSuffix;
+            if (seen.Add(legacyMeta + PendingDeleteSuffix)) yield return legacyMeta + PendingDeleteSuffix;
         }
 
         /// <summary>把文件名里对路径非法的字符替换掉（分片根目录下要建同名子目录）。</summary>
@@ -1587,6 +2057,9 @@ namespace GeZi.Core.Download
             {
                 Directory.CreateDirectory(partsDir);
                 ApplyHidden(partsDir);
+                // 租约必须早于第一片数据写入：清扫器看到它就把整个目录视为“有人用”，
+                // 暂停/崩溃后也有 30 天保护期，避免“越久没碰越容易被删”的误伤。
+                PartsLease.Touch(partsDir);
             }
             catch (Exception ex)
             {
@@ -1814,7 +2287,8 @@ namespace GeZi.Core.Download
             // 让它继续享有抢占机会（详见抢占循环里的说明）。
             var partPreemptAtW = new long[partCapacity];
             // 动态窃取时改 plan.Parts / 入队要串行化（多个 worker 可能同时切）
-            var splitLock = new object();
+            // 分片表的所有增删统一用 plan.SyncRoot，SavePlan 取快照也用同一把锁。
+            // （原来单独的 splitLock 只保护 Add，SavePlan 仍可能看到中间态。）
             int preemptedCount = 0;   // 累计抢占次数（收尾诊断用）
             // 分片回队自愈：全局整轮重试计数（跨分片累计，见 MaxTotalRequeues）
             int totalRequeues = 0;
@@ -2228,6 +2702,9 @@ namespace GeZi.Core.Download
                         if ((now - lastDiag).TotalSeconds >= 5.0)
                         {
                             lastDiag = now;
+                            // 租约心跳：让清扫器知道这个目录“有人正在用”，
+                            // 暂停中的任务也不会因为分片 mtime 变旧被误清。
+                            try { PartsLease.Touch(partsDir); } catch { /* 心跳失败不影响下载 */ }
                             string mergeNote = string.Format("，已合并 {0}",
                                 Fmt(Interlocked.Read(ref mergedBox[0])));
                             int pc = Volatile.Read(ref preemptedCount);
@@ -2575,7 +3052,7 @@ namespace GeZi.Core.Download
                 long lastThrottleMs = Environment.TickCount;
                 // 连续多久没再被限流就往上加 1 路。取得比较长（30 秒 ≈ 6 个采样轮）
                 // 是有意的：放回去太急会立刻又被限流，来回抖比一直低并发更糟。
-                const int GateRecoverQuietMs = 30000;
+                const int GateRecoverQuietMs = 60000;
 
                 // 一波风控会同时打回很多个 429/503（几百路并发下
                 // 尤其明显）。若每个 429 都收窄一次，闸门会在几百毫秒内从满档坍塌到下限
@@ -2607,15 +3084,17 @@ namespace GeZi.Core.Download
                             if (cur < workerCount
                                 && Environment.TickCount - lastThrottleMs >= GateRecoverQuietMs)
                             {
-                                // 恢复步长与收窄对称：收窄一步 -30%，
-                                // 恢复用 +workerCount/10（至少 +1）。旧实现是 +1 路 / 30 秒 ——
-                                // 一旦被收窄到 4 路，爬回 512 要 2.1 小时，收放严重不对称。
-                                int step = Math.Max(1, workerCount / 10);
-                                int next = Math.Min(workerCount, cur + step);
-                                Volatile.Write(ref concurrencyTarget, next);
-                                lastThrottleMs = Environment.TickCount;   // 重新计时
-                                Log?.Invoke("限流已平息，下载并发回升到 " + next
-                                    + " 路（上限 " + workerCount + " 路）。");
+                                // 档位化收放：收缩是减半（256→128→64→32），恢复是翻倍，
+                                // 且必须静默 60 秒才允许回升一档（迟滞，避免抖动）。
+                                int next = cur <= 0 ? workerCount : cur * 2;
+                                if (next > workerCount) next = workerCount;
+                                if (next > cur)
+                                {
+                                    Volatile.Write(ref concurrencyTarget, next);
+                                    lastThrottleMs = Environment.TickCount;   // 重新计时
+                                    Log?.Invoke("限流已平息，下载并发回升到 " + next
+                                        + " 路（上限 " + workerCount + " 路）。");
+                                }
                             }
                         }
                     }
@@ -2643,7 +3122,7 @@ namespace GeZi.Core.Download
                         // （见 worker 循环里的"软并发闸门"）：不碰信号量、不持锁阻塞、
                         // 收放完全对称；而且只影响"新开连接"，**不掐断正在跑的连接**。
                         int cur = Volatile.Read(ref concurrencyTarget);
-                        int next = Math.Max(throttleFloor, (int)(cur * 0.7));   // 每次砍 30%
+                        int next = Math.Max(throttleFloor, cur / 2);   // 档位化减半：256→128→64→32
                         if (next >= cur)
                             return;
                         Volatile.Write(ref concurrencyTarget, next);
@@ -2807,9 +3286,9 @@ namespace GeZi.Core.Download
                                     {
                                         long mid = part.S + part.W + remainHere / 2;
                                         long oldEnd = part.E;
-                                        part.E = mid - 1;          // 自己留前半
-                                        lock (splitLock)
+                                        lock (plan.SyncRoot)
                                         {
+                                            part.E = mid - 1;      // 自己留前半
                                             plan.Parts.Add(new PartPlan { S = mid, E = oldEnd, W = 0 });
                                             queue.Enqueue(plan.Parts.Count - 1);
                                         }
@@ -2896,10 +3375,93 @@ namespace GeZi.Core.Download
                                     {
                                         ["Range"] = "bytes=" + reqStart + "-" + part.E,
                                     };
+                                    // If-Range：资源没变就正常给 206，变了就返回 200 整份。
+                                    // 没有它的话，服务端换了文件仍会返回"新版本的同区间字节"，
+                                    // 我们照写进旧分片 → 合并后内容错乱（长度却对得上）。
+                                    if (!string.IsNullOrEmpty(_ifRange))
+                                        h["If-Range"] = _ifRange;
 
                                     bool fatal = false;   // true 表示重试无意义（取消/服务器不支持 Range）
                                     try
                                     {
+                                        // ---- UC 专用：分片走 OpenSSL 桥 ----
+                                        // UC 的 CDN 按 TLS 指纹拒 SChannel，HttpClient 恒 403；
+                                        // 这条分支用同一份头、同一个 Range 走 OpenSSL，实测 206。
+                                        if (_useOpenSsl)
+                                        {
+                                            var ou = new Uri(url);
+                                            FileStream ofs = new FileStream(PartPath(partsDir, idx),
+                                                FileMode.OpenOrCreate, FileAccess.Write,
+                                                FileShare.ReadWrite | FileShare.Delete, 64 * 1024,
+                                                FileOptions.SequentialScan);
+                                            OpenSslTls.StreamResult opr;
+                                            try
+                                            {
+                                                ofs.Seek(0, SeekOrigin.End);
+                                                long startAt = written;
+                                                long want = segSize - startAt;
+                                                if (want <= 0) want = 0;
+                                                var sink = new PartSink(ofs, partToken, pause, cancelToken,
+                                                    delegate (int cnt)
+                                                    {
+                                                        written += cnt;
+                                                        lock (plan.SyncRoot) part.W = written;
+                                                        Interlocked.Add(ref done, cnt);
+                                                    });
+                                                opr = await Task.Run(() => OpenSslTls.DownloadTo(
+                                                    ou.Host, ou.PathAndQuery, h, want, sink, 20000, 30000),
+                                                    partToken).ConfigureAwait(false);
+                                            }
+                                            finally
+                                            {
+                                                ofs.Dispose();
+                                            }
+
+                                            int ocode = opr.StatusCode;
+                                            if (ocode == 200 && !(reqStart == 0 && part.E >= total - 1))
+                                            {
+                                                // 带了 If-Range 却拿到 200：服务端资源变了，
+                                                // 绝不能按"不支持 Range"静默降级（会写出损坏文件）。
+                                                if (!string.IsNullOrEmpty(_ifRange))
+                                                {
+                                                    Interlocked.Exchange(ref cancelled, 1);
+                                                    AddError("resource-changed");
+                                                    return;
+                                                }
+                                                Interlocked.Exchange(ref cancelled, 1);
+                                                AddError("range-not-supported");
+                                                return;
+                                            }
+                                            if (ocode == 206 && opr.ContentRangeStart >= 0
+                                                && opr.ContentRangeStart != reqStart)
+                                            {
+                                                lastErr = "Content-Range 起点不符（请求 " + reqStart
+                                                          + "，服务端 " + opr.ContentRangeStart + "）";
+                                                lastErrTransient = true;
+                                                continue;
+                                            }
+                                            if (ocode != 200 && ocode != 206)
+                                            {
+                                                lastErr = "HTTP " + ocode;
+                                                lastErrTransient = IsTransientStatus(ocode);
+                                                if (ocode == 429 || ocode == 503)
+                                                    OnThrottled();
+                                                if (!IsTransientStatus(ocode)) break;
+                                                continue;
+                                            }
+
+                                            if (written < segSize)
+                                            {
+                                                lastErr = "分片不完整 " + written + "/" + segSize;
+                                                lastErrTransient = true;
+                                                continue;
+                                            }
+
+                                            Volatile.Write(ref partDone[idx], 1);
+                                            lastErr = null;
+                                            break;
+                                        }
+
                                         using (var req = BuildRequest(HttpMethod.Get, url, h))
                                         using (var resp = await _http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, partToken).ConfigureAwait(false))
                                         {
@@ -2917,10 +3479,35 @@ namespace GeZi.Core.Download
                                             int code = (int)resp.StatusCode;
                                             if (code == 200 && !(reqStart == 0 && part.E >= total - 1))
                                             {
+                                                // 带了 If-Range 却收到 200：说明服务端资源已经变了
+                                                // （大小/ETag 对不上）。此时**绝对不能**按"不支持 Range"
+                                                // 静默降级单连接 —— 那会把新版本整份写下去，与磁盘上
+                                                // 已有的旧分片混在一起，产出长度正确但内容损坏的文件。
+                                                if (!string.IsNullOrEmpty(_ifRange))
+                                                {
+                                                    Interlocked.Exchange(ref cancelled, 1);
+                                                    AddError("resource-changed");
+                                                    return;
+                                                }
                                                 // 服务器忽略 Range（且不是整文件单段）→ 交给单线程处理
                                                 Interlocked.Exchange(ref cancelled, 1);
                                                 AddError("range-not-supported");
                                                 return;                                            }
+                                            if (code == 206)
+                                            {
+                                                // 严格校验返回的字节区间是否就是请求的区间。
+                                                // 只判断"是不是 206"不够：中间层改写 Range、
+                                                // 重定向到别的对象、CDN 缓存串号，都会给出
+                                                // 一个区间不对的 206 —— 照写就是静默损坏。
+                                                var crGot = resp.Content.Headers.ContentRange;
+                                                if (crGot != null && crGot.From.HasValue && crGot.From.Value != reqStart)
+                                                {
+                                                    lastErr = "Content-Range 起点不符（请求 "
+                                                              + reqStart + "，服务端 " + crGot.From.Value + "）";
+                                                    lastErrTransient = true;
+                                                    continue;
+                                                }
+                                            }
                                             if (code != 200 && code != 206)
                                             {
                                                 // 5xx / 429 值得重试，其余 4xx 重试无意义
@@ -2987,7 +3574,7 @@ namespace GeZi.Core.Download
                                                 await pause.WaitIfPausedAsync(cancelToken).ConfigureAwait(false);
                                             await wfs.WriteAsync(buf, 0, n, partToken).ConfigureAwait(false);
                                                             written += n;
-                                                            part.W = written;
+                                                            lock (plan.SyncRoot) part.W = written;
                                                             Interlocked.Add(ref done, n);
                                                         }
                                                     }
@@ -3192,18 +3779,40 @@ namespace GeZi.Core.Download
                             cancelledButComplete = finalLenA == total;
                             if (cancelledButComplete)
                             {
+                                var hc = await VerifyHashAsync(dest).ConfigureAwait(false);
+                                if (!hc.Ok)
+                                    return (false, hc.Message);
                                 Log?.Invoke("注意: 下载中途被判中断，但数据已全部到位（"
-                                    + Fmt(total) + "），按成功处理。");
-                                return (true, "");
+                                    + Fmt(total) + "），按成功处理。" + hc.Suffix);
+                                return (true, hc.Message);
                             }
                             return (false, "下载中断（已保留断点与已下载部分，重试可续传）");
                         }
                     }
                     string msg = string.Join("; ", errors.Take(3));
+                    if (msg.Contains("resource-changed"))
+                    {
+                        // 服务端文件在下载期间变了（ETag/大小对不上，If-Range 让服务端
+                        // 返回了 200 整份）。此时磁盘上已有的分片是**旧版本**的字节，
+                        // 再拼上新版本必然损坏。
+                        // 特别注意：不能落到下面"目标文件长度 == total 就算成功"的分支 ——
+                        // 新旧混写的文件长度恰好也等于 total，那样会被误判成功，
+                        // 正好产出用户最怕的"长度对、内容坏"。
+                        ClearPartial(dest);
+                        return (false, "服务端文件在下载期间发生了变化（ETag 或大小不一致）。"
+                            + "为避免产出损坏文件，已丢弃本次已下载的部分，请重新添加该任务下载。");
+                    }
                     if (msg.Contains("range-not-supported"))
                     {
                         ClearPartial(dest);
-                        return await DownloadSingleAsync(url, dest, headers, total, progress, cancel, pause).ConfigureAwait(false);
+                        var single = await DownloadSingleAsync(url, dest, headers, total, progress, cancel, pause).ConfigureAwait(false);
+                        if (!single.Item1)
+                            return single;
+                        var hc = await VerifyHashAsync(dest).ConfigureAwait(false);
+                        if (!hc.Ok)
+                            return (false, hc.Message);
+                        Log?.Invoke("单连接兜底完成。" + hc.Suffix);
+                        return (true, hc.Message);
                     }
 
                     // 「下载报失败，但文件其实是好的」——
@@ -3243,12 +3852,32 @@ namespace GeZi.Core.Download
                         total, finalLen));
                 }
 
+                // 先校验内容，再删 .qmeta/分片：失败时必须保留它们，用户才能重试。
+                // 只在长度对时校验还不够 —— 长度相同、内容损坏（CDN 错片/磁盘坏块）
+                // 正是最危险的情况。
+                // 大文件算 SHA-256 可能要几十秒；必须给 UI 一个明确阶段，
+                // 否则 100% 停住会被当成卡死。
+                try { PartsLease.Touch(partsDir, PartsLease.State.Finalizing); } catch { }
+                Report(progress, total, total, 0, "正在校验内容…");
+                var hashCheck = await VerifyHashAsync(dest).ConfigureAwait(false);
+                if (!hashCheck.Ok)
+                {
+                    Log?.Invoke(hashCheck.Message);
+                    return (false, hashCheck.Message);
+                }
+                Log?.Invoke("下载完成。" + hashCheck.Suffix);
+
                 try { File.Delete(metaPath); } catch { }
+                // 成功收尾后 .bak 没有保留价值；留下的只是用户看不懂的垃圾文件。
+                try { File.Delete(metaPath + ".bak"); } catch { }
                 // 分片文件在每片合并后即已删除，这里兜底清掉目录本身
                 try
                 {
                     if (Directory.Exists(partsDir))
+                    {
+                        PartsLease.Release(partsDir);
                         Directory.Delete(partsDir, true);
+                    }
                 }
                 catch (Exception ex)
                 {
@@ -3322,7 +3951,7 @@ namespace GeZi.Core.Download
                 catch { }
 
                 Report(progress, total, total, 0);
-                return (true, "");
+                return (true, hashCheck.Message);
             }   // end: using(linked)
         }
 
@@ -3354,31 +3983,126 @@ namespace GeZi.Core.Download
 
         // ---------------- sidecar 续传元数据（简单文本格式，无 JSON 依赖） ----------------
 
+        private sealed class HashCheck
+        {
+            public bool Ok;
+            public string Message;
+            public string Suffix;
+        }
+
+        private static string NormalizeHash(string hash)
+        {
+            if (string.IsNullOrWhiteSpace(hash)) return null;
+            hash = hash.Trim().Trim('"').Trim();
+            return hash.Length == 0 ? null : hash;
+        }
+
+        /// <summary>
+        /// 完成前校验内容。优先 SHA-256，其次 SHA-1，最后 MD5；
+        /// 接口没给哈希时返回 Ok=true + “未校验”，而不是假装验证过。
+        /// 校验失败时**调用方必须保留 .qmeta 与分片**，让用户能重试。
+        /// </summary>
+        private async Task<HashCheck> VerifyHashAsync(string path)
+        {
+            string algorithm;
+            string expected;
+            if (!string.IsNullOrEmpty(_expectedSha256))
+            {
+                algorithm = "SHA-256";
+                expected = _expectedSha256;
+            }
+            else if (!string.IsNullOrEmpty(_expectedSha1))
+            {
+                algorithm = "SHA-1";
+                expected = _expectedSha1;
+            }
+            else if (!string.IsNullOrEmpty(_expectedMd5))
+            {
+                algorithm = "MD5";
+                expected = _expectedMd5;
+            }
+            else
+            {
+                return new HashCheck
+                {
+                    Ok = true,
+                    Message = "未校验（接口未提供哈希）",
+                    Suffix = "（接口未提供哈希，内容未校验）",
+                };
+            }
+
+            byte[] actualBytes = await Task.Run(() =>
+            {
+                using (var fs = new FileStream(path, FileMode.Open, FileAccess.Read,
+                           FileShare.Read, 1 << 20, FileOptions.SequentialScan))
+                using (HashAlgorithm h = algorithm == "SHA-256" ? (HashAlgorithm)SHA256.Create()
+                    : algorithm == "SHA-1" ? (HashAlgorithm)SHA1.Create()
+                    : (HashAlgorithm)MD5.Create())
+                {
+                    return h.ComputeHash(fs);
+                }
+            }).ConfigureAwait(false);
+
+            string actual = ToHex(actualBytes);
+            if (string.Equals(actual, expected, StringComparison.OrdinalIgnoreCase))
+            {
+                return new HashCheck
+                {
+                    Ok = true,
+                    Message = "内容校验通过（" + algorithm + "）",
+                    Suffix = "，内容校验通过（" + algorithm + "）",
+                };
+            }
+
+            return new HashCheck
+            {
+                Ok = false,
+                Message = string.Format(
+                    "内容校验失败（{0}）：期望 {1}，实际 {2}。分片与进度已保留，可重试续传。",
+                    algorithm, expected, actual),
+                Suffix = "",
+            };
+        }
+
+        private static string ToHex(byte[] bytes)
+        {
+            var sb = new StringBuilder(bytes.Length * 2);
+            foreach (byte b in bytes)
+                sb.Append(b.ToString("x2", CultureInfo.InvariantCulture));
+            return sb.ToString();
+        }
+
+        /// <summary>.qmeta 魔数。见到它才是 v2；否则按旧版 v1 纯文本解析。</summary>
+        private const string MetaMagic = "GEZI-QMETA";
+        /// <summary>当前写出的 schema 版本。只写 v2，但能读 v1（双读单写）。</summary>
+        private const int MetaVersion = 2;
+
+        /// <summary>
+        /// 读计划：先读主文件；主文件损坏/缺失时回退读上一份 <c>.bak</c>。
+        /// 这样升级 schema 或断电留下半截文件都不会让断点凭空消失。
+        /// </summary>
         private static DownloadPlan LoadPlan(string metaPath)
+        {
+            var plan = LoadPlanFile(metaPath);
+            if (plan != null)
+                return plan;
+            string bak = metaPath + ".bak";
+            if (File.Exists(bak))
+                return LoadPlanFile(bak);
+            return null;
+        }
+
+        private static DownloadPlan LoadPlanFile(string path)
         {
             try
             {
-                var lines = File.ReadAllLines(metaPath);
-                if (lines.Length < 2)
+                var lines = File.ReadAllLines(path);
+                if (lines.Length == 0)
                     return null;
-                long total = long.Parse(lines[0].Trim(), CultureInfo.InvariantCulture);
-                int n = int.Parse(lines[1].Trim(), CultureInfo.InvariantCulture);
-                if (lines.Length < 2 + n)
-                    return null;
-                var plan = new DownloadPlan { Total = total, Parts = new List<PartPlan>() };
-                for (int i = 0; i < n; i++)
-                {
-                    var cols = lines[2 + i].Split(',');
-                    if (cols.Length != 3)
-                        return null;
-                    plan.Parts.Add(new PartPlan
-                    {
-                        S = long.Parse(cols[0].Trim(), CultureInfo.InvariantCulture),
-                        E = long.Parse(cols[1].Trim(), CultureInfo.InvariantCulture),
-                        W = long.Parse(cols[2].Trim(), CultureInfo.InvariantCulture),
-                    });
-                }
-                return plan;
+                // 首行以魔数开头 → v2；否则按 v1 解析（老用户的断点必须继续可用）。
+                if (lines[0].TrimStart().StartsWith(MetaMagic, StringComparison.Ordinal))
+                    return ParsePlanV2(lines);
+                return ParsePlanV1(lines);
             }
             catch
             {
@@ -3386,46 +4110,148 @@ namespace GeZi.Core.Download
             }
         }
 
+        /// <summary>旧版格式：<c>total</c> / <c>count</c> / 每行 <c>S,E,W</c>。</summary>
+        private static DownloadPlan ParsePlanV1(string[] lines)
+        {
+            if (lines.Length < 2)
+                return null;
+            long total = long.Parse(lines[0].Trim(), CultureInfo.InvariantCulture);
+            int n = int.Parse(lines[1].Trim(), CultureInfo.InvariantCulture);
+            if (lines.Length < 2 + n)
+                return null;
+            var plan = new DownloadPlan { Total = total, Parts = new List<PartPlan>(), SchemaVersion = 1 };
+            for (int i = 0; i < n; i++)
+            {
+                var cols = lines[2 + i].Split(',');
+                if (cols.Length != 3)
+                    return null;
+                plan.Parts.Add(new PartPlan
+                {
+                    S = long.Parse(cols[0].Trim(), CultureInfo.InvariantCulture),
+                    E = long.Parse(cols[1].Trim(), CultureInfo.InvariantCulture),
+                    W = long.Parse(cols[2].Trim(), CultureInfo.InvariantCulture),
+                });
+            }
+            return plan;
+        }
+
+        /// <summary>
+        /// v2 格式：首行 <c>GEZI-QMETA 2</c>，随后 <c>total=</c> / <c>count=</c>，
+        /// 分片行仍是 <c>S,E,W</c>（与 v1 相同，便于人和旧工具阅读）。
+        /// 未知的 <c>key=</c> 行直接忽略 —— 未来加字段时老版本仍能读。
+        /// </summary>
+        private static DownloadPlan ParsePlanV2(string[] lines)
+        {
+            int ver = 0;
+            string head = lines[0].Trim();
+            var hp = head.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
+            if (hp.Length >= 2)
+                int.TryParse(hp[1], NumberStyles.Integer, CultureInfo.InvariantCulture, out ver);
+            // 读到比自己更新的 schema：不猜、不写，交给 .bak 回退或重新开始
+            if (ver > MetaVersion)
+                return null;
+
+            long total = -1;
+            int declared = -1;
+            var plan = new DownloadPlan { SchemaVersion = 2, Parts = new List<PartPlan>() };
+            for (int i = 1; i < lines.Length; i++)
+            {
+                string line = lines[i].Trim();
+                if (line.Length == 0)
+                    continue;
+                if (line.StartsWith("total=", StringComparison.Ordinal))
+                {
+                    if (!long.TryParse(line.Substring(6).Trim(), NumberStyles.Integer,
+                            CultureInfo.InvariantCulture, out total))
+                        return null;
+                    continue;
+                }
+                if (line.StartsWith("count=", StringComparison.Ordinal))
+                {
+                    int.TryParse(line.Substring(6).Trim(), NumberStyles.Integer,
+                        CultureInfo.InvariantCulture, out declared);
+                    continue;
+                }
+                if (line.IndexOf('=') >= 0)
+                    continue;   // 未知字段：向前兼容，忽略
+
+                var cols = line.Split(',');
+                if (cols.Length != 3)
+                    return null;
+                plan.Parts.Add(new PartPlan
+                {
+                    S = long.Parse(cols[0].Trim(), CultureInfo.InvariantCulture),
+                    E = long.Parse(cols[1].Trim(), CultureInfo.InvariantCulture),
+                    W = long.Parse(cols[2].Trim(), CultureInfo.InvariantCulture),
+                });
+            }
+            if (total < 0)
+                return null;
+            // count 只做一致性校验；不一致时以实际分片行为准（宁可多读几行，也别丢进度）
+            if (declared >= 0 && declared != plan.Parts.Count)
+                return null;
+            plan.Total = total;
+            return plan;
+        }
+
         private static void SavePlan(string metaPath, DownloadPlan plan)
         {
-            // 原子写：先落 .tmp，再整体替换。
-            // 这个文件每秒重写一次、且在下载中被多线程读取判断续传，
-            // 直接 File.WriteAllText 有概率被读到"写了一半"的残缺内容，
-            // 一旦解析失败就会丢掉已下载进度、从零开始。
+            // 原子写：锁内取一致快照，唯一临时文件，Flush(true) 落盘，再一次 Replace。
+            // 旧实现虽然用了 File.Replace，但没有锁、临时文件名固定、也没 Flush：
+            // 多个 worker 同时保存会互相覆盖，断电时还可能只留下半截文件。
+            string tmp = null;
             try
             {
-                var sb = new System.Text.StringBuilder();
-                sb.Append(plan.Total.ToString(CultureInfo.InvariantCulture)).Append('\n');
-                sb.Append(plan.Parts.Count.ToString(CultureInfo.InvariantCulture)).Append('\n');
-                foreach (var p in plan.Parts)
+                lock (plan.SyncRoot)
                 {
-                    sb.Append(p.S.ToString(CultureInfo.InvariantCulture)).Append(',')
-                      .Append(p.E.ToString(CultureInfo.InvariantCulture)).Append(',')
-                      .Append(p.W.ToString(CultureInfo.InvariantCulture)).Append('\n');
-                }
-                string tmp = metaPath + ".tmp";
-                File.WriteAllText(tmp, sb.ToString());
-                // File.Move 的目标已存在时会抛异常，所以原先是"先 Delete 再 Move"——
-                // 但这两步之间有窗口：若在 Delete 之后、Move 之前断电/进程被杀，
-                // 就变成既没有 .qmeta 也没有可用的 .tmp，LoadPlan 返回 null，
-                // 下载器会把整个任务当成全新的、从零开始 —— 正是本方法要防的事。
-                // 正确做法是一步替换。.NET Framework 的 File.Move 不支持 overwrite 重载，
-                // 但 File.Replace 语义是"用 tmp 替换 metaPath"，且是原子的，
-                // 还顺带处理目标不存在的情况（不存在时抛错，故先判断）。
-                if (File.Exists(metaPath))
-                {
-                    // File.Replace 要求三者同卷；tmp 与 metaPath 同目录，必然满足。
-                    // 备份文件参数传 null，不额外产生垃圾。
-                    File.Replace(tmp, metaPath, null);
-                }
-                else
-                {
-                    File.Move(tmp, metaPath);
+                    var sb = new System.Text.StringBuilder();
+                    // 只写 v2：老版本读不动 v2 会回退 .bak；新版本能读 v1，平滑升级。
+                    sb.Append(MetaMagic).Append(' ').Append(MetaVersion).Append('\n');
+                    sb.Append("total=").Append(plan.Total.ToString(CultureInfo.InvariantCulture)).Append('\n');
+                    sb.Append("count=").Append(plan.Parts.Count.ToString(CultureInfo.InvariantCulture)).Append('\n');
+                    foreach (var p in plan.Parts)
+                    {
+                        sb.Append(p.S.ToString(CultureInfo.InvariantCulture)).Append(',')
+                          .Append(p.E.ToString(CultureInfo.InvariantCulture)).Append(',')
+                          .Append(p.W.ToString(CultureInfo.InvariantCulture)).Append('\n');
+                    }
+
+                    // 唯一临时文件：不能再用固定的 .tmp，否则两个保存线程会写同一个文件。
+                    tmp = metaPath + "." + Guid.NewGuid().ToString("N") + ".tmp";
+                    using (var fs = new FileStream(tmp, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+                    using (var sw = new StreamWriter(fs, new UTF8Encoding(false)))
+                    {
+                        sw.Write(sb.ToString());
+                        sw.Flush();
+                        fs.Flush(true);   // 不只进 OS 缓存；断电后 .qmeta 仍可解析
+                    }
+
+                    // tmp 与 metaPath 同目录 ⇒ 同卷，File.Replace 才是原子的。
+                    // 保留上一份 .bak：schema 升级/写坏时 LoadPlan 能回退，不丢断点。
+                    string bak = metaPath + ".bak";
+                    if (File.Exists(metaPath))
+                    {
+                        try
+                        {
+                            if (File.Exists(bak)) File.Delete(bak);
+                            File.Replace(tmp, metaPath, bak, true);
+                        }
+                        catch (IOException)
+                        {
+                            // 备份路径不可用（只读/被杀软占用）时，至少保证主文件原子替换。
+                            File.Replace(tmp, metaPath, null);
+                        }
+                    }
+                    else
+                    {
+                        File.Move(tmp, metaPath);
+                    }
                 }
             }
             catch
             {
-                // 落盘失败不影响下载本身
+                // 落盘失败不影响下载本身，但不要留下本次的临时文件。
+                try { if (!string.IsNullOrEmpty(tmp)) File.Delete(tmp); } catch { }
             }
         }
 
@@ -3446,6 +4272,15 @@ namespace GeZi.Core.Download
     {
         public long Total { get; set; }
         public List<PartPlan> Parts { get; set; }
+
+        /// <summary>读入时的 schema 版本（1 = 旧纯文本，2 = GEZI-QMETA）。仅用于日志/诊断。</summary>
+        public int SchemaVersion { get; set; } = 2;
+
+        /// <summary>
+        /// 保护 Parts 的增删与 PartPlan.W 的更新。
+        /// SavePlan 在同一把锁内取快照，避免写出“半新半旧”的 .qmeta。
+        /// </summary>
+        public object SyncRoot { get; } = new object();
     }
 
     /// <summary>

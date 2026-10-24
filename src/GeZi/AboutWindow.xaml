@@ -1,4 +1,4 @@
-﻿<Window x:Class="GeZi.AboutWindow"
+<Window x:Class="GeZi.AboutWindow"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:shell="clr-namespace:System.Windows.Shell;assembly=PresentationFramework"
@@ -160,7 +160,7 @@
                             <TextBlock Style="{StaticResource ProseText}" FontSize="11" Margin="0,6,0,0"
                                        TextWrapping="Wrap"><Run Text="本项目" /><Run
                                         Text="完全开源" FontWeight="SemiBold" /><Run
-                                        Text="（GPL-3.0），源码公开可审计。无广告、无遥测、不收集任何用户数据；登录凭据仅以 Windows DPAPI 加密保存在本机，不会外传。第三方组件许可见仓库内 THIRD-PARTY-NOTICES.md。" /></TextBlock>
+                                        Text="（AGPL-3.0），源码公开可审计。无广告、无遥测、不收集任何用户数据；登录凭据仅以 Windows DPAPI 加密保存在本机，不会外传。第三方组件许可见仓库内 THIRD-PARTY-NOTICES.md。" /></TextBlock>
                         </StackPanel>
                     </Border>
 

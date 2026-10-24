@@ -3,4 +3,7 @@
     <Project Path="src/GeZi/GeZi.csproj" />
     <Project Path="src/GeZi.Core/GeZi.Core.csproj" />
   </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/GeZi.SelfTest/GeZi.SelfTest.csproj" />
+  </Folder>
 </Solution>

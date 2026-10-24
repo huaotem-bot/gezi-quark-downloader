@@ -1,15 +1,15 @@
-﻿// GeZi —— 夸克网盘下载器 (Quark netdisk downloader)
+﻿// GeZi —— 多网盘下载器 (Multi-cloud downloader)
 // Copyright (C) 2026  Yi Yuan
 // This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
+// it under the terms of the GNU Affero General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 // This program is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU General Public License for more details.
-// You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+// GNU Affero General Public License for more details.
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/agpl-3.0>.
 
 using System;
 using System.Collections.Generic;
@@ -104,6 +104,80 @@ namespace GeZi.Core.Support
         }
 
         /// <summary>
+        /// 清扫默认落盘位置：下载目录下的 <c>*.qparts</c>（以及对应的 <c>*.qmeta</c>）。
+        /// 这些目录不在用户配置的 partsRoots 里，旧版清扫器永远看不到。
+        /// </summary>
+        public static SweepResult SweepDefault(IEnumerable<string> downloadRoots, int maxAgeDays,
+            Func<bool> shouldStop = null)
+        {
+            if (maxAgeDays <= 0) maxAgeDays = DefaultMaxAgeDays;
+            var result = new SweepResult();
+            DateTime cutoff = DateTime.Now.AddDays(-maxAgeDays);
+
+            if (downloadRoots == null) return result;
+            foreach (string raw in downloadRoots)
+            {
+                string root = (raw ?? "").Trim();
+                if (root.Length == 0 || !SafeIsDir(root)) continue;
+                result.RootsScanned++;
+
+                string[] qpartsDirs;
+                try
+                {
+                    qpartsDirs = Directory.GetDirectories(root, "*.qparts", SearchOption.AllDirectories);
+                }
+                catch
+                {
+                    continue;
+                }
+
+                foreach (string dir in qpartsDirs)
+                {
+                    if (shouldStop != null && shouldStop()) return result;
+                    result.RootsScanned++;
+
+                    // 有租约 → 整个目录（含旁边的 .qmeta）都保留。
+                    if (PartsLease.IsProtected(dir, DateTime.UtcNow))
+                    {
+                        result.Skipped++;
+                        continue;
+                    }
+
+                    SweepOneDir(dir, cutoff, ref result);
+
+                    string dest = dir.Substring(0, dir.Length - ".qparts".Length);
+                    string meta = dest + ".qmeta";
+                    try
+                    {
+                        if (File.Exists(meta) && File.GetLastWriteTime(meta) < cutoff)
+                        {
+                            long size = 0;
+                            try { size = new FileInfo(meta).Length; } catch { }
+                            File.Delete(meta);
+                            result.Scanned++;
+                            result.Removed++;
+                            result.FreedBytes += size;
+                        }
+
+                        string metaBak = meta + ".bak";
+                        if (File.Exists(metaBak) && File.GetLastWriteTime(metaBak) < cutoff)
+                        {
+                            long size = 0;
+                            try { size = new FileInfo(metaBak).Length; } catch { }
+                            File.Delete(metaBak);
+                            result.Scanned++;
+                            result.Removed++;
+                            result.FreedBytes += size;
+                        }
+                    }
+                    catch (IOException) { result.Skipped++; }
+                    catch (UnauthorizedAccessException) { result.Skipped++; }
+                }
+            }
+            return result;
+        }
+
+        /// <summary>
         /// 枚举需要清扫的目录 —— 先给每个根目录本身，再给它下面一层子目录
         /// （分片根目录下的结构是 <c>{root}\{slug}_{hash}\parts\</c>，真正的分片在更深处）。
         /// 同时兜底扫一遍"目标文件同级"的默认分片目录无法枚举（那需要目标路径），
@@ -142,6 +216,14 @@ namespace GeZi.Core.Support
         /// <summary>清扫单个目录里的过期分片文件。</summary>
         private static void SweepOneDir(string dir, DateTime cutoff, ref SweepResult result)
         {
+            // 有未过期租约 → 整个目录跳过。暂停中的任务不写分片，mtime 会很快变旧；
+            // 只看 mtime 会把“用户还想续传”的断点删掉。
+            if (PartsLease.IsProtected(dir, DateTime.UtcNow))
+            {
+                result.Skipped++;
+                return;
+            }
+
             string[] names;
             try { names = Directory.GetFiles(dir); }
             catch { return; }   // 不存在/无权限 → 跳过

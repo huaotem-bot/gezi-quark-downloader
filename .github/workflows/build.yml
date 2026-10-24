@@ -1,0 +1,52 @@
+name: build
+
+# 零 NuGet 项目：只需 .NET SDK + windows runner 自带的 .NET Framework 4.8。
+# 门槛很明确 —— 0 警告 0 错误 + 自测全过。
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Show toolchain
+        run: |
+          dotnet --info
+
+      # 2.4.0 起引入 Microsoft.Web.WebView2（多网盘内嵌登录），需要还原这一个 NuGet 包。
+      # 其余第三方库仍是固化 DLL，不需要还原。
+      - name: Restore
+        run: dotnet restore GeZi.slnx
+
+      - name: Build (Release, warnings as errors)
+        run: >
+          dotnet build GeZi.slnx -c Release -t:Rebuild --no-restore
+          -nodeReuse:false -m:1 -p:UseSharedCompilation=false
+          -p:TreatWarningsAsErrors=true
+
+      - name: Self test
+        run: dotnet run --project tests/GeZi.SelfTest/GeZi.SelfTest.csproj -c Release --no-build
+
+      - name: Package (LICENSE / SHA256 / SBOM / PDB)
+        run: python tools/package_release.py --from-build --out artifacts
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: GeZi-release
+          path: artifacts/**
+          if-no-files-found: error

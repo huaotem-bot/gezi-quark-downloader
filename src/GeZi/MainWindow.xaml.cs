@@ -1,15 +1,15 @@
-﻿// GeZi —— 夸克网盘下载器 (Quark netdisk downloader)
+﻿// GeZi —— 多网盘下载器 (Multi-cloud downloader)
 // Copyright (C) 2026  Yi Yuan
 // This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
+// it under the terms of the GNU Affero General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 // This program is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU General Public License for more details.
-// You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+// GNU Affero General Public License for more details.
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/agpl-3.0>.
 
 using System;
 using System.Collections.Generic;
@@ -132,6 +132,340 @@ namespace GeZi
         private System.Threading.Tasks.Task _startupLoginTask;
         private string _pwdId;
         private string _stoken;
+
+        /// <summary>
+        /// 当前解析的分享属于哪个网盘。默认夸克 —— 也就是说，
+        /// 只要不碰多网盘，所有既有逻辑走的都是原来的路径，行为完全不变。
+        /// </summary>
+        private PanKind _panKind = PanKind.Quark;
+
+        /// <summary>非夸克网盘的客户端。夸克走 <see cref="_client"/>，这里为 null。</summary>
+        private IPanProvider _panProvider;
+
+        /// <summary>非夸克网盘的分享引用（夸克用 <see cref="_pwdId"/> + <see cref="_stoken"/>）。</summary>
+        private PanShareRef _panShareRef;
+
+        /// <summary>
+        /// **当前登录的账号属于哪个网盘**（账号卡片、「我的网盘」都跟着它走）。
+        /// <para>
+        /// 与 <see cref="_panKind"/> 是两件事：那个是"正在解析的分享属于谁"，
+        /// 这个是"我自己的账号是谁"。两者可以不同 —— 比如登录着 UC，
+        /// 却在解析一个夸克分享。
+        /// </para>
+        /// <para>
+        /// 夸克与 UC 共用 <see cref="QuarkClient"/>（同一套 ucpro 后端，靠 Kind 切
+        /// 域名/pr/请求头）；阿里云盘与迅雷云盘协议完全不同，走
+        /// <see cref="_ownProvider"/>（<see cref="IPanProvider"/>）。
+        /// 四条路都收敛到下面那几个 Own* 助手方法，调用方不必关心区别。
+        /// </para>
+        /// </summary>
+        private PanKind _activeKind = PanKind.Quark;
+
+        /// <summary>
+        /// 阿里 / 迅雷的**自有网盘**客户端（当前账号那一家）。
+        /// 夸克 / UC 时恒为 null —— 那两家用 <see cref="_client"/>。
+        /// </summary>
+        private IPanProvider _ownProvider;
+
+        /// <summary>当前登录账号的展示名（"夸克网盘" / "UC网盘" / "阿里云盘" / "迅雷云盘"）。</summary>
+        private string ActivePanDisplayName
+        {
+            get
+            {
+                switch (_activeKind)
+                {
+                    case PanKind.Uc: return "UC网盘";
+                    case PanKind.Aliyun: return "阿里云盘";
+                    case PanKind.Xunlei: return "迅雷云盘";
+                    default: return "夸克网盘";
+                }
+            }
+        }
+
+        /// <summary>
+        /// 当前账号是不是"夸克系"（夸克 / UC）—— 决定自有网盘走
+        /// <see cref="_client"/> 还是 <see cref="_ownProvider"/>。
+        /// </summary>
+        private bool OwnIsQuarkLike
+        {
+            get { return _activeKind == PanKind.Quark || _activeKind == PanKind.Uc; }
+        }
+
+        /// <summary>
+        /// 当前账号能不能浏览自有网盘（列目录 / 容量 / 取直链）。
+        /// <para>
+        /// 四家都能了：夸克/UC 走 <see cref="QuarkClient"/>，
+        /// 阿里/迅雷走各自的 <see cref="IPanProvider"/> 实现
+        /// （<c>ListOwnDirAsync</c> / <c>GetSpaceAsync</c> / <c>GetOwnDownloadLinksAsync</c>）。
+        /// </para>
+        /// </summary>
+        private bool CanBrowseOwnDrive
+        {
+            get
+            {
+                return _activeKind == PanKind.Quark || _activeKind == PanKind.Uc
+                    || _activeKind == PanKind.Aliyun || _activeKind == PanKind.Xunlei;
+            }
+        }
+
+        /// <summary>
+        /// 下载时该带的 Referer（null = 用下载器默认的夸克 Referer）。
+        /// <para>
+        /// 各家 CDN 的直链签名绑了不同的 Referer，带错会被 403：
+        /// 阿里 OSS 签名里含 <c>x-oss-additional-headers=referer</c>，必须是
+        /// <c>https://www.alipan.com/</c>；迅雷是 <c>https://pan.xunlei.com/</c>。
+        /// 夸克系返回 null，保持原有行为。
+        /// </para>
+        /// </summary>
+        private string OwnDownloadReferer
+        {
+            get
+            {
+                if (_activeKind == PanKind.Aliyun) return AliyunConstants.DownloadReferer;
+                if (_activeKind == PanKind.Xunlei) return XunleiConstants.Referer;
+                // UC 必须给 UC 自己的 Referer。原来这里落到 null，下载器就回退成
+                // QuarkConstants.Referer（https://pan.quark.cn/），而 UC 直链在
+                // drive.uc.cn 的防盗链白名单里 —— 带夸克 Referer 一律 403，
+                // 兜底重试再用夸克头撞一次就是 412。这就是「UC 进了任务也下不了」的根因。
+                if (_activeKind == PanKind.Uc) return UcConstants.Referer;
+                return null;   // 夸克：沿用下载器默认值
+            }
+        }
+
+        /// <summary>
+        /// 下载任务该带的 User-Agent。
+        /// <para>
+        /// 与 <see cref="OwnDownloadReferer"/> 成对使用：UC 的 CDN 只认 UC 自己的
+        /// 客户端 UA（<c>UcConstants.DlUa</c>），拿夸克的 <c>QuarkConstants.DlUa</c>
+        /// 去请求同样会被防盗链拒。空 = 用下载器默认值（夸克 UA）。
+        /// </para>
+        /// </summary>
+        private string OwnDownloadUserAgent
+        {
+            get
+            {
+                if (_activeKind == PanKind.Uc) return UcConstants.DlUa;
+                return null;
+            }
+        }
+
+        /// <summary>
+        /// 下载任务该带的 Origin，必须与 <see cref="OwnDownloadReferer"/> 同源。
+        /// 空 = 用下载器默认值（<c>https://pan.quark.cn</c>）。
+        /// </summary>
+        private string OwnDownloadOrigin
+        {
+            get
+            {
+                if (_activeKind == PanKind.Uc) return UcConstants.Origin;
+                return null;
+            }
+        }
+
+        /// <summary>
+        /// 下载数据面是否走 OpenSSL 桥。
+        /// <para>
+        /// <b>UC 必须为 true</b>：UC 的下载 CDN <c>dl-pc-sz-cf.pds.uc.cn</c> 按 TLS
+        /// ClientHello 指纹过滤，Windows 自带的 SChannel 一律回
+        /// <c>403 RequestDeniedByCallback / require login [auth not found]</c>。
+        /// 同一个直链、同一份 Cookie 换到 OpenSSL 通道立刻回 206（实测）。
+        /// </para>
+        /// </summary>
+        private bool OwnDownloadUseOpenSsl
+        {
+            get { return _activeKind == PanKind.Uc; }
+        }
+
+        /// <summary>
+        /// 下载任务该带的 Cookie。
+        /// <para>
+        /// <b>必须判空</b>：阿里/迅雷登录后 <see cref="_client"/> 是 null
+        /// （见 <c>ApplyProviderLoginAsync</c> 里的 <c>_client = null</c>），
+        /// 这里直接取 <c>_client.CookieStr</c> 会在点「下载」的瞬间抛
+        /// NullReferenceException，表现为「程序发生未处理错误」弹窗。
+        /// 而且非夸克网盘本来就不该带夸克登录态（别把夸克 Cookie 发给别家 CDN）。
+        /// </para>
+        /// </summary>
+        private string DownloadCookie
+        {
+            get
+            {
+                if (ShareMode && IsOtherPan) return "";
+                if (_client != null) return _client.CookieStr;
+                return "";
+            }
+        }
+
+        /// <summary>
+        /// 当前是否**已经登录了某个账号**（四家任意一家）。
+        /// <para>
+        /// 原来到处写 <c>_client != null</c> —— 那只对夸克/UC 成立。
+        /// 阿里/迅雷登录后 <see cref="_client"/> 仍是 null（走 <see cref="_ownProvider"/>），
+        /// 用旧判据会把这些账号当成"未登录"，功能全部点不动。
+        /// </para>
+        /// </summary>
+        private bool IsLoggedInAny
+        {
+            get { return OwnIsQuarkLike ? _client != null : _ownProvider != null; }
+        }
+
+        // ---------------- 自有网盘访问层（当前账号） ----------------
+        // 四个 Own* 助手把"夸克系 / 阿里 / 迅雷"的差异挡在这里，
+        // 上层（目录加载、容量、取直链、递归求和）只认这几个方法。
+        // ⚠️ 它们都只服务「我的网盘」；分享模式另有 _panProvider 那条路。
+
+        /// <summary>列当前账号网盘的某个目录（全部条目，不分页）。</summary>
+        private async Task<IReadOnlyList<QuarkFileEntry>> OwnListDirAsync(string fid)
+        {
+            if (OwnIsQuarkLike)
+                return await _client.ListDirAsync(fid).ConfigureAwait(true);
+
+            if (_ownProvider == null)
+                throw new InvalidOperationException(ActivePanDisplayName + " 客户端未就绪，请重新登录。");
+            return await _ownProvider.ListOwnDirAsync(fid).ConfigureAwait(true);
+        }
+
+        /// <summary>
+        /// 列当前账号网盘目录的**一页**。阿里/迅雷的客户端一次性取完整个目录，
+        /// 所以只认第 1 页、HasMore=false —— 与分享模式的处理保持一致。
+        /// </summary>
+        private async Task<QuarkClient.DirPage> OwnListDirPageAsync(string fid, int page)
+        {
+            if (OwnIsQuarkLike)
+                return await _client.ListDirPageAsync(fid, page).ConfigureAwait(true);
+
+            var one = new QuarkClient.DirPage();
+            if (page > 1)
+                return one;
+            var entries = await OwnListDirAsync(fid).ConfigureAwait(true);
+            if (entries != null)
+                one.Items.AddRange(entries);
+            one.HasMore = false;
+            return one;
+        }
+
+        /// <summary>当前账号的容量（总 / 已用）。取不到时返回 (0,0)，界面回退"未知"。</summary>
+        private async Task<(long total, long used)> OwnCapacityAsync()
+        {
+            if (OwnIsQuarkLike)
+                return await _client.GetCapacityAsync().ConfigureAwait(true);
+
+            if (_ownProvider == null)
+                return (0, 0);
+            var space = await _ownProvider.GetSpaceAsync().ConfigureAwait(true);
+            PersistProviderToken();      // 取容量会换 access_token，可能轮换 refresh_token
+            return space == null ? (0, 0) : (space.Total, space.Used);
+        }
+
+        /// <summary>取当前账号网盘里这些文件的直链。</summary>
+        private async Task<IReadOnlyList<DownloadLink>> OwnLinksAsync(IList<PanFileEntry> files)
+        {
+            if (files == null || files.Count == 0)
+                return new List<DownloadLink>();
+
+            if (OwnIsQuarkLike)
+            {
+                var fids = new List<string>(files.Count);
+                foreach (var f in files)
+                    fids.Add(f.Fid);
+                return await _client.GetDownloadAsync(fids).ConfigureAwait(true);
+            }
+
+            if (_ownProvider == null)
+                throw new InvalidOperationException(ActivePanDisplayName + " 客户端未就绪，请重新登录。");
+            var links = await _ownProvider.GetOwnDownloadLinksAsync(files).ConfigureAwait(true);
+            PersistProviderToken();      // 同上：取直链同样会走换 token
+            return links;
+        }
+
+        /// <summary>
+        /// 把 provider **当前**的令牌写回配置（只在真的变了时才写盘）。
+        /// <para>
+        /// 为什么需要它：阿里会**轮换** refresh_token —— 每次换 access_token 都可能下发
+        /// 新的 refresh_token，旧的那个随即失效。如果只把登录那一刻的值存起来，
+        /// 下次启动就用一个已作废的令牌去登录，表现为「明明昨天还好好的，今天就登录失效」。
+        /// 迅雷的 pan_token 目前不轮换，但同一份代码顺手覆盖，成本为零。
+        /// </para>
+        /// </summary>
+        private void PersistProviderToken()
+        {
+            if (_ownProvider == null)
+                return;
+            try
+            {
+                if (_activeKind == PanKind.Aliyun)
+                {
+                    var a = _ownProvider as AliyunClient;
+                    if (a == null)
+                        return;
+                    string cur = a.RefreshToken ?? "";
+                    bool changed = false;
+                    if (!string.IsNullOrEmpty(cur) && cur != _settings.AliyunRefreshToken)
+                    {
+                        _settings.AliyunRefreshToken = cur;
+                        _settings.AliyunAccessToken = "";   // 有了可续期凭证就不再留短期令牌
+                        changed = true;
+                        LogDetail("阿里 refresh_token 已轮换，已更新保存。");
+                    }
+                    // 只有短期令牌的账号：把（可能已被服务端续过的）access_token 落盘，
+                    // 否则重启后还是那条旧的。
+                    string shortLived = a.IsShortLivedOnly ? (a.AccessToken ?? "") : "";
+                    if (a.IsShortLivedOnly && !string.IsNullOrEmpty(shortLived)
+                        && shortLived != _settings.AliyunAccessToken)
+                    {
+                        _settings.AliyunAccessToken = shortLived;
+                        changed = true;
+                    }
+                    if (changed)
+                        SettingsStore.Save(_settings);
+                }
+                else if (_activeKind == PanKind.Xunlei)
+                {
+                    var x = _ownProvider as XunleiClient;
+                    if (x == null)
+                        return;
+                    string cur = x.PanToken ?? "";
+                    if (!string.IsNullOrEmpty(cur) && cur != _settings.XunleiPanToken)
+                    {
+                        _settings.XunleiPanToken = cur;
+                        SettingsStore.Save(_settings);
+                        LogDetail("迅雷 pan_token 已更新，已保存。");
+                    }
+                }
+            }
+            catch { }
+        }
+
+        /// <summary>
+        /// 当前阿里/迅雷账号的**凭证原文**（阿里是 refresh_token，迅雷是 pan_token）。
+        /// 夸克系没有这个 —— 它们用的是 Cookie，直接取 <see cref="_client"/>.CookieStr。
+        /// 用于「导出凭证」和账号卡片展示，不参与任何网络请求。
+        /// </summary>
+        private string OwnProviderToken()
+        {
+            try
+            {
+                if (_activeKind == PanKind.Aliyun)
+                {
+                    var a = _ownProvider as AliyunClient;
+                    return a == null ? "" : (a.RefreshToken ?? "");
+                }
+                if (_activeKind == PanKind.Xunlei)
+                {
+                    var x = _ownProvider as XunleiClient;
+                    return x == null ? "" : (x.PanToken ?? "");
+                }
+            }
+            catch { }
+            return "";
+        }
+
+        /// <summary>当前是否走"多网盘"分支（非夸克）。</summary>
+        private bool IsOtherPan
+        {
+            get { return _panKind != PanKind.Quark; }
+        }
+
         /// <summary>当前分享的进入目录 fid（普通分享 "0"，带 fid 的链接指向子目录）。
         /// 自动重解析分享时从这里开始逐级展开。</summary>
         private string _startFid = "0";
@@ -415,15 +749,76 @@ namespace GeZi
                 // 统一交给 AttachWindowHooks（订阅在构造函数里，走 SourceInitialized）。
             };
 
-            if (!string.IsNullOrEmpty(_settings.Cookie))
+            // 启动自动登录：先看上次用的是哪家（ActivePanKind），
+            // 那家没凭证就按固定顺序找一家有凭证的（夸克 → UC → 阿里 → 迅雷）。
+            // ⚠️ 顺序不能乱：旧版本只认识夸克/UC，用户升级后旧 Cookie 仍在，
+            //    所以这两家必须排在前面，保持"升级后行为不变"。
             {
-                Log("正在自动登录…");
-                // 记下这个任务：续传前要等它（见 EnsureClientForResumeAsync）。
-                _startupLoginTask = ApplyLoginAsync(_settings.Cookie);
-            }
-            else
-            {
-                Log("就绪。未登录：可用「分享链接」模式下载公开分享，或到「登录」页扫码。");
+                var order = new List<PanKind>
+                {
+                    _settings.ActivePanKind == (int)PanKind.Uc ? PanKind.Uc
+                        : _settings.ActivePanKind == (int)PanKind.Aliyun ? PanKind.Aliyun
+                        : _settings.ActivePanKind == (int)PanKind.Xunlei ? PanKind.Xunlei
+                        : PanKind.Quark,
+                    PanKind.Quark, PanKind.Uc, PanKind.Aliyun, PanKind.Xunlei,
+                };
+
+                PanKind pick = PanKind.Quark;
+                string cred = null;
+                var seen = new HashSet<PanKind>();
+                foreach (var k in order)
+                {
+                    if (!seen.Add(k)) continue;      // 去重（第一项可能与后面的重复）
+                    string c;
+                    switch (k)
+                    {
+                        case PanKind.Uc: c = _settings.UcCookie; break;
+                        case PanKind.Aliyun:
+                            // 优先可续期的 refresh_token；网页只给过短期令牌时退回 access_token。
+                            c = !string.IsNullOrEmpty(_settings.AliyunRefreshToken)
+                                ? "rt:" + _settings.AliyunRefreshToken
+                                : (!string.IsNullOrEmpty(_settings.AliyunAccessToken)
+                                    ? "at:" + _settings.AliyunAccessToken
+                                    : null);
+                            break;
+                        case PanKind.Xunlei: c = _settings.XunleiPanToken; break;
+                        default: c = _settings.Cookie; break;
+                    }
+                    if (!string.IsNullOrEmpty(c))
+                    {
+                        pick = k;
+                        cred = c;
+                        break;
+                    }
+                }
+
+                if (cred != null)
+                {
+                    _activeKind = pick;
+                    Log("正在自动登录（" + ActivePanDisplayName + "）…");
+                    // 校验是异步的（UC/夸克要过网络，必要时还要借 Python 桥），
+                    // 这期间卡片不能一直挂着"未登录" —— 用户会以为登录失败
+                    // （反馈过"明明登录了却显示没登录、没名字没头像"）。
+                    // 有上次的昵称就先显示出来，提示语改成"正在校验登录态…"。
+                    if (!string.IsNullOrEmpty(_settings.Who))
+                    {
+                        UpdateAccountCard(_settings.Who, 0, 0);
+                        AccountHintText.Text = "正在校验登录态…";
+                    }
+                    else
+                    {
+                        AccountText.Text = ActivePanDisplayName;
+                        AccountHintText.Text = "正在校验登录态…";
+                    }
+                    // 记下这个任务：续传前要等它（见 EnsureClientForResumeAsync）。
+                    _startupLoginTask = pick == PanKind.Aliyun || pick == PanKind.Xunlei
+                        ? ApplyProviderLoginAsync(pick, cred)
+                        : ApplyLoginAsync(cred, pick);
+                }
+                else
+                {
+                    Log("就绪。未登录：可用「分享链接」模式下载公开分享，或到「登录」页扫码。");
+                }
             }
 
             // 首屏必须主动刷一次空状态。
@@ -487,6 +882,8 @@ namespace GeZi
             // 也避免"关窗后进程还活着"的路径（如托盘常驻）把保活留着。
             try { SleepGuard.Release(); } catch { }
             try { _client?.StopKeepAlive(); } catch { }
+            // 多网盘客户端：不释放会留下未关闭的 HttpClient 与连接池
+            try { _panProvider?.Dispose(); _panProvider = null; } catch { }
             // ⚠️ 托盘图标必须释放：不释放的话进程退出后图标会留在通知区，
             //    鼠标划过去才消失（最经典的托盘 bug）。
             try { _tray?.Dispose(); _tray = null; } catch { }
@@ -758,6 +1155,55 @@ namespace GeZi
         }
 
         /// <summary>
+        /// 导出诊断包：运行日志 + 环境信息 + 设置摘要（已脱敏）。
+        /// 明确不含 Cookie、登录票据与下载直链 —— 用户可以放心把它贴到 issue 里。
+        /// </summary>
+        private void OnExportDiagnosticsPack(object sender, RoutedEventArgs e)
+        {
+            try
+            {
+                var dlg = new Microsoft.Win32.SaveFileDialog
+                {
+                    Title = "导出诊断包",
+                    Filter = "ZIP 压缩包|*.zip",
+                    FileName = "GeZi-diagnostics-" + DateTime.Now.ToString("yyyyMMdd-HHmmss") + ".zip",
+                    AddExtension = true,
+                    OverwritePrompt = true,
+                };
+                if (dlg.ShowDialog(this) != true)
+                    return;
+
+                string logText = null;
+                try { logText = LogBox != null ? LogBox.Text : null; } catch { }
+
+                string version = "";
+                try { version = typeof(MainWindow).Assembly.GetName().Version.ToString(); } catch { }
+
+                var info = new List<KeyValuePair<string, string>>
+                {
+                    new KeyValuePair<string, string>("单文件并发", _settings.Threads.ToString()),
+                    new KeyValuePair<string, string>("同时下载任务数", _settings.ConcurrentTasks.ToString()),
+                    new KeyValuePair<string, string>("下载目录", _settings.OutDir ?? ""),
+                    new KeyValuePair<string, string>("分片根目录",
+                        string.IsNullOrWhiteSpace(_settings.PartsRoot) ? "(默认)" : _settings.PartsRoot),
+                    new KeyValuePair<string, string>("自动清理", _settings.AutoClean ? "开" : "关"),
+                    new KeyValuePair<string, string>("使用系统代理", _settings.UseSystemProxy ? "开" : "关"),
+                    new KeyValuePair<string, string>("主题", _settings.Theme.ToString()),
+                    new KeyValuePair<string, string>("已登录", string.IsNullOrEmpty(_settings.Who) ? "否" : "是"),
+                    new KeyValuePair<string, string>("全局连接预算",
+                        ThreadAllocator.DefaultBudget.ToString()),
+                };
+
+                string path = DiagnosticsPack.Create(dlg.FileName, "鸽子下载 GeZi", version, logText, info);
+                LogDetail("诊断包已导出: " + path);
+            }
+            catch (Exception ex)
+            {
+                LogDetail("导出诊断包失败: " + ex.Message);
+            }
+        }
+
+        /// <summary>
         /// 把「会等网络 / 扫磁盘」的按钮统一置灰，避免请求期间被重复触发。
         /// </summary>
         /// <remarks>
@@ -933,6 +1379,23 @@ namespace GeZi
                 return;
 
             bool nowShare = ShareMode;
+
+            // 「我的网盘」列表永远由 _client（当前账号）提供，跟**当前解析的分享**
+            // 属于哪家没有关系。所以这里要按账号类型判断，不能按 _panKind 判断：
+            //   账号是夸克/UC → 能列自己的目录（同一套 ucpro 接口），放行；
+            //   账号是阿里/迅雷 → 还没实现自有目录浏览，拦住并说明原因。
+            // （早先按 _panKind 判断，会出现"解析了 UC 分享却进不去自己的夸克网盘"。）
+            if (!nowShare && !CanBrowseOwnDrive)
+            {
+                AppDialog.Show(this,
+                    "当前登录的是 " + ActivePanDisplayName + " 账号。\n\n" +
+                    "这个网盘暂时只支持「分享链接免转存下载」，还不支持浏览它里面的自有文件。\n\n" +
+                    "要浏览自己的网盘，请先到「登录」页切换成夸克或 UC 账号。",
+                    "暂不支持", MessageBoxButton.OK, MessageBoxImage.Information);
+                ShareModeRadio.IsChecked = true;
+                return;
+            }
+
             SharePanel.Visibility = nowShare ? Visibility.Visible : Visibility.Collapsed;
 
             // ① 先把**离开的那个模式**的导航状态存下来
@@ -955,7 +1418,7 @@ namespace GeZi
             ResetNav();
             if (!nowShare)
             {
-                if (_client == null)
+                if (!IsLoggedInAny)
                 {
                     Log("网盘模式需要先登录");
                     return;
@@ -1194,6 +1657,25 @@ namespace GeZi
                 Log("请先粘贴分享链接");
                 return;
             }
+
+            // 多网盘入口：先按域名判断是不是 UC / 阿里 / 迅雷。
+            // 命中就走统一接口，夸克（以及认不出的链接）继续走下面原有的夸克流程 ——
+            // 这样夸克链路一行都没动，行为与之前完全一致。
+            var otherPan = PanUrlParser.Parse(url);
+            if (otherPan != null && otherPan.Kind != PanKind.Quark)
+            {
+                await ParseOtherPanAsync(otherPan).ConfigureAwait(true);
+                return;
+            }
+
+            _panKind = PanKind.Quark;
+            _panShareRef = null;
+            if (_panProvider != null)
+            {
+                try { _panProvider.Dispose(); } catch { }
+                _panProvider = null;
+            }
+
             var info = ShareUrlParser.Parse(url);
             if (info.IsKouling)
             {
@@ -1272,6 +1754,486 @@ namespace GeZi
                 SetBusy(false);
                 await EndBusyAsync(ParseBtn, t0);
             }
+        }
+
+        /// <summary>
+        /// 解析非夸克网盘（UC / 阿里 / 迅雷）的分享。
+        /// <para>
+        /// 与夸克流程的区别：这些网盘还没有扫码登录，凭证由用户在设置页手动粘贴，
+        /// 所以"未登录"时必须给出**去哪拿凭证**的指引，而不是一句"解析失败"。
+        /// </para>
+        /// </summary>
+        private async Task ParseOtherPanAsync(PanShareRef shareRef)
+        {
+            string panName = PanUrlParser.DisplayNameOf(shareRef.Kind);
+
+            // ① 拿凭证建客户端
+            IPanProvider provider;
+            try
+            {
+                provider = CreateProviderFor(shareRef.Kind);
+            }
+            catch (Exception ex)
+            {
+                Log(panName + "客户端创建失败: " + ex.Message);
+                return;
+            }
+
+            if (!provider.IsLoggedIn)
+            {
+                string hint = PanProviderRegistry.CredentialHint(shareRef.Kind);
+                Log(panName + "尚未配置登录凭证（需要：" + hint + "）。");
+                AppDialog.Show(this,
+                    "还没有配置" + panName + "的登录凭证。\n\n" +
+                    "需要：" + hint + "\n\n" +
+                    "请到「设置 → 多网盘账号」里粘贴后重试。\n" +
+                    "（" + provider.Capabilities.Note + "）",
+                    panName + "未登录", MessageBoxButton.OK, MessageBoxImage.Information);
+                provider.Dispose();
+                return;
+            }
+
+            // ② 切到多网盘态，清掉上一个分享的所有缓存
+            _panProvider?.Dispose();
+            _panProvider = provider;
+            _panKind = shareRef.Kind;
+            _panShareRef = shareRef;
+            _passcode = shareRef.Passcode ?? "";
+            _linkCache.Clear();
+            _dirCache.Clear();
+            _dirSizeCache.Clear();
+
+            long t0 = BusyClock();
+            if (!BeginBusy(ParseBtn, "解析中")) return;
+            SetBusy(true);
+            try
+            {
+                ResetNav();
+                _curFid = string.IsNullOrEmpty(shareRef.StartFid) ? "0" : shareRef.StartFid;
+                _startFid = _curFid;
+                await LoadDirAsync(_curFid);
+                Log("解析成功（" + panName + "，免转存）。双击文件夹进入子目录；选中文件后点「下载选中」即可下载。");
+                NotifyIfHidden("已解析 " + panName + " 分享",
+                    _files.Count > 0
+                        ? "共 " + _files.Count + " 个文件。双击托盘图标打开窗口即可下载。"
+                        : "该分享的当前目录是空的（文件可能在子目录里）。");
+            }
+            catch (Exception ex)
+            {
+                Log(panName + "解析失败: " + ex.Message);
+                NotifyIfHidden(panName + "解析失败", ex.Message);
+            }
+            finally
+            {
+                SetBusy(false);
+                await EndBusyAsync(ParseBtn, t0);
+            }
+        }
+
+        /// <summary>按网盘种类用设置里的凭证建客户端。</summary>
+        private IPanProvider CreateProviderFor(PanKind kind)
+        {
+            // ⚠️ 夸克与 UC 都用 Cookie 字段，但两者是**不同的值、不同的域**：
+            //    夸克是 .quark.cn 的 Cookie，UC 是 .uc.cn 的。混用会拿错登录态，
+            //    表现为"明明登录了却提示未登录/无效"。所以这里按 kind 分发。
+            var cred = new PanCredential
+            {
+                QuarkCookie = _settings.Cookie ?? "",
+                UcCookie = _settings.UcCookie ?? "",
+                RefreshToken = _settings.AliyunRefreshToken ?? "",
+                PanToken = _settings.XunleiPanToken ?? "",
+                CaptchaToken = _settings.XunleiCaptchaToken ?? "",
+                // 设备标识优先取网页登录抓到的真实 deviceid，其次账号登录那套。
+                DeviceId = !string.IsNullOrEmpty(_settings.XunleiWebDeviceId)
+                    ? _settings.XunleiWebDeviceId
+                    : (_settings.XunleiDeviceId ?? ""),
+            };
+            return AttachXunleiCaptcha(PanProviderRegistry.Create(kind, cred));
+        }
+
+        /// <summary>
+        /// 给迅雷 provider 挂上「网页取验证码」的钩子。
+        /// <para>
+        /// 迅雷的 captcha 盾按 client_id 分体系：网页签发的 pan_token 必须配
+        /// 网页签发的 captcha，用 App 体系申请的会被判 client_id not match。
+        /// 钩子由 <see cref="XunleiCaptchaFetcher"/> 实现（开一个隐藏 WebView2
+        /// 让网页自己生成，再读 localStorage）。
+        /// </para>
+        /// <para>非迅雷 provider 原样返回，调用方不必判断类型。</para>
+        /// </summary>
+        private static IPanProvider AttachXunleiCaptcha(IPanProvider provider)
+        {
+            var xunlei = provider as XunleiClient;
+            if (xunlei != null)
+                xunlei.CaptchaRefresher = XunleiCaptchaFetcher.FetchAsync;
+            return provider;
+        }
+
+        // ---------------- 多网盘内嵌登录（WebView2） ----------------
+
+        /// <summary>
+        /// UC 内嵌登录：开 WebView2 窗口加载官方登录页，登录成功后自动把 Cookie 填回输入框。
+        /// <para>
+        /// 三层降级的第一层就在这里：<see cref="WebView2Runtime.IsInstalled"/> 为 false 时
+        /// 按钮会被禁用（见 <see cref="RefreshUcRuntimeStatus"/>），但手动粘贴框始终可用。
+        /// </para>
+        /// </summary>
+        private void OnUcWebLogin(object sender, RoutedEventArgs e)
+        {
+            if (!WebView2Runtime.IsInstalled)
+            {
+                AppDialog.Show(this,
+                    "未检测到 WebView2 运行时，内嵌登录不可用。\n\n"
+                    + "这不影响使用 —— 你仍然可以在下方输入框里手动粘贴 Cookie。\n\n"
+                    + "想启用内嵌登录的话，安装 WebView2 运行时即可（约 2 MB）：\n"
+                    + WebView2Runtime.ConsumerDownloadUrl,
+                    "缺少 WebView2 运行时", MessageBoxButton.OK, MessageBoxImage.Information);
+                return;
+            }
+
+            try
+            {
+                var win = new WebLoginWindow(PanKind.Uc,
+                    cookie =>
+                    {
+                        // 拿到的 Cookie 直接回填并保存，用户不用再操作
+                        if (UcCookieBox != null)
+                            UcCookieBox.Text = cookie;
+                        ApplySettings();
+                        Log("UC网盘 内嵌登录成功，凭证已保存。");
+                        RefreshUcRuntimeStatus();
+                    },
+                    msg => LogDetail(msg))
+                {
+                    Owner = this,
+                };
+                win.ShowDialog();
+            }
+            catch (Exception ex)
+            {
+                Log("打开内嵌登录失败: " + ex.Message);
+            }
+        }
+
+        /// <summary>
+        /// 夸克内嵌登录：与 UC 同一套 WebView2 方案。
+        /// <para>
+        /// 为什么夸克也需要它：扫码登录依赖**手机端**完成确认 —— 手机夸克 App 必须在
+        /// 登录态、且 H5 桥（account.getUserInfo）可用，否则 App 侧会直接显示
+        /// 「登录请求已过期」（实测该文案的触发条件很宽：只要
+        /// loginWithKpsAndQrcodeToken 返回非 2000000 就显示，见 b.quark.cn 的
+        /// loginconfirm bundle）。这不是二维码本身的问题，本机无从修复，只能给一条
+        /// 不依赖手机的兜底路径 —— 内嵌浏览器登录后直接读 Cookie，与 YunX / wenxi
+        /// 的做法一致，成功率不受 App 环境影响。
+        /// </para>
+        /// </summary>
+        private void OnQuarkWebLogin(object sender, RoutedEventArgs e)
+        {
+            if (!WebView2Runtime.IsInstalled)
+            {
+                AppDialog.Show(this,
+                    "未检测到 WebView2 运行时，内嵌登录不可用。\n\n"
+                    + "这不影响扫码登录 —— 你仍然可以用上面的二维码登录。\n\n"
+                    + "想启用内嵌登录的话，安装 WebView2 运行时即可（约 2 MB）：\n"
+                    + WebView2Runtime.ConsumerDownloadUrl,
+                    "缺少 WebView2 运行时", MessageBoxButton.OK, MessageBoxImage.Information);
+                return;
+            }
+
+            try
+            {
+                var win = new WebLoginWindow(PanKind.Quark,
+                    cookie =>
+                    {
+                        // 复用扫码登录同一条落地路径：校验 → 保存 → 启动保活 → 存档
+                        _ = ApplyLoginAsync(cookie);
+                        Log("夸克网盘 内嵌登录成功，凭证已保存。");
+                    },
+                    msg => LogDetail(msg))
+                {
+                    Owner = this,
+                };
+                win.ShowDialog();
+            }
+            catch (Exception ex)
+            {
+                Log("打开内嵌登录失败: " + ex.Message);
+            }
+        }
+
+        /// <summary>验证当前输入框里的 UC Cookie 是否真的有效（调 account/info）。</summary>
+        private async void OnUcVerifyLogin(object sender, RoutedEventArgs e)
+        {
+            string cookie = UcCookieBox == null ? "" : (UcCookieBox.Text ?? "").Trim();
+            if (string.IsNullOrEmpty(cookie))
+            {
+                AppDialog.Show(this, "请先填入或通过内嵌登录获取 UC Cookie。",
+                    "没有凭证", MessageBoxButton.OK, MessageBoxImage.Information);
+                return;
+            }
+
+            long t0 = BusyClock();
+            try
+            {
+                if (!BeginBusy(UcVerifyBtn, "验证中")) return;
+                using (var uc = new UcDriveClient(cookie))
+                {
+                    var (ok, nick, error) = await uc.ValidateCookieAsync(cookie);
+                    if (ok)
+                    {
+                        if (UcCookieBox != null)
+                            UcCookieBox.Text = cookie;
+                        ApplySettings();
+                        Log("UC网盘 登录态有效：" + nick);
+
+                        // ⚠️ 光"校验通过"是不够的 —— 早先这里校验完弹个框就结束，
+                        // 于是账号卡片和「我的网盘」用的还是**夸克**客户端，
+                        // 用户看到的就是"登录成功了，但什么都不显示"。
+                        // 现在校验通过即把它设为**当前账号**：换客户端、存 UC 凭证、
+                        // 拉容量、加载 UC 自己的根目录（ApplyLoginAsync 内部全都会做）。
+                        await ApplyLoginAsync(cookie, PanKind.Uc);
+                        AppDialog.Show(this,
+                            "UC网盘 登录态有效，已切换为当前账号。\n\n账号：" + nick,
+                            "验证通过", MessageBoxButton.OK, MessageBoxImage.Information);
+                    }
+                    else
+                    {
+                        Log("UC网盘 登录态无效: " + error);
+                        AppDialog.Show(this, error, "验证未通过",
+                            MessageBoxButton.OK, MessageBoxImage.Warning);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Log("验证 UC 登录态失败: " + ex.Message);
+            }
+            finally
+            {
+                await EndBusyAsync(UcVerifyBtn, t0);
+            }
+        }
+
+        /// <summary>阿里云盘内嵌登录：登录后自动从 localStorage 取 refresh_token。</summary>
+        private void OnAliyunWebLogin(object sender, RoutedEventArgs e)
+        {
+            OpenProviderWebLogin(PanKind.Aliyun);
+        }
+
+        /// <summary>迅雷云盘内嵌登录：登录后自动从 localStorage 取 pan_token。</summary>
+        private void OnXunleiWebLogin(object sender, RoutedEventArgs e)
+        {
+            OpenProviderWebLogin(PanKind.Xunlei);
+        }
+
+        /// <summary>
+        /// 迅雷账号登录（手机号 + 短信验证码）。
+        /// <para>
+        /// 与内嵌登录的区别：这条路拿到的是 <c>refresh_token</c>，能长期续期；
+        /// 内嵌登录只有约两小时就过期的 <c>pan_token</c>。
+        /// 这是迅雷"一直显示 pan_token 无效"的根本解法。
+        /// </para>
+        /// </summary>
+        private void OnXunleiAccountLogin(object sender, RoutedEventArgs e)
+        {
+            try
+            {
+                var win = new XunleiLoginWindow(_settings.XunleiDeviceId,
+                    (result, deviceId) =>
+                    {
+                        // 设备标识必须存下来复用，否则下次登录会被当成新设备。
+                        if (!string.IsNullOrEmpty(deviceId))
+                            _settings.XunleiDeviceId = deviceId;
+                        _settings.XunleiRefreshToken = result.RefreshToken ?? "";
+
+                        // access_token 就是业务令牌，直接当 pan_token 用。
+                        if (XunleiTokenBox != null)
+                            XunleiTokenBox.Text = result.AccessToken ?? "";
+
+                        ApplySettings();
+                        Log("迅雷账号登录成功，已保存长期令牌（昵称=" + (result.NickName ?? "") + "）。");
+                        if (!string.IsNullOrEmpty(result.NickName))
+                            _settings.Who = result.NickName;
+
+                        // 立刻设成当前账号
+                        _ = ApplyProviderLoginAsync(PanKind.Xunlei, result.AccessToken ?? "");
+                    },
+                    msg => LogDetail(msg))
+                {
+                    Owner = this,
+                };
+                win.ShowDialog();
+            }
+            catch (Exception ex)
+            {
+                Log("迅雷账号登录失败: " + ex.Message);
+                AppDialog.Show(this, "打开账号登录失败：\n\n" + ex.Message,
+                    "迅雷登录", MessageBoxButton.OK, MessageBoxImage.Warning);
+            }
+        }
+
+        /// <summary>
+        /// 阿里 / 迅雷共用的内嵌登录入口。
+        /// <para>
+        /// 与 UC 那家的区别：这两家的登录态是 localStorage 里的令牌，
+        /// <see cref="WebLoginWindow"/> 内部已经按 kind 切成"读令牌"模式，
+        /// 这里只负责把拿到的令牌回填到输入框并立刻落地成当前账号。
+        /// </para>
+        /// </summary>
+        private void OpenProviderWebLogin(PanKind kind)
+        {
+            if (!WebView2Runtime.IsInstalled)
+            {
+                AppDialog.Show(this,
+                    "未检测到 WebView2 运行时，内嵌登录不可用。\n\n"
+                    + "这不影响使用 —— 你仍然可以在下方输入框里手动粘贴令牌。\n\n"
+                    + "想启用内嵌登录的话，安装 WebView2 运行时即可（约 2 MB）：\n"
+                    + WebView2Runtime.ConsumerDownloadUrl,
+                    "缺少 WebView2 运行时", MessageBoxButton.OK, MessageBoxImage.Information);
+                return;
+            }
+
+            try
+            {
+                var win = new WebLoginWindow(kind,
+                    token =>
+                    {
+                        // 迅雷内嵌登录返回的是打包记录（access_token + refresh_token +
+                        // sub + device_id + captcha_token），先把 refresh_token 那几个
+                        // 存下来，输入框里只显示 access_token —— 用户看到的就是一个令牌。
+                        string shown = kind == PanKind.Xunlei ? ConsumeXunleiRecord(token) : token;
+                        var box = kind == PanKind.Aliyun ? AliyunTokenBox : XunleiTokenBox;
+                        if (box != null)
+                            box.Text = shown;
+                        ApplySettings();
+                        Log(PanUrlParser.DisplayNameOf(kind) + " 内嵌登录成功，凭证已保存。");
+                        // 拿到就立刻设成当前账号，用户不用再点"验证"
+                        _ = ApplyProviderLoginAsync(kind, shown);
+                    },
+                    msg => LogDetail(msg))
+                {
+                    Owner = this,
+                };
+                win.ShowDialog();
+            }
+            catch (Exception ex)
+            {
+                Log("打开内嵌登录失败: " + ex.Message);
+            }
+        }
+
+        /// <summary>
+        /// 拆开迅雷内嵌登录返回的打包记录，把 refresh_token / sub / device_id /
+        /// captcha_token 分别存进设置，只把 access_token 交给界面与登录流程。
+        /// <para>
+        /// 为什么要存 refresh_token：网页令牌约两小时过期，没有它就只能让用户
+        /// 反复扫码。网页 token 属于另一套 OAuth 客户端，所以单独存一份，
+        /// 刷新时也要走 <see cref="XunleiLoginService.RefreshWebAsync"/>。
+        /// </para>
+        /// <para>
+        /// 传入的不是打包记录（例如用户手动粘贴的裸 token）时原样返回。
+        /// </para>
+        /// </summary>
+        private string ConsumeXunleiRecord(string record)
+        {
+            string at, rt, sub, dev, cap;
+            if (!XunleiProtocol.TryParseRecord(record, out at, out rt, out sub, out dev, out cap))
+                return record;
+
+            if (!string.IsNullOrEmpty(rt))
+                _settings.XunleiWebRefreshToken = rt;
+            if (!string.IsNullOrEmpty(sub))
+                _settings.XunleiWebSub = sub;
+            if (!string.IsNullOrEmpty(dev))
+                _settings.XunleiWebDeviceId = dev;
+            if (!string.IsNullOrEmpty(cap))
+                _settings.XunleiCaptchaToken = cap;
+
+            if (!string.IsNullOrEmpty(rt))
+                LogDetail("[登录] 迅雷网页登录已取到 refresh_token，之后可自动续期，无需反复扫码。");
+            else
+                LogDetail("[登录] 迅雷网页登录未取到 refresh_token（网页可能尚未完成登录），到期后需重新扫码。");
+
+            return at;
+        }
+
+        private async void OnAliyunVerifyLogin(object sender, RoutedEventArgs e)
+        {
+            await VerifyProviderLoginAsync(PanKind.Aliyun);
+        }
+
+        private async void OnXunleiVerifyLogin(object sender, RoutedEventArgs e)
+        {
+            await VerifyProviderLoginAsync(PanKind.Xunlei);
+        }
+
+        /// <summary>阿里 / 迅雷共用的"验证登录态"：校验输入框里的令牌并设为当前账号。</summary>
+        private async Task VerifyProviderLoginAsync(PanKind kind)
+        {
+            var box = kind == PanKind.Aliyun ? AliyunTokenBox : XunleiTokenBox;
+            var btn = kind == PanKind.Aliyun ? AliyunVerifyBtn : XunleiVerifyBtn;
+            string token = box == null ? "" : (box.Text ?? "").Trim();
+            string panName = PanUrlParser.DisplayNameOf(kind);
+
+            if (string.IsNullOrEmpty(token))
+            {
+                AppDialog.Show(this, "请先填入或通过内嵌登录获取 " + panName + " 令牌。",
+                    "没有凭证", MessageBoxButton.OK, MessageBoxImage.Information);
+                return;
+            }
+
+            long t0 = BusyClock();
+            try
+            {
+                if (!BeginBusy(btn, "验证中")) return;
+                // notifyFailure: true —— 这是用户主动点的，必须有可见结果
+                await ApplyProviderLoginAsync(kind, token, true);
+            }
+            finally
+            {
+                await EndBusyAsync(btn, t0);
+            }
+        }
+
+        /// <summary>
+        /// 刷新"运行时是否可用"的界面状态。
+        /// 缺失时只置灰内嵌登录按钮 + 一行说明，不弹窗、不阻塞 —— 这是第二层降级。
+        /// </summary>
+        private void RefreshUcRuntimeStatus()
+        {
+            try
+            {
+                bool installed = WebView2Runtime.IsInstalled;
+
+                if (UcWebLoginBtn != null)
+                {
+                    UcWebLoginBtn.IsEnabled = installed;
+                    UcWebLoginBtn.ToolTip = installed
+                        ? "打开官方登录页，登录成功后自动填入 Cookie"
+                        : "需要 WebView2 运行时（Windows 11 预装；Win10 多数已有）。缺失时请用手动粘贴。";
+                }
+
+                if (UcRuntimeStatusText != null)
+                {
+                    UcRuntimeStatusText.Text = WebView2Runtime.DescribeStatus();
+                }
+
+                // 阿里 / 迅雷的内嵌登录按钮同理：缺运行时只置灰，手动粘贴始终可用。
+                string tip = installed
+                    ? "打开官方登录页，登录成功后自动填入令牌"
+                    : "需要 WebView2 运行时（Windows 11 预装；Win10 多数已有）。缺失时请手动粘贴。";
+                if (AliyunWebLoginBtn != null)
+                {
+                    AliyunWebLoginBtn.IsEnabled = installed;
+                    AliyunWebLoginBtn.ToolTip = tip;
+                }
+                if (XunleiWebLoginBtn != null)
+                {
+                    XunleiWebLoginBtn.IsEnabled = installed;
+                    XunleiWebLoginBtn.ToolTip = tip;
+                }
+            }
+            catch { }
         }
 
         // ---------------- 剪贴板自动解析（2026-10-08） ----------------
@@ -2059,9 +3021,39 @@ namespace GeZi
         /// <summary>取一页目录（分享模式 / 网盘模式走各自接口）。</summary>
         private Task<QuarkClient.DirPage> FetchDirPageAsync(string fid, int page)
         {
-            return ShareMode
-                ? _client.ShareDetailPageAsync(_pwdId, _stoken, fid, page)
-                : _client.ListDirPageAsync(fid, page);
+            // 「我的网盘」永远走**当前账号**的接口（夸克/UC 用 _client 自带 Kind，
+            // 阿里/迅雷用 _ownProvider —— 统一由 OwnListDirPageAsync 分派），
+            // 与当前解析的分享属于哪家无关。必须放在 IsOtherPan 判断之前，
+            // 否则解析过 UC 分享后切到「我的网盘」会跑到分享接口上去。
+            if (!ShareMode)
+                return OwnListDirPageAsync(fid, page);
+
+            // 分享模式下的非夸克网盘：走 IPanProvider。这些客户端的 ListShareAsync
+            // 内部已经翻完所有页，所以只认第 1 页、HasMore=false ——
+            // 界面本身还是按批揭示的，体验不受影响。
+            if (IsOtherPan)
+                return FetchOtherPanDirPageAsync(fid, page);
+
+            return _client.ShareDetailPageAsync(_pwdId, _stoken, fid, page);
+        }
+
+        /// <summary>非夸克网盘的目录页：一次性取完，转成夸克的条目类型交给界面。</summary>
+        private async Task<QuarkClient.DirPage> FetchOtherPanDirPageAsync(string fid, int page)
+        {
+            var one = new QuarkClient.DirPage();
+            if (page > 1)
+                return one;     // 已经把整份目录取回来了，没有第二页
+
+            if (_panProvider == null || _panShareRef == null)
+                throw new InvalidOperationException("多网盘客户端未就绪。");
+
+            var entries = await _panProvider.ListShareAsync(_panShareRef, fid)
+                .ConfigureAwait(false);
+
+            // 字段搬运统一走 Core 的 PanEntryMapper（可被自测覆盖）
+            one.Items.AddRange(PanEntryMapper.ToQuarkEntries(entries));
+            one.HasMore = false;
+            return one;
         }
 
         /// <summary>目录在前、文件在后，同类按名称排序 —— 与 Python Flet 版一致。</summary>
@@ -2351,9 +3343,23 @@ namespace GeZi
             if (_dirSizeCache.TryGetValue(DirSizeKey(fid), out cached)) return cached;
             if (!takeBudget()) return 0;
 
-            var items = ShareMode
-                ? await _client.ShareDetailAsync(_pwdId, _stoken, fid)
-                : await _client.ListDirAsync(fid);
+            // 非夸克网盘：目录大小求和也要走 provider，否则会拿夸克客户端去请求，
+            // 结果是异常或 0 —— 用户看到「文件夹 0 B」会以为文件是空的。
+            // 但「我的网盘」模式永远用当前账号的客户端（见 FetchDirPageAsync 的同款说明）。
+            List<QuarkFileEntry> items;
+            if (!ShareMode)
+            {
+                items = new List<QuarkFileEntry>(await OwnListDirAsync(fid).ConfigureAwait(true));
+            }
+            else if (IsOtherPan)
+            {
+                var page = await FetchOtherPanDirPageAsync(fid, 1).ConfigureAwait(true);
+                items = page.Items;
+            }
+            else
+            {
+                items = await _client.ShareDetailAsync(_pwdId, _stoken, fid);
+            }
 
             long sum = 0;
             foreach (var it in items)
@@ -2491,7 +3497,7 @@ namespace GeZi
         /// </summary>
         private async void OnDeleteCloudSelected(object sender, RoutedEventArgs e)
         {
-            if (_client == null) { Log("请先登录"); return; }
+            if (!IsLoggedInAny) { Log("请先登录"); return; }
             if (ShareMode) { Log("「删除网盘文件」只在「我的网盘」模式下可用（分享里的文件属于分享者）"); return; }
 
             var selected = FileList.SelectedItems.Cast<ShareFileItem>().ToList();
@@ -2506,6 +3512,17 @@ namespace GeZi
 
             var fids = selected.Select(f => f.Fid).Where(f => !string.IsNullOrEmpty(f)).ToList();
             if (fids.Count == 0) return;
+
+            // 阿里/迅雷的客户端目前只实现了"浏览 + 取直链"，没有删除接口。
+            // 与其让它抛一个晦涩的异常，不如直接说清楚。
+            if (!OwnIsQuarkLike)
+            {
+                AppDialog.Show(this,
+                    ActivePanDisplayName + " 目前只支持浏览与下载，暂不支持在软件内删除文件。\n\n"
+                    + "需要删除的话，请到网页版操作。",
+                    "暂不支持", MessageBoxButton.OK, MessageBoxImage.Information);
+                return;
+            }
 
             SetBusy(true);
             try
@@ -2692,11 +3709,11 @@ namespace GeZi
         /// </summary>
         private bool RequireLogin(string action)
         {
-            if (_client != null) return true;
+            if (IsLoggedInAny) return true;
             try
             {
                 AppDialog.Show(this,
-                    action + "需要先登录夸克账号。\n\n"
+                    action + "需要先登录账号。\n\n"
                     + "登录后可浏览「我的网盘」、转存分享文件、下载文件与获取直链。",
                     "需要登录", MessageBoxButton.OK, MessageBoxImage.Information);
             }
@@ -3095,7 +4112,7 @@ namespace GeZi
         private void ExportLinksFromDialog(Window owner, List<DownloadItem> items,
             LinkExporter.Format format)
         {
-            if (_client == null) { Log("请先登录或解析分享"); return; }
+            if (!IsLoggedInAny && _panProvider == null) { Log("请先登录或解析分享"); return; }
 
             var list = new List<LinkExporter.Item>();
             int skipped = 0;
@@ -3235,8 +4252,14 @@ namespace GeZi
                 jobs.Add(new DownloadJob
                 {
                     Name = item.Name, Url = item.Url, Dest = dest,
-                    Cookie = _client.CookieStr,
+                    // 非夸克网盘用签名直链，不带夸克 Cookie（避免把夸克登录态发给别家 CDN）
+                    Cookie = DownloadCookie,
+                    Referer = OwnDownloadReferer,
+                    UserAgent = OwnDownloadUserAgent,
+                    Origin = OwnDownloadOrigin,
+                              UseOpenSsl = OwnDownloadUseOpenSsl,
                     Threads = i < alloc.Length ? alloc[i] : _settings.Threads,
+                    Md5 = item.Md5, Sha1 = item.Sha1, Sha256 = item.Sha256,
                     // 写入方式统一取设置页的全局值（原来靠下载区的「边下边播」勾选框，
                     // 与设置页重复且容易误导，已移除该勾选框）。
                     PartsRoot = string.IsNullOrWhiteSpace(_settings.PartsRoot) ? null : _settings.PartsRoot,
@@ -3248,8 +4271,11 @@ namespace GeZi
                         PwdId = _pwdId, Stoken = _stoken, Passcode = item.Passcode,
                         Fid = item.Fid, Token = item.Token, FromShare = item.FromShare,
                         RelDir = item.RelDir ?? "", Dest = dest, Size = item.Size,
+                        Md5 = item.Md5, Sha1 = item.Sha1, Sha256 = item.Sha256,
                         // 自动重解析分享的上下文（stoken 过期时换新凭证用）
                         StartFid = item.StartFid, ShareRelDir = item.ShareRelDir,
+                        // 来源网盘（0=夸克）：续传时要据此选客户端
+                        PanKind = (int)_panKind,
                     },
                 });
             }
@@ -3266,7 +4292,7 @@ namespace GeZi
         private async Task StartDownloadAsync(List<ShareFileItem> selected,
             CancellationToken ct = default(CancellationToken), bool forceNoSave = false)
         {
-            if (_client == null)
+            if (!IsLoggedInAny && _panProvider == null)
             {
                 Log("请先登录或解析分享");
                 return;
@@ -3350,8 +4376,13 @@ namespace GeZi
                     jobs.Add(new DownloadJob
                     {
                         Name = item.Name, Url = item.Url, Dest = dest,
-                        Cookie = _client.CookieStr,
+                        Cookie = DownloadCookie,
+                        Referer = OwnDownloadReferer,
+                        UserAgent = OwnDownloadUserAgent,
+                        Origin = OwnDownloadOrigin,
+                              UseOpenSsl = OwnDownloadUseOpenSsl,
                         Threads = i < alloc.Length ? alloc[i] : _settings.Threads,
+                        Md5 = item.Md5, Sha1 = item.Sha1, Sha256 = item.Sha256,
                         // 分片根目录：留空 = 与目标同级（默认）。非空则分片集中存放，
                         // 下载目录不被 .qparts 污染，也支持分片跨盘（如放 SSD）。
                         PartsRoot = string.IsNullOrWhiteSpace(_settings.PartsRoot) ? null : _settings.PartsRoot,
@@ -3368,8 +4399,10 @@ namespace GeZi
                             Fid = item.Fid, Token = item.Token,
                             FromShare = item.FromShare, RelDir = item.RelDir ?? "",
                             Dest = dest, Size = item.Size,
+                            Md5 = item.Md5, Sha1 = item.Sha1, Sha256 = item.Sha256,
                             // 自动重解析分享的上下文（stoken 过期时换新凭证用）
                             StartFid = item.StartFid, ShareRelDir = item.ShareRelDir,
+                            PanKind = (int)_panKind,
                         },
                     });
                 }
@@ -3406,9 +4439,26 @@ namespace GeZi
                     List<QuarkFileEntry> children;
                     try
                     {
-                        children = ShareMode
-                            ? await _client.ShareDetailAsync(_pwdId, _stoken, it.Fid)
-                            : await _client.ListDirAsync(it.Fid);
+                        // 「我的网盘」永远走当前账号的客户端（与 FetchDirPageAsync 同款说明）；
+                        // 分享模式下的非夸克网盘才走 provider。
+                        // ⚠️ 这里必须显式分支：下面的 catch 是"跳过该目录继续"，
+                        //    如果漏走 provider 就会**静默少收文件** ——
+                        //    用户点「下载文件夹」却只下到一部分，且没有任何报错。
+                        if (!ShareMode)
+                        {
+                            children = new List<QuarkFileEntry>(
+                                await OwnListDirAsync(it.Fid).ConfigureAwait(true));
+                        }
+                        else if (IsOtherPan)
+                        {
+                            var page = await FetchOtherPanDirPageAsync(it.Fid, 1)
+                                .ConfigureAwait(true);
+                            children = page.Items;
+                        }
+                        else
+                        {
+                            children = await _client.ShareDetailAsync(_pwdId, _stoken, it.Fid);
+                        }
                     }
                     catch (OperationCanceledException)
                     {
@@ -3505,10 +4555,12 @@ namespace GeZi
             var items = new List<DownloadItem>();
             foreach (var f in files)
             {
-                if (urlOf.TryGetValue(f.Fid, out string url))
+                DownloadLink link;
+                if (urlOf.TryGetValue(f.Fid, out link))
                     items.Add(new DownloadItem
                     {
-                        Name = f.Name, Size = f.Size, Url = url, RelDir = f.RelDir,
+                        Name = f.Name, Size = f.Size, Url = link.DownloadUrl, RelDir = f.RelDir,
+                        Md5 = link.Md5, Sha1 = link.Sha1, Sha256 = link.Sha256,
                         Fid = f.Fid, Token = f.Token, FromShare = true,
                         // f.RelDir 是「相对当前浏览目录」的，拼上 shareDir 才是「相对分享进入点」的完整路径
                         Passcode = passcode, StartFid = startFid,
@@ -3543,10 +4595,12 @@ namespace GeZi
             var items = new List<DownloadItem>();
             foreach (var f in files)
             {
-                if (urlOf.TryGetValue(f.Fid, out string url))
+                DownloadLink link;
+                if (urlOf.TryGetValue(f.Fid, out link))
                     items.Add(new DownloadItem
                     {
-                        Name = f.Name, Size = f.Size, Url = url, RelDir = f.RelDir,
+                        Name = f.Name, Size = f.Size, Url = link.DownloadUrl, RelDir = f.RelDir,
+                        Md5 = link.Md5, Sha1 = link.Sha1, Sha256 = link.Sha256,
                         Fid = f.Fid, FromShare = false,
                     });
                 else
@@ -3621,10 +4675,12 @@ namespace GeZi
 
                     for (int j = 0; j < newFids.Count && j < batch.Count; j++)
                     {
-                        if (urlOf.TryGetValue(newFids[j], out string url))
+                        DownloadLink link;
+                        if (urlOf.TryGetValue(newFids[j], out link))
                             items.Add(new DownloadItem
                             {
-                                Name = batch[j].Name, Size = batch[j].Size, Url = url, RelDir = batch[j].RelDir,
+                                Name = batch[j].Name, Size = batch[j].Size, Url = link.DownloadUrl, RelDir = batch[j].RelDir,
+                                Md5 = link.Md5, Sha1 = link.Sha1, Sha256 = link.Sha256,
                                 // 转存后要按"新 fid"取链，所以这里记的是转存后的 fid，不是分享里的
                                 Fid = newFids[j], FromShare = false,
                             });
@@ -3651,11 +4707,13 @@ namespace GeZi
         ///     用户只看到「跳过（无直链）」，无从判断是会员额度、风控还是分享被关。
         ///  2. **多一轮"逐个单请求"兜底**。批量接口更易被限流，剩少量文件时逐个问成功率更高。
         /// </summary>
-        private async Task<Dictionary<string, string>> FetchUrlsWithRetryAsync(
+        private async Task<Dictionary<string, DownloadLink>> FetchUrlsWithRetryAsync(
             List<LinkTarget> targets, bool fromShare, CancellationToken ct = default(CancellationToken))
         {
             ct.ThrowIfCancellationRequested();
-            var urls = new Dictionary<string, string>();
+            // fid → 完整取链结果（含 download_url 与内容哈希）。
+            // 只存 string 会把哈希丢掉，完成时只能显示“未校验”。
+            var urls = new Dictionary<string, DownloadLink>();
             var pending = new List<LinkTarget>(targets);
             var reason = new Dictionary<string, string>();
             int[] delays = { 0, 800, 1600, 3000, 5000 };
@@ -3666,7 +4724,7 @@ namespace GeZi
             var miss = new List<LinkTarget>();
             foreach (var t in pending)
             {
-                string hit = _linkCache.Get(t.Fid);
+                var hit = _linkCache.GetLink(t.Fid);
                 if (hit != null) { urls[t.Fid] = hit; cached++; }
                 else miss.Add(t);
             }
@@ -3698,22 +4756,22 @@ namespace GeZi
                             reason[t.Fid] = "接口报错: " + err;
                     }
 
-                    var got = new Dictionary<string, string>();
+                    var got = new Dictionary<string, DownloadLink>();
                     if (links != null)
                     {
                         foreach (var l in links)
                         {
                             if (!string.IsNullOrEmpty(l.Fid) && !string.IsNullOrEmpty(l.DownloadUrl))
-                                got[l.Fid] = l.DownloadUrl;
+                                got[l.Fid] = l;
                         }
                     }
 
                     foreach (var t in batch)
                     {
-                        string url;
-                        if (got.TryGetValue(t.Fid, out url))
+                        DownloadLink link;
+                        if (got.TryGetValue(t.Fid, out link))
                         {
-                            urls[t.Fid] = url;
+                            urls[t.Fid] = link;
                         }
                         else
                         {
@@ -3741,7 +4799,7 @@ namespace GeZi
                         var hit = one == null ? null : one.FirstOrDefault(l => !string.IsNullOrEmpty(l.DownloadUrl));
                         if (hit != null)
                         {
-                            urls[t.Fid] = hit.DownloadUrl;
+                            urls[t.Fid] = hit;
                         }
                         else
                         {
@@ -3771,23 +4829,61 @@ namespace GeZi
                     + "分享直链还可能是分享者已关闭直链，或超出游客可获取的大小限制。");
             }
 
-            // ---- 写回缓存：本次取到的链在 TTL 内可被后续操作复用 ----
+            // ---- 写回缓存：本次取到的链 + 哈希在 TTL 内可被后续操作复用 ----
             foreach (var kv in urls)
-                _linkCache.Put(kv.Key, kv.Value);
+                _linkCache.PutLink(kv.Value);
 
             return urls;
         }
 
-        private Task<List<DownloadLink>> FetchBatchAsync(List<LinkTarget> batch, bool fromShare)
+        private async Task<List<DownloadLink>> FetchBatchAsync(List<LinkTarget> batch, bool fromShare)
         {
+            // 非夸克网盘：分享模式走 provider 的免转存取链；
+            // 自有网盘（阿里/迅雷）走 _ownProvider —— 两者都由下面的助手分派，
+            // 所以这里必须先按"是不是分享"分开，否则解析过分享后回到
+            // 「我的网盘」下文件会走错分支。
+            if (fromShare && ShareMode && IsOtherPan)
+                return await FetchOtherPanLinksAsync(batch).ConfigureAwait(true);
+
             if (fromShare)
             {
-                return _client.GetShareDownloadAsync(
+                return await _client.GetShareDownloadAsync(
                     batch.Select(t => t.Fid).ToList(),
                     batch.Select(t => t.Token ?? "").ToList(),
-                    _pwdId, _stoken);
+                    _pwdId, _stoken).ConfigureAwait(true);
             }
-            return _client.GetDownloadAsync(batch.Select(t => t.Fid).ToList());
+
+            var files = new List<PanFileEntry>(batch.Count);
+            foreach (var t in batch)
+            {
+                files.Add(new PanFileEntry
+                {
+                    Fid = t.Fid,
+                    Token = t.Token ?? "",
+                    Name = t.Name ?? "",
+                });
+            }
+            var links = await OwnLinksAsync(files).ConfigureAwait(true);
+            return links == null ? new List<DownloadLink>() : new List<DownloadLink>(links);
+        }
+
+        /// <summary>非夸克网盘的免转存取直链。</summary>
+        private async Task<List<DownloadLink>> FetchOtherPanLinksAsync(List<LinkTarget> batch)
+        {
+            if (_panProvider == null || _panShareRef == null)
+                throw new InvalidOperationException("多网盘客户端未就绪。");
+
+            var files = PanEntryMapper.ToPanEntries(batch.Select(t =>
+                new QuarkFileEntry { Fid = t.Fid, Name = t.Name, Token = t.Token ?? "" }));
+
+            var links = await _panProvider
+                .GetShareDownloadLinksAsync(_panShareRef, files)
+                .ConfigureAwait(false);
+
+            var result = new List<DownloadLink>();
+            if (links != null)
+                result.AddRange(links);
+            return result;
         }
 
         /// <summary>
@@ -3806,6 +4902,36 @@ namespace GeZi
             _linkCache.Invalidate(item.Fid);
 
             List<DownloadLink> links;
+            if (item.FromShare && IsOtherPan)
+            {
+                // 非夸克网盘：直接向对应 provider 重新取一次链。
+                // 这些客户端的取链接口每次都重新换 token，天然支持"过期重取"，
+                // 不需要夸克那套 GetShareLinkWithReResolveAsync（重解析分享换 stoken）。
+                try
+                {
+                    var one = new List<PanFileEntry>
+                    {
+                        new PanFileEntry { Fid = item.Fid, Name = item.Name, Token = item.Token ?? "" },
+                    };
+                    var fresh = await _panProvider
+                        .GetShareDownloadLinksAsync(_panShareRef, one, ct)
+                        .ConfigureAwait(false);
+                    var hit2 = fresh == null
+                        ? null
+                        : fresh.FirstOrDefault(l => !string.IsNullOrEmpty(l.DownloadUrl));
+                    if (hit2 != null)
+                    {
+                        _linkCache.Put(item.Fid, hit2.DownloadUrl);
+                        return hit2.DownloadUrl;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    LogDetail("刷新直链失败（" + PanUrlParser.DisplayNameOf(_panKind) + "）: " + ex.Message);
+                }
+                return null;
+            }
+
             if (item.FromShare)
             {
                 // stoken 过期时自动重解析分享：换新 stoken + 新
@@ -3826,7 +4952,12 @@ namespace GeZi
             }
             else
             {
-                links = await _client.GetDownloadAsync(new List<string> { item.Fid }).ConfigureAwait(false);
+                // 自有网盘：夸克/UC 走 _client，阿里/迅雷走 _ownProvider（由助手分派）。
+                var one = new List<PanFileEntry>
+                {
+                    new PanFileEntry { Fid = item.Fid, Token = item.Token ?? "" },
+                };
+                links = (await OwnLinksAsync(one).ConfigureAwait(false)).ToList();
             }
 
             if (links == null)
@@ -3834,13 +4965,24 @@ namespace GeZi
             var hit = links.FirstOrDefault(l => !string.IsNullOrEmpty(l.DownloadUrl));
             string u = hit == null ? null : hit.DownloadUrl;
             if (u != null)
-                _linkCache.Put(item.Fid, u);   // 新链写回缓存，供后续同类操作复用
+            {
+                // 新链可能带新的哈希；更新到 item，完成校验时用同一份。
+                item.Md5 = hit.Md5;
+                item.Sha1 = hit.Sha1;
+                item.Sha256 = hit.Sha256;
+                _linkCache.PutLink(hit);   // 新链写回缓存，供后续同类操作复用
+            }
             return u;
         }
 
         /// <summary>转存后校验：等文件异步落盘，过滤不在目标目录里的 fid（对应原版 _resolve_saved_fids）。</summary>
         private async Task<List<string>> ResolveSavedFidsAsync(string toFid, List<string> fids)
         {
+            // 转存（保存到自己网盘）目前只有夸克系实现了 —— 阿里/迅雷没有转存接口，
+            // 它们那条路根本不会调到这里；真调到了就原样返回，别拿夸克客户端去问。
+            if (!OwnIsQuarkLike || _client == null)
+                return fids;
+
             int[] delays = { 0, 1000, 1500, 2000, 2500, 3000 };
             for (int round = 0; round < delays.Length; round++)
             {
@@ -3863,6 +5005,11 @@ namespace GeZi
             string path = "/" + name;
             try
             {
+                // 中转文件夹只在"转存到夸克系网盘"时用到；阿里/迅雷没有转存，
+                // 也没有 PathFidAsync/MkdirAsync，直接返回 null（调用方会跳过清理）。
+                if (!OwnIsQuarkLike || _client == null)
+                    return null;
+
                 string fid = await _client.PathFidAsync(path);
                 if (!string.IsNullOrEmpty(fid))
                     return fid;
@@ -3954,6 +5101,9 @@ namespace GeZi
                 return;
             }
             if (_client == null)
+                return;
+            // 只有夸克系做过转存（阿里/迅雷没有），所以清理也只对它们有意义。
+            if (!OwnIsQuarkLike)
                 return;
             try
             {
@@ -4069,6 +5219,11 @@ namespace GeZi
                             // 自动重解析分享的上下文（stoken 过期自愈用）
                             StartFid = pi?.StartFid,
                             ShareRelDir = pi?.ShareRelDir,
+                            Md5 = pi?.Md5,
+                            Sha1 = pi?.Sha1,
+                            Sha256 = pi?.Sha256,
+                            // 来源网盘：0=夸克。续传时据此选客户端，不能丢。
+                            PanKindValue = pi?.PanKind ?? 0,
                         });
                     }
                 }
@@ -5273,6 +6428,7 @@ namespace GeZi
         private void StartPartsSweep()
         {
             var roots = AllPartsRoots();
+            string outDir = _settings.OutDir;
             string rootSnapshot = roots.Count == 0 ? "（无自定义根目录）" : string.Join("；", roots);
 
             var t = new Thread(() =>
@@ -5280,20 +6436,38 @@ namespace GeZi
                 try
                 {
                     var r = PartsSweeper.Sweep(roots, PartsSweeper.DefaultMaxAgeDays);
-                    if (r.Scanned == 0)
+                    // 默认 {dest}.qparts 不在 roots 里，单独扫一遍下载目录。
+                    var d = PartsSweeper.SweepDefault(
+                        string.IsNullOrWhiteSpace(outDir) ? null : new[] { outDir },
+                        PartsSweeper.DefaultMaxAgeDays);
+                    if (r.Scanned == 0 && d.Scanned == 0)
                         return;   // 没有任何分片文件，不必打扰用户
 
-                    if (r.AnythingDone)
+                    int removed = r.Removed + d.Removed;
+                    int skipped = r.Skipped + d.Skipped;
+                    long freed = r.FreedBytes + d.FreedBytes;
+                    if (removed > 0)
                     {
                         LogFromWorker(string.Format(
-                            "分片清扫：回收了 {0} 个过期分片（{1}），跳过 {2} 个被占用的文件。",
-                            r.Removed, Util.FormatSize(r.FreedBytes), r.Skipped));
+                            "分片清扫：回收了 {0} 个过期分片（{1}），跳过 {2} 个被占用/受保护的目录。",
+                            removed, Util.FormatSize(freed), skipped));
                     }
-                    else if (r.Skipped > 0)
+                    else if (skipped > 0)
                     {
                         LogFromWorker(string.Format(
-                            "分片清扫：{0} 个过期分片因被占用而跳过（下次启动会重试）。", r.Skipped));
+                            "分片清扫：{0} 个过期分片因被占用或仍在租约保护期而跳过。", skipped));
                     }
+
+                    // 上次“软删除”时文件仍被占用而留下的 *.gezi-deleting：
+                    // 现在进程刚启动，不可能再被占用，直接收尾。
+                    var sweepRoots = new List<string>();
+                    sweepRoots.AddRange(roots);
+                    if (!string.IsNullOrWhiteSpace(outDir))
+                        sweepRoots.Add(outDir);
+                    int pending = SegmentedDownloader.SweepPendingDeletes(sweepRoots);
+                    if (pending > 0)
+                        LogFromWorker(string.Format(
+                            "残留清理：删除了 {0} 个上次未能删除的半成品文件。", pending));
                 }
                 catch (Exception ex)
                 {
@@ -5692,7 +6866,10 @@ namespace GeZi
             // 注意用的是**局部** client：自动登录完成时会换掉全局客户端，
             // 若直接用字段，换的那一刻可能在途请求会被 Dispose 掉。
             var client = await EnsureClientForResumeAsync();
-            if (client == null)
+            // ⚠️ 判据是「任意一家登录了」而不是「夸克客户端拿到了」：
+            //    阿里/迅雷账号下 _client 恒为 null（走 _ownProvider），
+            //    用 client == null 判会让这两家的续传永远进不来。
+            if (client == null && !IsLoggedInAny)
             {
                 Log("续传需要先登录。请登录后重新下载（分片在，会自然续传）。");
                 AppDialog.Show(this,
@@ -5707,16 +6884,33 @@ namespace GeZi
 
             SetBusy(true);
             var jobs = new List<DownloadJob>();
+            // 续传也必须走同一套“按大小分总预算”的分配，不能每个任务直接开满
+            // _settings.Threads（3 个 256 路就是 768 条连接，绕过 512 总预算）。
+            var alloc = AllocateThreads(tasks.Select(p => p.Size).ToList());
+            int allocIdx = 0;
             try
             {
                 foreach (var p in tasks)
                 {
+                    int myAlloc = allocIdx < alloc.Length ? alloc[allocIdx] : _settings.Threads;
+                    allocIdx++;
                     try
                     {
                         string url = null;
 
-                        if (p.FromShare)
+                        if (p.PanKindValue != 0)
                         {
+                            // 非夸克网盘：用对应 provider 重取链（凭证从当前设置重建）。
+                            url = await RefreshOtherPanLinkForPendingAsync(p, default(CancellationToken))
+                                .ConfigureAwait(false);
+                        }
+                        else if (p.FromShare)
+                        {
+                            if (client == null)
+                            {
+                                Log("[" + p.Name + "] 这条是夸克分享，需要夸克登录态才能续传，已跳过。");
+                                continue;
+                            }
                             // 分享模式：先用记录里的 pwd_id/stoken/token 重取（GetShareDownloadAsync
                             // 的参数是显式传入的，不依赖客户端的"当前分享"状态）。
                             // stoken 一般几小时~几天就过期，过期后这一路必失败。
@@ -5736,6 +6930,11 @@ namespace GeZi
                         }
                         else
                         {
+                            if (client == null)
+                            {
+                                Log("[" + p.Name + "] 需要夸克登录态才能续传，已跳过。");
+                                continue;
+                            }
                             var links = await client.GetDownloadAsync(new List<string> { p.Fid });
                             url = links?.FirstOrDefault(l => !string.IsNullOrEmpty(l.DownloadUrl))?.DownloadUrl;
                         }
@@ -5754,23 +6953,31 @@ namespace GeZi
                             Name = p.Name ?? Path.GetFileName(dest),
                             Url = url,
                             Dest = dest,
-                            Cookie = client.CookieStr,
-                            Threads = _settings.Threads,
+                            // 非夸克网盘的直链是签名 URL，下载时**不需要**也不应该带夸克 Cookie
+                            // （带了等于把夸克登录态发给别家 CDN）。夸克保持原样。
+                            Cookie = p.PanKindValue == 0 ? client.CookieStr : "",
+                            Threads = myAlloc,
+                            Md5 = p.Md5, Sha1 = p.Sha1, Sha256 = p.Sha256,
                             PartsRoot = string.IsNullOrWhiteSpace(_settings.PartsRoot) ? null : _settings.PartsRoot,
                             Pending = new PendingInfo
                             {
                                 PwdId = p.PwdId, Stoken = p.Stoken, Passcode = p.Passcode,
                                 Fid = p.Fid, Token = p.Token, FromShare = p.FromShare,
                                 RelDir = p.RelDir ?? "", Dest = dest, Size = p.Size,
+                                Md5 = p.Md5, Sha1 = p.Sha1, Sha256 = p.Sha256,
                                 // 自动重解析分享的上下文（stoken 过期自愈用）。
                                 // 上面取链若触发过重解析，p.Stoken/p.Token 已是新值。
                                 StartFid = p.StartFid, ShareRelDir = p.ShareRelDir,
+                                // 保留来源网盘：否则续传一次就退化成"夸克任务"
+                                PanKind = p.PanKindValue,
                             },
                         };
                         var captured = job;
                         job.LinkRefresher = ct => RefreshLinkAsyncForPending(captured, ct);
                         // 免转存任务续传取不到新链（stoken 过期）→ 失败文案要说"需重新解析分享"
-                        job.ResumeCannotRefresh = p.FromShare;
+                        // 非夸克网盘有专门的 refresher（见 RefreshOtherPanLinkForPendingAsync），
+                        // 只要设置里有凭证就能自愈，所以不算"无法刷新"。
+                        job.ResumeCannotRefresh = p.FromShare && p.PanKindValue == 0;
                         jobs.Add(job);
                     }
                     catch (Exception ex)
@@ -5785,6 +6992,7 @@ namespace GeZi
                     return;
                 }
 
+                LogAllocation(alloc);
                 foreach (var job in jobs)
                     _tasks.Add(new TaskItem(job, job.Name));
                 Log("已续传 " + jobs.Count + " 个任务。");
@@ -5804,8 +7012,24 @@ namespace GeZi
                 return null;
             try
             {
+                // 阿里/迅雷的「我的网盘」任务：不走夸克那套（那是分享专用），
+                // 也不走 provider 的分享取链 —— 用它的自有网盘取链接口。
+                if (!p.FromShare && p.PanKind != 0)
+                {
+                    return await RefreshOwnLinkForPendingAsync(
+                        (PanKind)p.PanKind, p.Fid, p.Token, ct).ConfigureAwait(false);
+                }
+
                 if (p.FromShare)
                 {
+                    // 非夸克网盘：用对应 provider 重新取链（凭证在设置里，任务只记 PanKind）。
+                    // 不走夸克那套 GetShareLinkWithReResolveAsync —— 那会拿夸克客户端
+                    // 去请求别的网盘，必然失败。
+                    if (p.PanKind != 0)
+                    {
+                        return await RefreshOtherPanLinkForPendingAsync(p, ct).ConfigureAwait(false);
+                    }
+
                     // 与续传入队同理：旧 stoken 过期就自动重解析分享换新凭证。
                     // 写回 p.Stoken/p.Token —— job.Pending 是引用：本次换链立即用上新值，
                     // 之后落盘的 PendingTask（保存时从 pi 序列化）也是新值。
@@ -5819,13 +7043,132 @@ namespace GeZi
                         }, ct).ConfigureAwait(false);
                 }
 
-                var links = await _client.GetDownloadAsync(new List<string> { p.Fid }).ConfigureAwait(false);
+                var ownFiles = new List<PanFileEntry>
+                {
+                    new PanFileEntry { Fid = p.Fid, Token = p.Token ?? "" },
+                };
+                var links = (await OwnLinksAsync(ownFiles).ConfigureAwait(false)).ToList();
                 return links?.FirstOrDefault(l => !string.IsNullOrEmpty(l.DownloadUrl))?.DownloadUrl;
             }
             catch { return null; }
         }
 
-        // ---------------- 免转存续传：stoken 过期自愈（2026-10-17） ----------------
+        /// <summary>
+        /// 续传时给非夸克网盘的任务重新取直链。
+        /// <para>
+        /// 凭证不落在任务里（那是敏感数据，且会随用户更新凭证而过期），
+        /// 任务只记 <see cref="PendingTask.PanKindValue"/>，这里按当前设置重建客户端。
+        /// </para>
+        /// </summary>
+        private async Task<string> RefreshOtherPanLinkForPendingAsync(PanKind kind, string shareId,
+            string passcode, string startFid, string fid, string token, CancellationToken ct)
+        {
+            IPanProvider provider = null;
+            try
+            {
+                provider = CreateProviderFor(kind);
+                if (!provider.IsLoggedIn)
+                {
+                    LogDetail(PanUrlParser.DisplayNameOf(kind)
+                        + " 未配置凭证，无法为续传任务重新取链。请到设置里补上。");
+                    return null;
+                }
+
+                var shareRef = new PanShareRef
+                {
+                    Kind = kind,
+                    ShareId = shareId ?? "",
+                    Passcode = passcode ?? "",
+                    StartFid = string.IsNullOrEmpty(startFid) ? "0" : startFid,
+                };
+
+                var one = new List<PanFileEntry>
+                {
+                    new PanFileEntry { Fid = fid, Token = token ?? "" },
+                };
+
+                var links = await provider.GetShareDownloadLinksAsync(shareRef, one, ct)
+                    .ConfigureAwait(false);
+
+                var hit = links == null
+                    ? null
+                    : links.FirstOrDefault(l => !string.IsNullOrEmpty(l.DownloadUrl));
+                return hit == null ? null : hit.DownloadUrl;
+            }
+            catch (Exception ex)
+            {
+                LogDetail("续传取链失败（" + PanUrlParser.DisplayNameOf(kind) + "）: " + ex.Message);
+                return null;
+            }
+            finally
+            {
+                if (provider != null)
+                {
+                    try { provider.Dispose(); } catch { }
+                }
+            }
+        }
+
+        /// <summary>
+        /// 续传时给阿里/迅雷的**自有网盘**任务重新取直链。
+        /// <para>
+        /// 与分享那条路的区别：不需要 shareId / stoken，直接用文件自己的 fid
+        /// 调 <see cref="IPanProvider.GetOwnDownloadLinksAsync"/>。凭证同样从设置里
+        /// 现取现建客户端，任务里不落敏感数据。
+        /// </para>
+        /// </summary>
+        private async Task<string> RefreshOwnLinkForPendingAsync(PanKind kind, string fid,
+            string token, CancellationToken ct)
+        {
+            IPanProvider provider = null;
+            try
+            {
+                provider = CreateProviderFor(kind);
+                if (!provider.IsLoggedIn)
+                {
+                    LogDetail(PanUrlParser.DisplayNameOf(kind)
+                        + " 未配置凭证，无法为续传任务重新取链。请到设置里补上。");
+                    return null;
+                }
+
+                var one = new List<PanFileEntry>
+                {
+                    new PanFileEntry { Fid = fid, Token = token ?? "" },
+                };
+
+                var links = await provider.GetOwnDownloadLinksAsync(one, ct).ConfigureAwait(false);
+                var hit = links == null
+                    ? null
+                    : links.FirstOrDefault(l => !string.IsNullOrEmpty(l.DownloadUrl));
+                return hit == null ? null : hit.DownloadUrl;
+            }
+            catch (Exception ex)
+            {
+                LogDetail("续传取链失败（" + PanUrlParser.DisplayNameOf(kind) + "）: " + ex.Message);
+                return null;
+            }
+            finally
+            {
+                if (provider != null)
+                {
+                    try { provider.Dispose(); } catch { }
+                }
+            }
+        }
+
+        /// <summary>PendingInfo 版本（下载中换链用）。</summary>
+        private Task<string> RefreshOtherPanLinkForPendingAsync(PendingInfo p, CancellationToken ct)
+        {
+            return RefreshOtherPanLinkForPendingAsync((PanKind)p.PanKind, p.PwdId, p.Passcode,
+                p.StartFid, p.Fid, p.Token, ct);
+        }
+
+        /// <summary>PendingTask 版本（重启后续传用）。</summary>
+        private Task<string> RefreshOtherPanLinkForPendingAsync(PendingTask p, CancellationToken ct)
+        {
+            return RefreshOtherPanLinkForPendingAsync((PanKind)p.PanKindValue, p.PwdId, p.Passcode,
+                p.StartFid, p.Fid, p.Token, ct);
+        }
 
         /// <summary>
         /// 免转存取链：先用手头的（可能已过期的）stoken / share_fid_token 试一次；
@@ -6150,6 +7493,26 @@ namespace GeZi
                 UseSystemProxyCheck.IsChecked = _settings.UseSystemProxy;
                 // 外观主题：把配置里的选择回填到三个单选（_applyingSettings 已挡掉 Checked）
                 SyncThemeRadios();
+
+                // 多网盘凭证回填。明文直接显示在输入框里 —— 它们只在本机、只给本机用户看，
+                // 且落盘是加密的；这里再遮成圆点反而会让用户没法核对是否粘对。
+                try
+                {
+                    UcCookieBox.Text = _settings.UcCookie ?? "";
+                    // 回填：优先可续期的 refresh_token；只有短期令牌时带 at: 前缀显示，
+                    // 让用户一眼看出"这条两小时后会失效"，而不是以为永久有效。
+                    AliyunTokenBox.Text = !string.IsNullOrEmpty(_settings.AliyunRefreshToken)
+                        ? _settings.AliyunRefreshToken
+                        : (!string.IsNullOrEmpty(_settings.AliyunAccessToken)
+                            ? "at:" + _settings.AliyunAccessToken
+                            : "");
+                    XunleiTokenBox.Text = _settings.XunleiPanToken ?? "";
+                    XunleiCaptchaBox.Text = _settings.XunleiCaptchaToken ?? "";
+                }
+                catch { }
+
+                // 内嵌登录的可用性（运行时缺失时置灰按钮，不阻塞任何东西）
+                RefreshUcRuntimeStatus();
             }
             finally
             {
@@ -6427,6 +7790,32 @@ namespace GeZi
                 _settings.OnCloseButton = (CloseAction)Math.Max(0,
                     Math.Min(2, CloseActionBox.SelectedIndex));
 
+                // 多网盘凭证：手动粘贴，落盘时由 SettingsStore 统一 DPAPI 加密。
+                // 用 try 兜住 —— 这几个控件在旧布局里可能不存在，不能因为一个 null 就丢掉整次保存。
+                try
+                {
+                    _settings.UcCookie = (UcCookieBox.Text ?? "").Trim();
+                    {
+                        // 允许用户在框里贴 at:… （短期令牌）或 rt:… / 裸 refresh_token。
+                        string aliRaw = (AliyunTokenBox.Text ?? "").Trim();
+                        if (aliRaw.StartsWith("at:", StringComparison.Ordinal))
+                        {
+                            _settings.AliyunAccessToken = aliRaw.Substring(3);
+                            _settings.AliyunRefreshToken = "";
+                        }
+                        else
+                        {
+                            _settings.AliyunRefreshToken = aliRaw.StartsWith("rt:", StringComparison.Ordinal)
+                                ? aliRaw.Substring(3)
+                                : aliRaw;
+                            _settings.AliyunAccessToken = "";
+                        }
+                    }
+                    _settings.XunleiPanToken = (XunleiTokenBox.Text ?? "").Trim();
+                    _settings.XunleiCaptchaToken = (XunleiCaptchaBox.Text ?? "").Trim();
+                }
+                catch { }
+
                 SettingsStore.Save(_settings);
                 RecreateScheduler();
 
@@ -6649,7 +8038,9 @@ namespace GeZi
         {
             // 未登录且**一个已保存账号都没有**时，
             // 直接取二维码并提示扫码（而不是弹一个空列表让人更困惑）。
-            if (_client == null)
+            // 注意用 IsLoggedInAny：阿里/迅雷账号下 _client 是 null，
+            // 但它们已经登录了，不该再弹二维码。
+            if (!IsLoggedInAny)
             {
                 int saved = 0;
                 try { saved = AccountStore.LoadAll().Count; } catch { }
@@ -6967,7 +8358,10 @@ namespace GeZi
                         }
                     });
 
-                    var poll = await svc.PollForTicketWithStatusAsync(token, 300, status, cts.Token);
+                    // 超时与 token 的真实有效期对齐：实测 token 在 ~180 秒后变成
+                    // 50004002（Token Not Found），早先设 300 秒会让界面在最后 2 分钟里
+                    // 一直等一个已经失效的码。
+                    var poll = await svc.PollForTicketWithStatusAsync(token, 180, status, cts.Token);
                     if (poll.Stage == QrLoginStage.Expired)
                     {
                         // 过期/无效：收起图片，提示用户点「刷新」重新取一张。
@@ -7269,28 +8663,41 @@ namespace GeZi
         /// </summary>
         private void OnExportCookie(object sender, RoutedEventArgs e)
         {
-            if (_client == null)
+            if (!IsLoggedInAny)
             {
                 Log("尚未登录");
                 return;
             }
             try
             {
+                // 夸克系导出 Cookie；阿里/迅雷没有 Cookie，导出的是令牌本身，
+                // 文件名与提示文案都跟着变，免得用户拿到一串令牌却以为坏掉了。
+                bool quarkLike = OwnIsQuarkLike && _client != null;
+                string secret = quarkLike ? _client.CookieStr : (OwnProviderToken() ?? "");
+                string label = quarkLike
+                    ? "Cookie"
+                    : (PanUrlParser.DisplayNameOf(_activeKind) + " 令牌");
+                if (string.IsNullOrWhiteSpace(secret))
+                {
+                    Log("当前账号没有可导出的凭证");
+                    return;
+                }
                 string outFile = Path.Combine(
                     Environment.GetFolderPath(Environment.SpecialFolder.Desktop),
-                    "GeZi-Cookie-" + DateTime.Now.ToString("yyyyMMdd-HHmmss") + ".txt");
-                File.WriteAllText(outFile, _client.CookieStr, new UTF8Encoding(false));
+                    "GeZi-" + (quarkLike ? "Cookie" : "Token") + "-"
+                        + DateTime.Now.ToString("yyyyMMdd-HHmmss") + ".txt");
+                File.WriteAllText(outFile, secret, new UTF8Encoding(false));
 
-                Log("已导出 Cookie：" + outFile);
+                Log("已导出 " + label + "：" + outFile);
                 AppDialog.Show(this,
-                    "已把当前登录 Cookie 导出到：\n\n" + outFile +
-                    "\n\n注意：Cookie 等同于账号登录凭证，请勿分享给他人。",
+                    "已把当前登录 " + label + " 导出到：\n\n" + outFile +
+                    "\n\n注意：它等同于账号登录凭证，请勿分享给他人。",
                     "导出完成", MessageBoxButton.OK, MessageBoxImage.Information);
             }
             catch (Exception ex)
             {
-                Log("导出 Cookie 失败：" + ex.Message);
-                AppDialog.Show(this, "导出 Cookie 失败：\n\n" + ex.Message,
+                Log("导出凭证失败：" + ex.Message);
+                AppDialog.Show(this, "导出凭证失败：\n\n" + ex.Message,
                     "导出失败", MessageBoxButton.OK, MessageBoxImage.Warning);
             }
         }
@@ -7350,10 +8757,31 @@ namespace GeZi
             try { _client?.StopKeepAlive(); } catch { }
             _client?.Dispose();
             _client = null;
+            // 阿里/迅雷的自有网盘客户端同样要释放并置空，否则登出后
+            // IsLoggedInAny 仍是 true（_ownProvider 还在），界面看起来"还登录着"。
+            try { _ownProvider?.Dispose(); } catch { }
+            _ownProvider = null;
             // 登出同样是"换账号"：直链 / 目录缓存 / 导航快照都要作废，
             // 否则下次登录别的账号会看到上一个账号的网盘内容（见 InvalidateAccountCaches）。
             InvalidateAccountCaches();
-            _settings.Cookie = "";
+            // 只清**当前这家**的凭证：登出 UC 不该顺手把夸克的 Cookie 也抹掉，
+            // 否则用户切回夸克还得重新扫码。
+            switch (_activeKind)
+            {
+                case PanKind.Uc:
+                    _settings.UcCookie = "";
+                    break;
+                case PanKind.Aliyun:
+                    _settings.AliyunRefreshToken = "";
+                    _settings.AliyunAccessToken = "";
+                    break;
+                case PanKind.Xunlei:
+                    _settings.XunleiPanToken = "";
+                    break;
+                default:
+                    _settings.Cookie = "";
+                    break;
+            }
             _settings.Who = "";
             _settings.AvatarUrl = "";
             _settings.CurrentAccountKey = "";
@@ -7368,11 +8796,24 @@ namespace GeZi
             Log(string.IsNullOrEmpty(reason) ? "已登出" : reason);
         }
 
-        private async Task ApplyLoginAsync(string cookie)
+        private Task ApplyLoginAsync(string cookie)
+        {
+            return ApplyLoginAsync(cookie, _activeKind);
+        }
+
+        /// <summary>
+        /// 校验并启用一个账号的凭证。
+        /// <para>
+        /// <paramref name="kind"/> 决定这次登录归属哪个网盘：
+        /// 夸克与 UC 共用同一套 ucpro 协议，<see cref="QuarkClient"/> 靠 Kind
+        /// 切域名/pr/请求头即可服务两家，所以这里只有一处 new，不需要两个客户端类。
+        /// </para>
+        /// </summary>
+        private async Task ApplyLoginAsync(string cookie, PanKind kind)
         {
             try
             {
-                var client = new QuarkClient(cookie);
+                var client = new QuarkClient(cookie, kind);
                 var (valid, nick) = await client.ValidateAsync();
 
                 // ⚠️ account/info 挂在 pan.quark.cn，**.NET 根本连不上**（WAF 按 TLS
@@ -7395,6 +8836,13 @@ namespace GeZi
                     try { _client?.StopKeepAlive(); } catch { }
                     _client?.Dispose();
                     _client = client;
+                    // 从阿里/迅雷切回夸克系：旧 provider 必须释放，否则它的
+                    // HttpClient 与连接池会一直挂着（虽然已不再被使用）。
+                    try { _ownProvider?.Dispose(); } catch { }
+                    _ownProvider = null;
+                    // 账号归属的网盘跟着这次登录走 —— 账号卡片的展示名、
+                    // 「我的网盘」用的是哪家的接口，全都由它决定。
+                    _activeKind = kind;
                     // 保活心跳连续失败 → 登录很可能已失效。事件在后台线程上触发，
                     // 必须切回 UI 线程再动界面。
                     _client.LoginExpired += () =>
@@ -7411,7 +8859,13 @@ namespace GeZi
                     // 换账号后旧账号的**直链 / 目录缓存 / 两个模式的导航快照**全部作废。
                     // （原来只清了直链 → 切回「我的网盘」会显示旧账号的内容，见 InvalidateAccountCaches）
                     InvalidateAccountCaches();
-                    _settings.Cookie = client.CookieStr;
+                    // 凭证写回**对应网盘**的字段：两家的 Cookie 互不相通，
+                    // 混着存会让下次启动用 UC 的 Cookie 去登录夸克（必然失败）。
+                    if (kind == PanKind.Uc)
+                        _settings.UcCookie = client.CookieStr;
+                    else
+                        _settings.Cookie = client.CookieStr;
+                    _settings.ActivePanKind = (int)kind;
                     _settings.Who = nick;
                     // 头像：探测到的就存下来（拿不到存空串 → 界面回退"昵称首字"）
                     _settings.AvatarUrl = realAvatar ?? client.AvatarUrl ?? "";
@@ -7445,13 +8899,314 @@ namespace GeZi
                 {
                     client.Dispose();
                     UpdateAccountCard(null, 0, 0);
-                    AccountHintText.Text = "Cookie 已失效，请重新登录";
+                    // 失败原因要**说清楚是哪一种**，否则用户只知道"失效"，
+                    // 却不知道是缺 __pus（只能重新登录）还是 __puus 过期（已尝试自动刷新）。
+                    AccountHintText.Text = DescribeLoginFailure(cookie, nick);
                     Log("登录校验失败: " + nick);
                 }
             }
             catch (Exception ex)
             {
                 Log("登录出错: " + ex.Message);
+            }
+        }
+
+        /// <summary>
+        /// 登录校验失败时给出一句**能指导用户动作**的提示。
+        /// <para>
+        /// 原来一律写「Cookie 已失效，请重新登录」，把三种完全不同的情况混成了一句：
+        /// ① 缺 <c>__pus</c>（长效凭证根本没抓到，只能重新登录）；
+        /// ② 有 <c>__pus</c>，但 <c>__puus</c> 过期且自动续期也被拒（服务端不认了）；
+        /// ③ 网络/风控抖动（等一会儿重试即可）。
+        /// 用户看到笼统的"失效"只会反复重新登录，却不知道是抓取不完整。
+        /// </para>
+        /// </summary>
+        private static string DescribeLoginFailure(string cookie, string reason)
+        {
+            var dict = QuarkSession.ParseCookies(cookie);
+            string pus, puus;
+            dict.TryGetValue(UcConstants.CookiePus, out pus);
+            dict.TryGetValue(UcConstants.CookiePuus, out puus);
+
+            if (string.IsNullOrEmpty(pus))
+                return "登录凭证不完整：缺少 __pus（长效凭证），请重新登录";
+            if (string.IsNullOrEmpty(puus))
+                return "登录凭证不完整：缺少 __puus（会话凭证），请重新登录";
+
+            // 两种凭证都在，说明是服务端已经作废了这个会话（或风控拦截）
+            if (!string.IsNullOrEmpty(reason)
+                && (reason.Contains("401") || reason.Contains("412")))
+                return "登录态已被服务端作废（自动续期未成功），请重新登录";
+            if (!string.IsNullOrEmpty(reason)
+                && (reason.Contains("超时") || reason.Contains("网络")))
+                return "网络异常，未能确认登录态，请稍后重试";
+
+            return "Cookie 已失效，请重新登录";
+        }
+
+        /// <summary>
+        /// 校验并启用一个**阿里云盘 / 迅雷云盘**账号（自有网盘）。
+        /// <para>
+        /// 与 <see cref="ApplyLoginAsync(string, PanKind)"/> 的区别：那两家不走
+        /// <see cref="QuarkClient"/>（协议完全不同），凭证也不是 Cookie 而是一个
+        /// 令牌（阿里是 refresh_token，迅雷是 pan_token）。所以这里单独一条路：
+        /// 建 provider → 校验 → 存凭证 → 换账号 → 拉容量与根目录。
+        /// </para>
+        /// </summary>
+        /// <param name="kind">只接受 Aliyun / Xunlei。</param>
+        /// <param name="credential">
+        /// 阿里 = <c>rt:&lt;refresh_token&gt;</c> 或 <c>at:&lt;access_token&gt;</c>（可无前缀，按 refresh_token）；
+        /// 迅雷 = pan_token。
+        /// </param>
+        /// <param name="notifyFailure">
+        /// 失败时是否弹窗告知原因。用户**主动点**「验证登录态」时为 true ——
+        /// 否则失败只写左下角提示和日志，用户在设置页根本看不到任何反应
+        /// （这正是"点了验证登录态根本没有用"的由来）。
+        /// 内嵌登录成功后自动调用时为 false，避免登录窗口刚关就弹一个失败框。
+        /// </param>
+        private async Task ApplyProviderLoginAsync(PanKind kind, string credential,
+            bool notifyFailure = false)
+        {
+            if (kind != PanKind.Aliyun && kind != PanKind.Xunlei)
+            {
+                Log("内部错误：ApplyProviderLoginAsync 只处理阿里/迅雷。");
+                return;
+            }
+
+            // 阿里云盘的两种凭证（见 WebLoginWindow.AliyunTokenScript 的返回值）：
+            //   rt:… 可续期的 refresh_token，最优；
+            //   at:… 网页只给了短期 access_token（阿里新版 sessionStorage 就只有它），
+            //        约两小时后失效，到期后需要重新登录。
+            // 没有前缀的（手动粘贴、旧配置）一律按 refresh_token 处理，保持向后兼容。
+            string aliyunRt = "";
+            string aliyunAt = "";
+            if (kind == PanKind.Aliyun)
+            {
+                string raw = credential ?? "";
+                if (raw.StartsWith("at:", StringComparison.Ordinal))
+                    aliyunAt = raw.Substring(3);
+                else if (raw.StartsWith("rt:", StringComparison.Ordinal))
+                    aliyunRt = raw.Substring(3);
+                else
+                    aliyunRt = raw;
+            }
+
+            IPanProvider provider = null;
+            try
+            {
+                // 迅雷网页登录给的是打包记录（xlrec:at|rt|sub|dev|cap）：
+                // 设备标识必须跟着 token 一起用 —— 迅雷把登录态和设备绑定，
+                // 拿随机 device_id 去请求会被判 captcha_required（HTTP 400）。
+                string xunleiToken = credential;
+                // ⚠️ 两个字段要分清：XunleiWebDeviceId 是网页登录时从 Cookie 的
+                // deviceid 取到的**真实设备号**（与签 token 的那台一致），
+                // XunleiDeviceId 是账号登录（短信）那条路用的。
+                // 用错字段 = 设备对不上 = 400 captcha_required。
+                string xunleiDeviceId = !string.IsNullOrEmpty(_settings.XunleiWebDeviceId)
+                    ? _settings.XunleiWebDeviceId
+                    : _settings.XunleiDeviceId;
+                string xunleiCaptcha = _settings.XunleiCaptchaToken;
+                string xlRt = null, xlSub = null;
+                string recAt, recDev, recCap;
+                if (kind == PanKind.Xunlei
+                    && XunleiProtocol.TryParseRecord(credential ?? "",
+                        out recAt, out xlRt, out xlSub, out recDev, out recCap))
+                {
+                    xunleiToken = recAt;
+                    if (!string.IsNullOrEmpty(recDev)) xunleiDeviceId = recDev;
+                    if (!string.IsNullOrEmpty(recCap)) xunleiCaptcha = recCap;
+                }
+
+                provider = kind == PanKind.Aliyun
+                    ? (IPanProvider)(!string.IsNullOrEmpty(aliyunAt)
+                        ? new AliyunClient(null, null, null, aliyunAt,
+                            _settings.AliyunDeviceId, _settings.AliyunDevicePrivateKey)
+                        : new AliyunClient(aliyunRt, null, null, null,
+                            _settings.AliyunDeviceId, _settings.AliyunDevicePrivateKey))
+                    : (IPanProvider)AttachXunleiCaptcha(
+                        new XunleiClient(xunleiToken, xunleiCaptcha, null, xunleiDeviceId));
+
+                var (valid, nick) = await provider.ValidateAsync().ConfigureAwait(true);
+
+                // 迅雷：pan_token 只有约两小时寿命。若校验失败但我们手里有 refresh_token，
+                // 就静默换一张新的再试一次 —— 用户不该为"令牌到期"这件事重新登录。
+                // 两种 refresh_token 属于两套 OAuth 客户端，刷新方式不同，所以依次尝试：
+                // 先账号登录那套（带 client_secret 的表单），再网页登录那套（JSON + 桌面 UA）。
+                if (!valid && kind == PanKind.Xunlei
+                    && (!string.IsNullOrEmpty(_settings.XunleiRefreshToken)
+                        || !string.IsNullOrEmpty(_settings.XunleiWebRefreshToken)))
+                {
+                    Log("迅雷令牌已过期，正在用刷新令牌自动续期…");
+                    try
+                    {
+                        using (var refresher = new XunleiLoginService(_settings.XunleiDeviceId))
+                        {
+                            XunleiLoginResult renewed = null;
+
+                            if (!string.IsNullOrEmpty(_settings.XunleiRefreshToken))
+                            {
+                                renewed = await refresher.RefreshAsync(_settings.XunleiRefreshToken)
+                                    .ConfigureAwait(true);
+                                if (renewed != null && renewed.Ok)
+                                {
+                                    if (!string.IsNullOrEmpty(refresher.DeviceId))
+                                        _settings.XunleiDeviceId = refresher.DeviceId;
+                                    if (!string.IsNullOrEmpty(renewed.RefreshToken))
+                                        _settings.XunleiRefreshToken = renewed.RefreshToken;
+                                }
+                                else
+                                {
+                                    Log("账号登录刷新令牌续期失败：" + refresher.LastError);
+                                    renewed = null;
+                                }
+                            }
+
+                            if (renewed == null && !string.IsNullOrEmpty(_settings.XunleiWebRefreshToken))
+                            {
+                                renewed = await refresher.RefreshWebAsync(
+                                    _settings.XunleiWebRefreshToken, _settings.XunleiWebDeviceId)
+                                    .ConfigureAwait(true);
+                                if (renewed != null && renewed.Ok)
+                                {
+                                    if (!string.IsNullOrEmpty(renewed.RefreshToken))
+                                        _settings.XunleiWebRefreshToken = renewed.RefreshToken;
+                                }
+                                else
+                                {
+                                    Log("网页登录刷新令牌续期失败：" + refresher.LastError);
+                                    renewed = null;
+                                }
+                            }
+
+                            if (renewed != null && renewed.Ok)
+                            {
+                                credential = renewed.AccessToken;
+                                if (XunleiTokenBox != null)
+                                    XunleiTokenBox.Text = renewed.AccessToken;
+                                _settings.XunleiPanToken = renewed.AccessToken;
+
+                                try { provider.Dispose(); } catch { }
+                                provider = AttachXunleiCaptcha(
+                                    new XunleiClient(renewed.AccessToken, _settings.XunleiCaptchaToken,
+                                        null, xunleiDeviceId));
+                                var again = await provider.ValidateAsync().ConfigureAwait(true);
+                                valid = again.Item1;
+                                nick = again.Item2;
+                                Log(valid ? "迅雷令牌续期成功。" : "迅雷令牌续期后仍无效：" + provider.LastError);
+                            }
+                            else
+                            {
+                                Log("迅雷令牌续期失败：需要重新登录。");
+                            }
+                        }
+                    }
+                    catch (Exception rex)
+                    {
+                        Log("迅雷令牌续期异常：" + rex.Message);
+                    }
+                }
+
+                if (!valid)
+                {
+                    // 失败原因：优先用 provider 自己记下的（令牌过期/服务端拒绝/网络不通），
+                    // 拿不到再退回一句通用文案。**不能只说"无效"** —— 用户没法据此行动。
+                    string reason = provider.LastError;
+                    string panName = PanUrlParser.DisplayNameOf(kind);
+                    string hint = string.IsNullOrEmpty(reason)
+                        ? panName + " 登录态无效，请重新登录"
+                        : panName + " 登录态无效：" + reason;
+
+                    try { provider.Dispose(); } catch { }
+                    UpdateAccountCard(null, 0, 0);
+                    AccountHintText.Text = hint;
+                    Log(panName + " 登录校验失败" + (string.IsNullOrEmpty(reason) ? "" : "：" + reason));
+
+                    if (notifyFailure)
+                    {
+                        AppDialog.Show(this,
+                            hint + "\n\n"
+                            + "常见原因：\n"
+                            + "· 令牌已过期 —— 重新点「内嵌登录（自动获取）」\n"
+                            + "· 粘贴的内容不完整（漏了前后段）\n"
+                            + "· 网络不通或被拦截",
+                            panName + " 登录失败", MessageBoxButton.OK, MessageBoxImage.Warning);
+                    }
+                    return;
+                }
+
+                // 换账号：旧的夸克客户端与旧的 provider 都要释放
+                try { _client?.StopKeepAlive(); } catch { }
+                _client?.Dispose();
+                _client = null;                  // 阿里/迅雷不用 QuarkClient
+                try { _ownProvider?.Dispose(); } catch { }
+                _ownProvider = provider;
+                _activeKind = kind;
+
+                InvalidateAccountCaches();
+
+                // 凭证写回对应网盘的字段。
+                // 阿里两个字段互斥：能续期就存 refresh_token，只有短期令牌就存 access_token。
+                if (kind == PanKind.Aliyun)
+                {
+                    _settings.AliyunRefreshToken = aliyunRt;
+                    _settings.AliyunAccessToken = aliyunAt;
+                    // 设备身份必须落盘：每次启动都生成新设备会被阿里当成"一堆新设备登录"，
+                    // 既污染官网的「登录设备」列表，也更容易触发风控。
+                    var aliClient = provider as AliyunClient;
+                    if (aliClient != null)
+                    {
+                        if (!string.IsNullOrEmpty(aliClient.DeviceId))
+                            _settings.AliyunDeviceId = aliClient.DeviceId;
+                        if (!string.IsNullOrEmpty(aliClient.DevicePrivateKey))
+                            _settings.AliyunDevicePrivateKey = aliClient.DevicePrivateKey;
+                    }
+                }
+                else
+                    _settings.XunleiPanToken = credential;
+                _settings.ActivePanKind = (int)kind;
+                _settings.Who = string.IsNullOrEmpty(nick) ? PanUrlParser.DisplayNameOf(kind) : nick;
+                // 头像：阿里从 /v2/user/get 的 avatar、迅雷从 /drive/v1/about 的头像字段取。
+                // 该账号没设头像时 provider 返回空串 → 界面回退"昵称首字"头像。
+                _settings.AvatarUrl = provider.AvatarUrl ?? "";
+                _settings.CurrentAccountKey = _settings.Who;
+                SettingsStore.Save(_settings);
+                // 校验那一步可能已经轮换过 refresh_token，这里再同步一次
+                PersistProviderToken();
+
+                UpdateAccountCard(_settings.Who, 0, 0);
+                Log("登录成功: " + _settings.Who + "（" + ActivePanDisplayName + "）");
+                if (kind == PanKind.Aliyun && !string.IsNullOrEmpty(aliyunAt))
+                    Log("提示：本次只拿到阿里的短期令牌（无 refresh_token），约两小时后失效，届时需重新登录。");
+                // 设备会话建不起来时「我的网盘」列不了目录，必须当场说清楚，
+                // 否则用户会以为登录成功就等于能用了。
+                var aliForNote = provider as AliyunClient;
+                if (aliForNote != null && !string.IsNullOrEmpty(aliForNote.DeviceSessionNote))
+                {
+                    Log("阿里云盘设备会话未建立：" + aliForNote.DeviceSessionNote);
+                    AccountHintText.Text = "已登录（设备会话未建立，网盘列表可能打不开）";
+                }
+
+                if (!ShareMode)
+                {
+                    ResetNav();
+                    await LoadDirAsync("0");
+                }
+
+                await RefreshCapacityAsync();
+            }
+            catch (Exception ex)
+            {
+                if (provider != null && !ReferenceEquals(provider, _ownProvider))
+                {
+                    try { provider.Dispose(); } catch { }
+                }
+                Log("登录出错: " + ex.Message);
+                if (notifyFailure)
+                {
+                    AppDialog.Show(this,
+                        PanUrlParser.DisplayNameOf(kind) + " 登录出错：" + ex.Message,
+                        "登录失败", MessageBoxButton.OK, MessageBoxImage.Warning);
+                }
             }
         }
 
@@ -7482,7 +9237,11 @@ namespace GeZi
             if (!valid) return (false, null, null);
 
             // 昵称是兜底值、或还没有头像 → 借 Python 桥补真实信息
-            if (nick == FallbackNick || string.IsNullOrEmpty(client.AvatarUrl))
+            // ⚠️ 只有夸克需要这条：account/info 挂在 pan.quark.cn 上，.NET 连不上
+            // （WAF 按 TLS 指纹 RST）。UC 的 account/info 在 drive.uc.cn，.NET 直接可达，
+            // ValidateAsync 已经拿到真名了 —— 再走 Python 桥只会白起一个进程。
+            if (client.Kind != PanKind.Uc
+                && (nick == FallbackNick || string.IsNullOrEmpty(client.AvatarUrl)))
             {
                 try
                 {
@@ -7510,7 +9269,7 @@ namespace GeZi
 
         private async void OnRefreshAccountClick(object sender, RoutedEventArgs e)
         {
-            if (_client == null)
+            if (!IsLoggedInAny)
             {
                 Log("尚未登录，先扫码登录吧");
                 try { Tabs.SelectedIndex = 3; } catch { }
@@ -7520,7 +9279,24 @@ namespace GeZi
             if (!BeginBusy(AccountRefreshBtn, "")) return;   // 忙时按钮显示转圈
             try
             {
-                var (valid, nick, avatar) = await ResolveAccountInfoAsync(_client, _settings.Cookie);
+                // 阿里/迅雷走 provider 的 ValidateAsync；夸克/UC 走 QuarkClient 那条
+                // （那条还要借 Python 桥补真名与头像，不能省）。
+                bool valid;
+                string nick = null, avatar = null;
+                if (_activeKind == PanKind.Aliyun || _activeKind == PanKind.Xunlei)
+                {
+                    var (ok, name) = await _ownProvider.ValidateAsync();
+                    valid = ok;
+                    nick = name;
+                    // 阿里/迅雷的头像也在同一份用户信息里，刷新时一并更新
+                    avatar = _ownProvider.AvatarUrl;
+                }
+                else
+                {
+                    // 用客户端自己的 Cookie（UC 存的是 _settings.UcCookie，
+                    // 读 _settings.Cookie 会把夸克那串拿过来，校验必然失败）。
+                    (valid, nick, avatar) = await ResolveAccountInfoAsync(_client, _client.CookieStr);
+                }
                 if (!valid)
                 {
                     Log("账号状态刷新：登录已失效");
@@ -7585,7 +9361,7 @@ namespace GeZi
             try
             {
                 _tray?.ShowBalloon("登录已过期",
-                    "夸克登录状态已失效，请打开主窗口到「登录」页重新扫码。");
+                    ActivePanDisplayName + " 登录状态已失效，请打开主窗口到「登录」页重新登录。");
             }
             catch { }
         }
@@ -7598,17 +9374,17 @@ namespace GeZi
         /// </summary>
         private async void OnCapacityTick()
         {
-            if (_client == null || _loginExpired) return;
+            if (!CanBrowseOwnDrive || _loginExpired) return;
             try { await RefreshCapacityAsync(); } catch { }
         }
 
         private async Task RefreshCapacityAsync()
         {
-            if (_client == null)
+            if (!CanBrowseOwnDrive)
                 return;
             try
             {
-                var (total, used) = await _client.GetCapacityAsync();
+                var (total, used) = await OwnCapacityAsync();
                 if (total > 0)
                 {
                     // 容量条已经显示了用量，这里只更新卡片（昵称保持当前值）。
@@ -7973,11 +9749,16 @@ namespace GeZi
             // 同一个 URL 已经加载过就不重复下载。
             // ⚠️ 启动时 UpdateAccountCard 会被调用好几次（自动登录 → 刷容量 → 同步登录页），
             // 不拦的话同一张头像会被下载 4 次（实测日志里出现 4 行「账号头像已加载」）。
+            // 各网盘返回的头像 URL 形态不一（绝对 http/https、协议相对 //host/x.png、
+            // 甚至裸域名）。不规范化的话 WebClient 会直接抛 UriFormatException，
+            // 明明有头像也显示不出来 —— 这是「设了头像却不显示」最常见的坑。
+            string target = NormalizeAvatarUrl(url);
+
             if (img.Source != null &&
-                string.Equals(img.Tag as string, url, StringComparison.Ordinal))
+                string.Equals(img.Tag as string, target, StringComparison.Ordinal))
                 return;
 
-            if (string.IsNullOrEmpty(url))
+            if (string.IsNullOrEmpty(target))
             {
                 img.Source = null;
                 img.Tag = null;
@@ -7988,14 +9769,7 @@ namespace GeZi
 
             try
             {
-                byte[] bytes = await Task.Run(() =>
-                {
-                    using (var wc = new System.Net.WebClient())
-                    {
-                        wc.Headers["User-Agent"] = QuarkConstants.DlUa;
-                        return wc.DownloadData(url);
-                    }
-                });
+                byte[] bytes = await Task.Run(() => DownloadAvatar(target));
 
                 var bmp = new System.Windows.Media.Imaging.BitmapImage();
                 bmp.BeginInit();
@@ -8006,7 +9780,7 @@ namespace GeZi
                 bmp.Freeze();   // 冻结后可以跨线程/被多处共享
 
                 img.Source = bmp;
-                img.Tag = url;      // 记住已加载的 URL，避免重复下载
+                img.Tag = target;      // 记住已加载的 URL，避免重复下载
                 img.Visibility = Visibility.Visible;
                 if (fallback != null) fallback.Visibility = Visibility.Collapsed;
                 // 成功**不写日志** —— 用户要求「这两个就不要在日志中显示了，
@@ -8021,6 +9795,61 @@ namespace GeZi
                 img.Visibility = Visibility.Collapsed;
                 if (fallback != null) fallback.Visibility = Visibility.Visible;
             }
+        }
+
+        /// <summary>
+        /// 把各网盘给的头像地址补成 WebClient 能直接下载的绝对 URL。
+        /// 实测夸克/UC 的 avatarUri 形如 <c>http://image.quark.cn/o/uop/...</c>，
+        /// 但也见过协议相对（<c>//image.uc.cn/...</c>）和裸域名两种写法。
+        /// 以单个 <c>/</c> 开头的相对路径无法判断域名，返回 null 走首字回退。
+        /// </summary>
+        private static string NormalizeAvatarUrl(string url)
+        {
+            if (string.IsNullOrWhiteSpace(url))
+                return null;
+
+            string u = url.Trim();
+            if (u.StartsWith("//", StringComparison.Ordinal))
+                return "https:" + u;
+            if (u.StartsWith("http://", StringComparison.OrdinalIgnoreCase)
+                || u.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
+                return u;
+            if (u.StartsWith("/", StringComparison.Ordinal))
+                return null;
+            return "https://" + u;
+        }
+
+        /// <summary>
+        /// 下载头像。先用客户端 UA（夸克/UC 的图片 CDN 认这个），
+        /// 失败再换浏览器 UA 试一次 —— 部分 CDN 会拒绝 Electron UA。
+        /// 两次都失败才抛异常，由调用方回退首字头像。
+        /// </summary>
+        private static byte[] DownloadAvatar(string url)
+        {
+            string[] userAgents =
+            {
+                QuarkConstants.DlUa,
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+                "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            };
+
+            Exception last = null;
+            foreach (string ua in userAgents)
+            {
+                try
+                {
+                    using (var wc = new System.Net.WebClient())
+                    {
+                        wc.Headers["User-Agent"] = ua;
+                        return wc.DownloadData(url);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    last = ex;
+                }
+            }
+            throw last;
         }
 
         // 原来"账号/容量"散在 5 处直接给
@@ -8074,7 +9903,7 @@ namespace GeZi
 
                 AccountText.Text = nick;
                 AccountText.ToolTip = nick;   // 昵称过长被截断时仍可悬停看全
-                AccountHintText.Text = "夸克网盘";
+                AccountHintText.Text = ActivePanDisplayName;
 
                 if (total > 0)
                 {
@@ -8155,7 +9984,7 @@ namespace GeZi
                     AccountsBtn.Visibility = Visibility.Visible;
                     LoginSubText.Text = saved > 0
                         ? "本机已保存 " + saved + " 个账号，点右侧「选择账号」直接切回"
-                        : "扫码或导入 Cookie 即可登录";
+                        : "扫码、内嵌登录或粘贴凭证即可登录";
                     return;
                 }
 
