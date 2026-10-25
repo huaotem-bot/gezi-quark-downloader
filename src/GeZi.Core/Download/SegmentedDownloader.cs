@@ -1614,7 +1614,7 @@ namespace GeZi.Core.Download
             mergedBytes = have;
 
             // 对账：目标文件尾部那一段必须是"从第 mergedCount 片的分片文件里读来的"。
-            // 若分片文件比它短，说明目标文件里混进了来路不明的字节，
+            // 若超出分片的可信已写前缀，说明目标文件里混进了来路不明的字节，
             // 只能把这一段截掉重来 —— 宁可少一点，也不能产出内容错误的文件。
             if (mergedInHead > 0)
             {
@@ -1625,19 +1625,23 @@ namespace GeZi.Core.Download
                     if (hfi.Exists) headLen = hfi.Length;
                 }
                 catch { }
-                if (headLen < mergedInHead)
+                long trustedHead = Math.Min(headLen, plan.Parts[mergedCount].W);
+                if (trustedHead < mergedInHead)
                 {
                     Log?.Invoke(string.Format(
-                        "边合并: 目标文件尾部 {0} 字节在分片 {1} 中找不到对应数据，已截除重下（内容正确优先于省流量）。",
-                        Fmt(mergedInHead), mergedCount));
+                        "边合并: 目标文件尾部 {0} 字节超出分片 {1} 的可信进度，需要截除重下（内容正确优先于省流量）。",
+                        Fmt(mergedInHead - trustedHead), mergedCount));
                     try
                     {
                         using (var fs = new FileStream(dest, FileMode.Open, FileAccess.Write, FileShare.ReadWrite | FileShare.Delete))
-                            fs.SetLength(acc);
+                            fs.SetLength(acc + trustedHead);
                     }
-                    catch { }
-                    mergedInHead = 0;
-                    mergedBytes = acc;
+                    catch (Exception ex)
+                    {
+                        return (false, "无法截除目标文件的未提交尾部: " + ex.Message);
+                    }
+                    mergedInHead = trustedHead;
+                    mergedBytes = acc + trustedHead;
                 }
             }
 
@@ -1662,25 +1666,14 @@ namespace GeZi.Core.Download
                     if (fi.Exists) len = fi.Length;
                 }
                 catch { }
-                if (len > sz)
-                {
-                    try
-                    {
-                        using (var fs = new FileStream(PartPath(partsDir, i), FileMode.Open,
-                                   FileAccess.Write, FileShare.ReadWrite | FileShare.Delete))
-                            fs.SetLength(sz);
-                    }
-                    catch { }
-                    len = sz;
-                }
                 // 只信任记账值：min(记账, 盘长)。
                 // 记账 > 盘长（缓冲未落盘进程被杀）→ 取盘长，续写位置仍正确；
                 // 盘长 > 记账 → 超出的部分是记账之后新写的，其中含撕裂尾，一律截掉。
-                long trusted = Math.Min(plan.Parts[i].W, len);
+                long trusted = Math.Min(sz, Math.Min(plan.Parts[i].W, len));
                 if (len > trusted)
                 {
                     Log?.Invoke(string.Format(
-                        "边合并: 分片 {0} 盘长 {1} 超出可信进度 {2}，已截掉 {3} 字节（疑似强杀撕裂尾，重下以保证内容正确）。",
+                        "边合并: 分片 {0} 盘长 {1} 超出可信进度 {2}，需要截掉 {3} 字节（重下以保证内容正确）。",
                         i, Fmt(len), Fmt(trusted), Fmt(len - trusted)));
                     try
                     {
@@ -1688,7 +1681,10 @@ namespace GeZi.Core.Download
                                    FileAccess.Write, FileShare.ReadWrite | FileShare.Delete))
                             fs.SetLength(trusted);
                     }
-                    catch { }
+                    catch (Exception ex)
+                    {
+                        return (false, "无法截除分片 " + i + " 的未提交尾部: " + ex.Message);
+                    }
                 }
                 plan.Parts[i].W = trusted;
                 // 完整分片直接标记完成。
@@ -2418,9 +2414,9 @@ namespace GeZi.Core.Download
                             long sz = plan.Parts[next].E - plan.Parts[next].S + 1;
                             string pp = PartPath(partsDir, next);
 
-                            // 分片文件当前在盘上有多少字节。worker 是顺序追加写，
-                            // 长度单调增长，所以"已落盘长度"始终是该分片的合法前缀 ——
-                            // 读它不会读到脏数据，最多只是读到得少一点（缓冲还没落盘）。
+                            // net48 异步 FileStream 先扩长，再完成 WriteFile。
+                            // 文件长度可能包含在飞/失败写留下的零尾部，不能作为提交点。
+                            // W 只在无托管写缓冲的 WriteAsync 成功后发布。
                             long onDisk = 0;
                             try
                             {
@@ -2428,7 +2424,7 @@ namespace GeZi.Core.Download
                                 if (pfi.Exists) onDisk = pfi.Length;
                             }
                             catch { }
-                            if (onDisk > sz) onDisk = sz;
+                            onDisk = Math.Min(sz, Math.Min(onDisk, plan.Parts[next].W));
 
                             // 把"新落盘、还没合并"的那一段追加到目标文件
                             if (onDisk > inPart)
@@ -2935,13 +2931,8 @@ namespace GeZi.Core.Download
 
                                             using (var stream = await resp.Content.ReadAsStreamAsync().ConfigureAwait(false))
                                             {
-                                                // 每个分片独立开一个文件流。
-                                                // 曾经为了"省掉反复 open/close"改成 worker 级复用，
-                                                // 但那是过度优化：现代 Windows 上一次 open/close 只有微秒级，
-                                                // 768 片总计不过几毫秒，几乎白省；代价却是
-                                                // ① 缓冲里的数据不随关闭自动落盘，断点续传可能记了账但盘上还是空洞
-                                                // ② 512 个流句柄长期占用
-                                                // 所以改回每片独立流：Dispose 时自动 flush，简单且正确。
+                                                // 每次尝试独立开流，禁用托管写缓冲（bufferSize=1）：
+                                                // WriteAsync 成功才可推进 W，不能把仅进入缓冲的字节发布给合并线程。
                                                 FileStream wfs;
                                                 // 独立分片：写到自己的分片文件，从当前已写长度续写。
                                                 // 注意 reqStart 是"在整个文件里的偏移"，
@@ -2954,19 +2945,15 @@ namespace GeZi.Core.Download
                                                 // 上下文切换 + GC 暂停被放大 → CPU 飙高。
                                                 // 加了之后走 overlapped IO，写盘不再占线程。
                                                 wfs = new FileStream(PartPath(partsDir, idx), FileMode.OpenOrCreate,
-                                                          FileAccess.Write, FileShare.ReadWrite | FileShare.Delete, 64 * 1024,
+                                                          FileAccess.Write, FileShare.ReadWrite | FileShare.Delete, 1,
                                                           FileOptions.SequentialScan | FileOptions.Asynchronous);
-                                                // 续写点 = 文件尾部。
-                                                // 这里曾经有一段「W=0 且文件非空则截断」的
-                                                // worker 级保护，实测证明是**死代码**：RunSegmentedAsync 的
-                                                // 「与磁盘对账」循环在 worker 启动之前就跑完了，那时已按
-                                                // 「W=min(记账,盘长)」把超长的撕裂尾截掉并回填 W，
-                                                // 所以 worker 开门时「文件长度 == part.W」恒成立。
-                                                // 对账层（单一事实来源）负责可信度判定，worker 只管追加。
-                                                wfs.Seek(0, SeekOrigin.End);
 
                                                 using (wfs)
                                                 {
+                                                    // 每次重试也要对账：失败/取消的异步写可能已经扩长文件，
+                                                    // 但没有推进 W。只能从已提交偏移覆盖，不能追加到物理尾部。
+                                                    wfs.SetLength(written);
+                                                    wfs.Seek(written, SeekOrigin.Begin);
                                                     Interlocked.Increment(ref activeConns);
                                                     try
                                                     {
@@ -3437,9 +3424,15 @@ namespace GeZi.Core.Download
 
     internal class PartPlan
     {
+        private long _written;
         public long S { get; set; }   // 起始（含）
         public long E { get; set; }   // 结束（含）
-        public long W { get; set; }   // 已写入字节
+        // 跨 worker、合并线程和元数据快照发布的已提交前缀。
+        public long W
+        {
+            get => Interlocked.Read(ref _written);
+            set => Interlocked.Exchange(ref _written, value);
+        }
     }
 
     internal class DownloadPlan

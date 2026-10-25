@@ -85,6 +85,22 @@ src/GeZi/bin/Release/net48/GeZi.exe
 **无需 `nuget restore`** —— 本项目零 NuGet 依赖，所有第三方库以固化 DLL 形式随仓库分发，
 任何机器 clone 下来即可直接构建（需已安装 .NET Framework 4.8 开发包 / MSBuild）。
 
+### 下载完整性回归测试
+
+测试是零 NuGet 依赖的 net48 x64 控制台程序，在 Windows 上运行：
+
+```powershell
+dotnet build .\tests\GeZi.Core.RegressionTests\GeZi.Core.RegressionTests.csproj -c Release
+.\tests\GeZi.Core.RegressionTests\bin\Release\net48\GeZi.Core.RegressionTests.exe
+```
+
+仅使用本机回环 HTTP Range 服务和合成数据，不需要账号或真实下载链接。
+覆盖未提交分片尾部的合并、失败后重试、断点恢复、暂停/恢复、对账失败及全新分片下载，
+对最终文件逐字节比较。测试显式构造 net48 异步写入先扩长文件、后完成写入的中间状态，
+不需要填满磁盘或强杀进程。分片的可信进度只在无托管写缓冲的写入成功后更新；
+合并和重试不再把物理文件长度当作提交点。这不等同于断电后的硬件级持久性保证，
+也不能检测或修复旧版本已经完成并清理断点的损坏文件。
+
 ---
 
 ## 🧱 项目结构
@@ -169,4 +185,3 @@ GNU General Public License for more details.
 <p align="center">
   <img src="GeZi.png" width="260" alt="赞赏码">
 </p>
-
