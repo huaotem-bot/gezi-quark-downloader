@@ -1113,6 +1113,21 @@ namespace GeZi
                             "再把拿到的 https://pan.quark.cn/s/… 链接粘进来。",
                             "这是夸克口令", MessageBoxButton.OK, MessageBoxImage.Information);
                     }
+                    else if (ShareLinkResolver.IsHttpUrl(text))
+                    {
+                        // 给一个「查找」入口：要不要联网去找由用户点，程序不默认做。
+                        var r = AppDialog.ShowTwoButton(this,
+                            "二维码识别成功，但内容看起来不是分享链接：\n\n" + text + "\n\n" +
+                            "有些分享会把真实链接放在跳转页或页面代码里，要尝试查找吗？",
+                            "识别结果",
+                            "查找", "确定",
+                            MessageBoxImage.Information,
+                            // 默认落在「确定」上：回车不该顺手就发出联网请求
+                            MessageBoxResult.Cancel);
+
+                        if (r == MessageBoxResult.OK)
+                            TryResolveScannedLink(text);
+                    }
                     else
                     {
                         AppDialog.Show(this,
@@ -1133,6 +1148,68 @@ namespace GeZi
             catch (Exception ex)
             {
                 LogDetail("处理识别结果失败: " + ex.Message);
+            }
+        }
+
+        /// <summary>点了「查找」：联网找夸克链接，先确认一次（可勾「此后不再提示」）。</summary>
+        private async void TryResolveScannedLink(string url)
+        {
+            try
+            {
+                var s = SettingsStore.Load();
+
+                bool go;
+                if (s.OnQrNonQuarkLink == QrResolveMode.Always)
+                {
+                    go = true;
+                }
+                else if (s.OnQrNonQuarkLink == QrResolveMode.Never)
+                {
+                    go = false;
+                }
+                else
+                {
+                    bool dontAsk;
+                    var r = AppDialog.ShowWithDontAsk(this,
+                        "该行为需要联网尝试，确认吗？",
+                        "还原分享链接",
+                        "确认", "取消",
+                        MessageBoxImage.Question,
+                        out dontAsk);
+                    go = (r == MessageBoxResult.OK);
+
+                    if (dontAsk)
+                    {
+                        s.OnQrNonQuarkLink = go ? QrResolveMode.Always : QrResolveMode.Never;
+                        SettingsStore.Save(s);
+                        // Save 只写磁盘，内存里的 _settings 要同步，否则下次扫还会弹
+                        _settings.OnQrNonQuarkLink = s.OnQrNonQuarkLink;
+                        LogDetail("已记住查找的选择：" + (go ? "以后直接查找" : "以后不再查找"));
+                    }
+                }
+
+                if (!go) return;
+
+                LogDetail("正在查找夸克链接…");
+                var rr = await ShareLinkResolver.ResolveAsync(url).ConfigureAwait(true);
+                if (rr == null || !rr.Ok || string.IsNullOrEmpty(rr.Url))
+                {
+                    string why = rr == null ? "无结果" : (rr.Error ?? "未知");
+                    LogDetail("没能找到夸克链接：" + why);
+                    AppDialog.Show(this,
+                        "没能从这条链接里找到夸克分享链接：\n\n" + why,
+                        "还原结果", MessageBoxButton.OK, MessageBoxImage.Information);
+                    return;
+                }
+
+                LogDetail("找到夸克链接（" + rr.How + "）：" + rr.Url);
+                LinkBox.Text = rr.Url;
+                LinkBox.CaretIndex = rr.Url.Length;
+                OnParseClick(null, null);
+            }
+            catch (Exception ex)
+            {
+                LogDetail("还原失败: " + ex.Message);
             }
         }
 

@@ -179,6 +179,24 @@ namespace GeZi
 
         /// <summary>用户点过「忽略此版本」的版本号。与 <see cref="UpdateLatestVersion"/> 相同则不再提示。</summary>
         public string UpdateIgnoredVersion { get; set; }
+
+        /// <summary>
+        /// 点「查找」时是否先弹确认。只由「此后不再提示」写入，设置页不给入口。
+        /// ⚠️ 默认必须是 0 = Ask：XmlSerializer 反序列化不执行字段初始化器，
+        /// 老配置缺这个节点时保持 default = 0，正好是"每次问"。
+        /// </summary>
+        public QrResolveMode OnQrNonQuarkLink { get; set; } = QrResolveMode.Ask;
+    }
+
+    /// <summary>点「查找」时是否先弹联网确认。</summary>
+    public enum QrResolveMode
+    {
+        /// <summary>每次都问一次（默认）。</summary>
+        Ask = 0,
+        /// <summary>不再问，直接查找。</summary>
+        Always = 1,
+        /// <summary>不再问，也不查找。</summary>
+        Never = 2,
     }
 
     /// <summary>主窗口「关闭」按钮的行为。</summary>

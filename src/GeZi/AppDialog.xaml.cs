@@ -134,6 +134,39 @@ namespace GeZi
             return dlg._result;
         }
 
+        /// <summary>
+        /// 两个自定义文案的按钮，不带「此后不再提示」勾选框。
+        /// </summary>
+        /// <param name="defaultResult">回车/主色落在哪个按钮上。联网等有风险的操作传 Cancel 更稳。</param>
+        /// <returns>左按钮 = OK，右按钮 = Cancel，右上角 X / Esc = Cancel</returns>
+        public static MessageBoxResult ShowTwoButton(Window owner, string text, string title,
+                                                    string primaryText, string secondaryText,
+                                                    MessageBoxImage icon,
+                                                    MessageBoxResult defaultResult = MessageBoxResult.OK)
+        {
+            var dlg = new AppDialog();
+            if (owner != null && owner.IsVisible)
+            {
+                dlg.Owner = owner;
+                dlg.WindowStartupLocation = WindowStartupLocation.CenterOwner;
+            }
+            else
+            {
+                dlg.WindowStartupLocation = WindowStartupLocation.CenterScreen;
+            }
+
+            dlg.Configure(text, title, MessageBoxButton.OKCancel, icon, defaultResult);
+
+            // 槽位映射见 ShowWithDontAsk 的说明：Btn2 = 左（主操作），Btn1 = 右（次操作）
+            dlg.Btn2.Content = primaryText;
+            dlg.Btn1.Content = secondaryText;
+            dlg.Btn2.MinWidth = 108;
+            dlg.Btn1.MinWidth = 108;
+
+            dlg.ShowDialog();
+            return dlg._result;
+        }
+
         private static MessageBoxResult DefaultFor(MessageBoxButton button)
         {
             switch (button)
