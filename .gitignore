@@ -70,3 +70,6 @@ venv/
 # ⚠️ 以下目录必须入库，不要加进本文件：
 #   src/GeZi.Core/lib/ZXing/        —— 固化的 ZXing DLL（离线构建需要）
 #   src/GeZi.Core/Runtime/win-x64/  —— 内置 CPython（离线构建 + 扫码登录需要）
+
+# runtime folder (exe + user data, never commit)
+app/
