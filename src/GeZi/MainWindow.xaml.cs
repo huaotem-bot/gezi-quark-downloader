@@ -3297,13 +3297,26 @@ namespace GeZi
         /// </summary>
         private void StartDownloadFromItems(List<DownloadItem> items)
         {
+            // 「每次下载前询问保存位置」：弹一次目录选择，仅对本次生效。
+            // 放在**最前面**：用户点了取消就整个不入队，一个请求都不浪费。
+            string overrideRoot = null;
+            if (_settings.AskSaveLocation)
+            {
+                overrideRoot = PickDownloadFolder();
+                if (overrideRoot == null)
+                {
+                    Log("已取消（未选择保存位置）。");
+                    return;
+                }
+            }
+
             var alloc = AllocateThreads(items.Select(i => i.Size).ToList());
             var jobs = new List<DownloadJob>();
             for (int i = 0; i < items.Count; i++)
             {
                 var it = items[i];
                 if (string.IsNullOrEmpty(it.Url)) continue;
-                string destDir = Path.Combine(_settings.OutDir, it.RelDir ?? "");
+                string destDir = Path.Combine(overrideRoot ?? _settings.OutDir, it.RelDir ?? "");
                 try { Directory.CreateDirectory(destDir); }
                 catch (Exception ex) { Log("创建下载目录失败: " + destDir + " — " + ex.Message); continue; }
 
@@ -3314,8 +3327,8 @@ namespace GeZi
                     Name = item.Name, Url = item.Url, Dest = dest,
                     Cookie = _client.CookieStr,
                     Threads = i < alloc.Length ? alloc[i] : _settings.Threads,
-                    // 写入方式统一取设置页的全局值（原来靠下载区的「边下边播」勾选框，
-                    // 与设置页重复且容易误导，已移除该勾选框）。
+                    // 写入方式取设置页的全局值（共写单一文件 / 独立分片+边合并）。
+                    WriteMode = _settings.WriteMode,
                     PartsRoot = string.IsNullOrWhiteSpace(_settings.PartsRoot) ? null : _settings.PartsRoot,
                     LinkRefresher = ct => RefreshLinkAsync(item, ct),
                     // 免转存（从分享直接取链）→ 续传取不到新链，失败文案别承诺"可续传"
@@ -3407,6 +3420,20 @@ namespace GeZi
                     }
                 }
 
+                // 「每次下载前询问保存位置」：放在取直链**之前** ——
+                // 用户在目录框里点了取消时，一个取链请求都不浪费。
+                // 弹窗虽在 SetBusy 区域内，但与上方 AppDialog 确认框同款（模态子窗口，不受影响）。
+                string overrideRoot = null;
+                if (_settings.AskSaveLocation)
+                {
+                    overrideRoot = PickDownloadFolder();
+                    if (overrideRoot == null)
+                    {
+                        Log("已取消（未选择保存位置）。");
+                        return;
+                    }
+                }
+
                 ct.ThrowIfCancellationRequested();
                 var items = await GetDownloadItemsAsync(files, ct, forceNoSave);
                 ct.ThrowIfCancellationRequested();
@@ -3419,7 +3446,7 @@ namespace GeZi
                 {
                     ct.ThrowIfCancellationRequested();
                     var it = items[i];
-                    string destDir = Path.Combine(_settings.OutDir, it.RelDir ?? "");
+                    string destDir = Path.Combine(overrideRoot ?? _settings.OutDir, it.RelDir ?? "");
                     try { Directory.CreateDirectory(destDir); }
                     catch (Exception ex) { Log("创建下载目录失败: " + destDir + " — " + ex.Message); continue; }
                     string dest = PathUtil.UniquePath(Path.Combine(destDir, PathUtil.SanitizeFileName(it.Name)));
@@ -3429,6 +3456,8 @@ namespace GeZi
                         Name = item.Name, Url = item.Url, Dest = dest,
                         Cookie = _client.CookieStr,
                         Threads = i < alloc.Length ? alloc[i] : _settings.Threads,
+                        // 写入方式取设置页的全局值（共写单一文件 / 独立分片+边合并）。
+                        WriteMode = _settings.WriteMode,
                         // 分片根目录：留空 = 与目标同级（默认）。非空则分片集中存放，
                         // 下载目录不被 .qparts 污染，也支持分片跨盘（如放 SSD）。
                         PartsRoot = string.IsNullOrWhiteSpace(_settings.PartsRoot) ? null : _settings.PartsRoot,
@@ -4135,8 +4164,8 @@ namespace GeZi
                             Token = pi?.Token,
                             FromShare = pi?.FromShare ?? false,
                             Size = t.Total,
-                            StreamPlay = true,      // 共写模式已删除，恒可边下边播
-                            StreamPlayMode = true,
+                            StreamPlay = t.Job.WriteMode != WriteMode.SharedFile,
+                            StreamPlayMode = t.Job.WriteMode != WriteMode.SharedFile,
                             Status = t.StatusText,
                             // ---- 续传所需（重启后重取链）----
                             PwdId = pi?.PwdId,
@@ -5833,6 +5862,9 @@ namespace GeZi
                             Dest = dest,
                             Cookie = client.CookieStr,
                             Threads = _settings.Threads,
+                            // 写入方式取设置页的全局值。若与该任务上次的方式不同，
+                            // 核心层会按磁盘现状自动对齐（见 SegmentedDownloader 的「写入方式与磁盘现状的自动对齐」）。
+                            WriteMode = _settings.WriteMode,
                             PartsRoot = string.IsNullOrWhiteSpace(_settings.PartsRoot) ? null : _settings.PartsRoot,
                             Pending = new PendingInfo
                             {
@@ -6219,6 +6251,12 @@ namespace GeZi
                         _settings.PartsRoot = _settings.OutDir;
                 }
                 HidePartsCheck.IsChecked = _settings.HideParts;
+                // 写入方式（共写/独立分片）：回填两个单选（_applyingSettings 已挡掉 Checked）
+                bool sharedMode = _settings.WriteMode == WriteMode.SharedFile;
+                WriteModeSharedRadio.IsChecked = sharedMode;
+                WriteModeSegmentedRadio.IsChecked = !sharedMode;
+                // 每次下载前询问保存位置
+                AskSaveLocationCheck.IsChecked = _settings.AskSaveLocation;
                 CloseActionBox.SelectedIndex = (int)_settings.OnCloseButton;
                 // 剪贴板自动解析（默认开）。注意这里**只回填控件**：真正的注册在窗口句柄
                 // 建好之后由 AttachWindowHooks→ApplyClipboardListener 做。
@@ -6501,6 +6539,11 @@ namespace GeZi
                 _settings.PartsRoot = newPartsRoot;
                 _settings.HideParts = HidePartsCheck.IsChecked == true;
                 SegmentedDownloader.HidePartsDir = _settings.HideParts;
+                // 写入方式与「下载前询问保存位置」
+                _settings.WriteMode = WriteModeSharedRadio.IsChecked == true
+                    ? WriteMode.SharedFile
+                    : WriteMode.SegmentedFiles;
+                _settings.AskSaveLocation = AskSaveLocationCheck.IsChecked == true;
                 _settings.OnCloseButton = (CloseAction)Math.Max(0,
                     Math.Min(2, CloseActionBox.SelectedIndex));
 
@@ -6580,6 +6623,35 @@ namespace GeZi
                     PartsRootBox.Text = dlg.SelectedPath;
                     ApplySettings();   // 即时生效（没有"保存"按钮了）
                 }
+            }
+        }
+
+        /// <summary>「每次下载前询问保存位置」记忆的**本次会话**上次所选目录（不落盘）。</summary>
+        private string _lastPickedDownloadDir;
+
+        /// <summary>
+        /// 「每次下载前询问保存位置」开关开启时，点下载弹出的目录选择框。
+        /// 复用 OnBrowsePartsRoot 同款 FolderBrowserDialog（WinForms 自带，零新依赖）。
+        /// 返回 null = 用户取消；选中结果**仅对本次下载生效**，不改动全局下载目录。
+        /// 起始目录：本次会话上次选的 > 全局下载目录。
+        /// </summary>
+        private string PickDownloadFolder()
+        {
+            string start = _lastPickedDownloadDir;
+            if (string.IsNullOrEmpty(start)) start = _settings.OutDir;
+            using (var dlg = new System.Windows.Forms.FolderBrowserDialog
+            {
+                SelectedPath = string.IsNullOrEmpty(start) ? AppDomain.CurrentDomain.BaseDirectory : start,
+                Description = "选择本次下载的保存位置（仅对本次下载生效）",
+                ShowNewFolderButton = true,
+            })
+            {
+                // 无 owner 调用（与 OnBrowsePartsRoot 同款）：WPF Window 不实现
+                // WinForms 的 IWin32Window，直接传 this 会编译错 CS1503。
+                if (dlg.ShowDialog() != System.Windows.Forms.DialogResult.OK)
+                    return null;
+                _lastPickedDownloadDir = dlg.SelectedPath;
+                return dlg.SelectedPath;
             }
         }
 

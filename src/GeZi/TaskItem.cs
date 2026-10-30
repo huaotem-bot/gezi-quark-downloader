@@ -121,16 +121,18 @@ namespace GeZi
         /// 这个任务现在能不能「播放」—— 决定任务行右边那个「播放」按钮显不显示。
         /// </summary>
         /// <remarks>
-        /// 共写模式已物理删除，落盘方式唯一「独立分片 + 边合并」：
-        /// 目标文件不预分配、从 0 连续增长 → 播放器看到的是"被截断但内容连续"的文件，
-        /// 这正是能正常边下边播的情况。因此下载中即可播放，无需再按写入方式判断。
+        /// 独立分片 + 边合并模式：目标文件不预分配、从 0 连续增长 → 播放器看到的是
+        /// "被截断但内容连续"的文件，下载中即可播放。
+        /// 共写模式：目标文件是预分配的满尺寸空洞文件，下载中含未填充区间，
+        /// 播放器读到的是垃圾数据 —— 只有**下载完成**后才给播。
         /// </remarks>
         public bool CanPlay
         {
             get
             {
                 if (Job == null) return false;
-                return true;
+                if (State == JobState.Completed) return true;
+                return Job.WriteMode != WriteMode.SharedFile;
             }
         }
 

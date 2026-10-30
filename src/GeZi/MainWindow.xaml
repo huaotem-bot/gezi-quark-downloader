@@ -1627,6 +1627,12 @@
                                                           Content="下载完成后自动清理云盘转存文件"
                                                           Style="{StaticResource AppCheckBox}"
                                                           Click="OnSettingChanged"/>
+                                                <CheckBox x:Name="AskSaveLocationCheck"
+                                                          Content="每次下载前询问保存位置"
+                                                          Style="{StaticResource AppCheckBox}"
+                                                          Margin="0,12,0,0"
+                                                          Click="OnSettingChanged"
+                                                          ToolTip="勾选后，每次点击「下载」会先弹出目录选择框，本次下载的文件保存到所选目录（不改动上面的全局下载目录）。批量任务会保留分享内的目录结构。"/>
                                             </StackPanel>
                                         </Border>
 
@@ -1765,6 +1771,39 @@
                                                           Margin="0,12,0,0"
                                                           Click="OnSettingChanged"
                                                           ToolTip="只影响新建的分片目录是否隐藏，不影响下载功能。默认勾选。"/>
+
+                                                <TextBlock Text="写入方式" Style="{StaticResource FieldLabel}"
+                                                           Margin="0,16,0,6"/>
+                                                <!-- 与顶部「分享链接/我的网盘」同构的分段选择（SegmentedSlider 滑块动画）。
+                                                     共写 = v2.2.0 旧默认：无分片文件、无合并线程、下完即结束；
+                                                     分片 = 2.3.1 方式：可边下边播，收尾有「正在合并分片」环节。 -->
+                                                <Border HorizontalAlignment="Left" CornerRadius="8"
+                                                        Background="{DynamicResource SurfaceSunkenBrush}"
+                                                        Padding="3">
+                                                    <Grid local:SegmentedSlider.IsEnabled="True"
+                                                          local:SegmentedSlider.Thumb="{x:Reference WriteModeThumb}">
+                                                        <Border x:Name="WriteModeThumb" CornerRadius="6"
+                                                                HorizontalAlignment="Left"
+                                                                VerticalAlignment="Stretch"
+                                                                IsHitTestVisible="False"
+                                                                Background="{DynamicResource SurfaceBrush}"/>
+                                                        <StackPanel Orientation="Horizontal">
+                                                            <RadioButton x:Name="WriteModeSegmentedRadio" Content="独立分片（可边下边播）"
+                                                                         GroupName="WriteMode"
+                                                                         Checked="OnSettingChanged"
+                                                                         Style="{StaticResource SegmentedRadio}"
+                                                                         Margin="0"/>
+                                                            <RadioButton x:Name="WriteModeSharedRadio" Content="共写单一文件（下完即结束）"
+                                                                         GroupName="WriteMode"
+                                                                         Checked="OnSettingChanged"
+                                                                         Style="{StaticResource SegmentedRadio}"
+                                                                         Margin="2,0,0,0"/>
+                                                        </StackPanel>
+                                                    </Grid>
+                                                </Border>
+                                                <TextBlock Text="共写：所有连接直写同一个文件，下完即完成、无「合并分片」环节；下载中文件含未下载区间，不可边下边播。切换只影响新任务，进行中的任务不受影响。"
+                                                           Style="{StaticResource ProseText}" TextWrapping="Wrap"
+                                                           Margin="0,8,0,0"/>
                                             </StackPanel>
                                         </Border>
 

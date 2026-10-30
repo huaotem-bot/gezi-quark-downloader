@@ -29,6 +29,12 @@ namespace GeZi.Core.Download
         public int Threads { get; set; } = 0;
 
         /// <summary>
+        /// 落盘方式：独立分片+边合并（可边下边播）或共写单一文件（下完即结束、无合并环节）。
+        /// 由 UI 层从设置页填入；核心层据此选择 worker 的写入路径。
+        /// </summary>
+        public WriteMode WriteMode { get; set; } = WriteMode.SegmentedFiles;
+
+        /// <summary>
         /// 分片/续传元数据的根目录覆盖。null/空 = 与目标文件同级（默认）。
         /// 见 SegmentedDownloader 的 _partsRoot 说明。
         /// </summary>

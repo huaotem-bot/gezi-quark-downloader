@@ -66,6 +66,28 @@ namespace GeZi
         public string PartsRoot { get; set; } = "";
 
         /// <summary>
+        /// 落盘方式（应用户要求恢复 v2.2.0 的选择开关）：
+        /// · <see cref="GeZi.Core.Download.WriteMode.SegmentedFiles"/> 独立分片 + 边合并
+        ///   —— 2.3.1 的默认/唯一方式，可边下边播，收尾有「正在合并分片」环节；
+        /// · <see cref="GeZi.Core.Download.WriteMode.SharedFile"/> 共写单一文件
+        ///   —— v2.2.0 的默认行为：无分片文件、无合并线程，下完即结束；
+        ///   代价是下载中文件含未填充区间，不能边下边播。
+        /// ⚠️ 默认取 SegmentedFiles 与 2.3.1 官方版一致：老配置里没有这个节点时，
+        ///    XmlSerializer 取枚举第一个成员（见枚举定义处的顺序说明）。
+        /// </summary>
+        public GeZi.Core.Download.WriteMode WriteMode { get; set; }
+            = GeZi.Core.Download.WriteMode.SegmentedFiles;
+
+        /// <summary>
+        /// 「下载时手动选择保存位置」。开启后每次点下载会先弹目录选择框，
+        /// 选中的目录**仅对本次下载生效**（临时覆盖全局下载目录，不改动设置）。
+        /// 批量任务（含文件夹展开）按"选中目录 + 分享内相对路径"落盘，保留目录结构。
+        /// ⚠️ 默认 false：老配置没有该节点时 XmlSerializer 读到 default(bool) = false，
+        ///    与升级前行为一致（直接下到全局下载目录）。
+        /// </summary>
+        public bool AskSaveLocation { get; set; }
+
+        /// <summary>
         /// 是否把分片目录设为「隐藏」。移植自 Python Flet 版的 hide_parts。
         /// 只影响新建的分片目录在资源管理器里是否显示（不影响功能）。
         /// </summary>
