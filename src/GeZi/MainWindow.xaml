@@ -1468,34 +1468,51 @@
 
                                                 <Grid Margin="0,0,0,6">
                                                     <Grid.ColumnDefinitions>
-                                                        <ColumnDefinition Width="120"/>
+                                                        <ColumnDefinition Width="140"/>
                                                         <ColumnDefinition Width="*"/>
                                                     </Grid.ColumnDefinitions>
                                                     <TextBlock Text="单文件并发连接数" Style="{StaticResource FieldLabel}"/>
-                                                    <ComboBox x:Name="ThreadsBox" Grid.Column="1" MaxWidth="340"
-                                                              HorizontalAlignment="Left"
-                                                              Style="{StaticResource AppComboBox}"
-                                                              ItemContainerStyle="{StaticResource AppComboBoxItem}"
-                                                              SelectionChanged="OnSettingChanged">
-                                                        <ComboBoxItem Content="16  — 省网保守"/>
-                                                        <ComboBoxItem Content="32  — 保守，够用"/>
-                                                        <!-- 标注必须与 Settings.Threads 的默认值一致。
-                                                        默认值已按**实测拐点**从 64 改成 256
-                                                        （docs/CDN并发阈值-实测.md：64 路 4.00 MB/s、128 路 7.98、
-                                                        **256 路 13.94 ← 拐点**、512 路 13.31）。
-                                                        ⚠️ 之前这里一直写着"64 — 默认"，与代码默认值不符，会直接误导用户。
-                                                        ⚠️ 512 档：实测略慢于 256（13.31 vs 13.94），但那只是**当时那个时段**的
-                                                        数据（CDN 配额会浮动），所以文案写"可能会更快"而不写死结论。 -->
-                                                        <ComboBoxItem Content="64  — 省网，速度一般"/>
-                                                        <ComboBoxItem Content="128 — 较快"/>
-                                                        <ComboBoxItem Content="256 — 默认，实测最快"/>
-                                                        <ComboBoxItem Content="512 — 上限，可能会更快"/>
-                                                    </ComboBox>
+                                                    <StackPanel Grid.Column="1" Orientation="Horizontal">
+                                                        <ComboBox x:Name="ThreadsBox" MaxWidth="340"
+                                                                  HorizontalAlignment="Left"
+                                                                  Style="{StaticResource AppComboBox}"
+                                                                  ItemContainerStyle="{StaticResource AppComboBoxItem}"
+                                                                  SelectionChanged="OnSettingChanged">
+                                                            <ComboBoxItem Content="16  — 省网保守"/>
+                                                            <ComboBoxItem Content="32  — 保守，够用"/>
+                                                            <!-- 标注必须与 Settings.Threads 的默认值一致。
+                                                            默认值已按**实测拐点**从 64 改成 256
+                                                            （docs/CDN并发阈值-实测.md：64 路 4.00 MB/s、128 路 7.98、
+                                                            **256 路 13.94 ← 拐点**、512 路 13.31）。
+                                                            ⚠️ 之前这里一直写着"64 — 默认"，与代码默认值不符，会直接误导用户。
+                                                            ⚠️ 512 档：实测略慢于 256（13.31 vs 13.94），但那只是**当时那个时段**的
+                                                            数据（CDN 配额会浮动），所以文案写"可能会更快"而不写死结论。 -->
+                                                            <ComboBoxItem Content="64  — 省网，速度一般"/>
+                                                            <ComboBoxItem Content="128 — 较快"/>
+                                                            <ComboBoxItem Content="256 — 默认，实测最快"/>
+                                                            <ComboBoxItem Content="512 — 上限，可能会更快"/>
+                                                        </ComboBox>
+                                                        <!-- ⚠ 入口：机械硬盘（HDD）高并发寻道说明（点开二级窗口）。
+                                                             图标用 IconWarning（描边几何），照 IconActivity 的
+                                                             Stroke 写法渲染，别写成 Fill（! 两笔会消失）。 -->
+                                                        <Button Style="{StaticResource IconGhostButton}"
+                                                                Margin="8,0,0,0" VerticalAlignment="Center"
+                                                                Click="OnThreadsHddTip"
+                                                                AutomationProperties.Name="机械硬盘高并发说明"
+                                                                ToolTip="用机械硬盘下载？点这里看说明">
+                                                            <Path Data="{StaticResource IconWarning}" Stretch="Uniform"
+                                                                  Width="13" Height="13"
+                                                                  Stroke="{DynamicResource TextSecondaryBrush}"
+                                                                  StrokeThickness="1.5"
+                                                                  StrokeStartLineCap="Round" StrokeEndLineCap="Round"
+                                                                  StrokeLineJoin="Round"/>
+                                                        </Button>
+                                                    </StackPanel>
                                                 </Grid>
 
                                                 <Grid Margin="0,0,0,16">
                                                     <Grid.ColumnDefinitions>
-                                                        <ColumnDefinition Width="120"/>
+                                                        <ColumnDefinition Width="140"/>
                                                         <ColumnDefinition Width="*"/>
                                                     </Grid.ColumnDefinitions>
                                                     <TextBlock Text="同时下载任务数" Style="{StaticResource FieldLabel}"/>
@@ -1516,7 +1533,7 @@
                                                 走独立 Click 处理器：不重建调度器（见 OnUseSystemProxyChanged）。 -->
                                                 <Grid Margin="0,0,0,6">
                                                     <Grid.ColumnDefinitions>
-                                                        <ColumnDefinition Width="120"/>
+                                                        <ColumnDefinition Width="140"/>
                                                         <ColumnDefinition Width="*"/>
                                                     </Grid.ColumnDefinitions>
                                                     <TextBlock Text="代理" Style="{StaticResource FieldLabel}"/>
@@ -1529,7 +1546,7 @@
                                                 </Grid>
                                                 <TextBlock Style="{StaticResource TertiaryText}" FontSize="11"
                                                            Margin="120,0,0,0" TextWrapping="Wrap"
-                                                           Text="默认关闭（直连）。仅在必须经代理才能上网时打开；打开后重新开始下载或重新登录才会生效。"/>
+                                                           Text="默认关闭（直连）。仅在必须经代理才能上网时打开；本机装有代理软件（VPN、抓包、加速器）时建议保持关闭。打开后重新开始下载或重新登录才会生效。"/>
                                             </StackPanel>
                                         </Border>
 
@@ -1543,7 +1560,7 @@
                                                 弹窗里可勾「此后不再提示」，之后在**这里**还能改。 -->
                                                 <Grid Margin="0,0,0,6">
                                                     <Grid.ColumnDefinitions>
-                                                        <ColumnDefinition Width="120"/>
+                                                        <ColumnDefinition Width="140"/>
                                                         <ColumnDefinition Width="*"/>
                                                     </Grid.ColumnDefinitions>
                                                     <TextBlock Text="关闭按钮行为" Style="{StaticResource FieldLabel}"/>
@@ -1564,7 +1581,7 @@
                                                 这个开关不需要重建下载调度器，见 OnClipboardAutoParseChanged。 -->
                                                 <Grid Margin="0,0,0,6">
                                                     <Grid.ColumnDefinitions>
-                                                        <ColumnDefinition Width="120"/>
+                                                        <ColumnDefinition Width="140"/>
                                                         <ColumnDefinition Width="*"/>
                                                     </Grid.ColumnDefinitions>
                                                     <TextBlock Text="剪贴板" Style="{StaticResource FieldLabel}"/>
@@ -1590,6 +1607,8 @@
                                                      只显示得出 "C://Users" 就被截断。
                                                      改成与右列「分片与缓存」完全同构的**竖排**：
                                                      标签在上、输入框吃满整行、两个按钮并排在右侧。 -->
+                                                <!-- 勾选「每次下载前询问保存位置」时整行隐藏（UpdatePathRowsVisibility 联动） -->
+                                                <StackPanel x:Name="OutDirRow">
                                                 <TextBlock Text="下载目录" Style="{StaticResource FieldLabel}"
                                                            Margin="0,0,0,6"/>
                                                 <Grid Margin="0,0,0,16">
@@ -1623,16 +1642,18 @@
                                                         </StackPanel>
                                                     </Button>
                                                 </Grid>
-                                                <CheckBox x:Name="AutoCleanCheck"
-                                                          Content="下载完成后自动清理云盘转存文件"
-                                                          Style="{StaticResource AppCheckBox}"
-                                                          Click="OnSettingChanged"/>
+                                                </StackPanel>
+                                                <!-- 询问保存在上、自动清理在下（用户要求对调）：询问保存位置直接管“文件存哪”，跟下载目录一行更近 -->
                                                 <CheckBox x:Name="AskSaveLocationCheck"
                                                           Content="每次下载前询问保存位置"
                                                           Style="{StaticResource AppCheckBox}"
-                                                          Margin="0,12,0,0"
                                                           Click="OnSettingChanged"
-                                                          ToolTip="勾选后，每次点击「下载」会先弹出目录选择框，本次下载的文件保存到所选目录（不改动上面的全局下载目录）。批量任务会保留分享内的目录结构。"/>
+                                                          ToolTip="勾选后，每次点击「下载」会先弹出目录选择框，本次下载的文件保存到所选目录（不改动全局下载目录设置）。批量任务会保留分享内的目录结构。"/>
+                                                <CheckBox x:Name="AutoCleanCheck"
+                                                          Content="下载完成后自动清理云盘转存文件"
+                                                          Style="{StaticResource AppCheckBox}"
+                                                          Margin="0,12,0,0"
+                                                          Click="OnSettingChanged"/>
                                             </StackPanel>
                                         </Border>
 
@@ -1731,6 +1752,8 @@
                                                 <TextBlock Text="分片与缓存" Style="{StaticResource CardTitleText}"
                                                            FontSize="14" Margin="0,0,0,10"/>
 
+                                                <!-- 共写单一文件模式下没有分片/缓存目录，整块隐藏（UpdatePathRowsVisibility 联动） -->
+                                                <StackPanel x:Name="PartsRootRow">
                                                 <TextBlock Text="分片/缓存根目录" Style="{StaticResource BodyText}"
                                                            Margin="0,0,0,6"/>
                                                 <!-- 除「浏览…」外，再加一个「打开目录」按钮，
@@ -1745,7 +1768,7 @@
                                                              Style="{StaticResource AppTextBox}"
                                                              LostFocus="OnSettingChanged"
                                                              KeyDown="OnSettingKeyDown"
-                                                             ToolTip="默认与下载目录相同。指定到另一块盘（如 SSD）可减轻机械盘压力。"/>
+                                                             ToolTip="仅「独立分片」写入方式使用；单一文件模式的续传记录跟随目标文件（文件名.qmeta）。默认与下载目录相同。"/>
                                                     <Button Grid.Column="1" Content="浏览…" Click="OnBrowsePartsRoot"
                                                             Style="{StaticResource SecondaryButton}" Margin="8,0,0,0"/>
                                                     <Button Click="OnOpenPartsRoot"
@@ -1771,6 +1794,7 @@
                                                           Margin="0,12,0,0"
                                                           Click="OnSettingChanged"
                                                           ToolTip="只影响新建的分片目录是否隐藏，不影响下载功能。默认勾选。"/>
+                                                </StackPanel>
 
                                                 <TextBlock Text="写入方式" Style="{StaticResource FieldLabel}"
                                                            Margin="0,16,0,6"/>

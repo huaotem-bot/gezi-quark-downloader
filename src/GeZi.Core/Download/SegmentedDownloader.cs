@@ -19,11 +19,13 @@ using System.IO;
 using System.Linq;
 using System.Net;
 using System.Net.Http;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using GeZi.Core.Support;
+using Microsoft.Win32.SafeHandles;
 
 namespace GeZi.Core.Download
 {
@@ -42,8 +44,8 @@ namespace GeZi.Core.Download
         SegmentedFiles,
 
         /// <summary>
-        /// 多个 worker 直接写目标文件的各自区间（预分配满尺寸，峰值 1×，**无合并阶段**，
-        /// 下完即结束 —— 旧版 v2.2.0 的默认行为）。
+        /// 多个 worker 直接写目标文件的各自区间（文件为**稀疏文件**：逻辑长度撑到满尺寸、
+        /// 磁盘占用只随实际写入增长；峰值 1×，**无合并阶段**，下完即结束 —— 旧版 v2.2.0 的默认行为）。
         /// 代价：文件中间存在空洞，未下完时不是有效媒体文件，不可边下边播。
         /// </summary>
         SharedFile,
@@ -762,8 +764,16 @@ namespace GeZi.Core.Download
 
                 if (string.IsNullOrEmpty(fresh) || string.Equals(fresh, url, StringComparison.Ordinal))
                 {
-                    Log?.Invoke("未能取到新的直链（接口未返回或与旧链相同），本次任务中止，断点已保留。");
-                    break;
+                    // 取不到新链 ≠ 只能立刻放弃：23018/412 这类限流是**动态开关**的窗口
+                    // （2026-10-31 实测：关 10~60 分钟后自行重开，同请求即可通过）。
+                    // 等 60 秒回到循环头重试 —— refreshed 计数在循环里照常消耗，
+                    // 仍受 maxRefreshes 上限约束，不会无限等；窗口期内任务表现为
+                    // "原地等待"而不是"失败"，窗口重开后自动续传。
+                    Log?.Invoke(string.Format(
+                        "未取到新直链（限流窗口或接口异常，{0}），60 秒后重试（第 {1}/{2} 次），断点已保留。",
+                        Trim(msg, 60), refreshed, maxRefreshes));
+                    await Task.Delay(TimeSpan.FromSeconds(60), cancel).ConfigureAwait(false);
+                    continue;
                 }
 
                 url = fresh;
@@ -942,6 +952,33 @@ namespace GeZi.Core.Download
                 return false;
             int code;
             return int.TryParse(m.Groups[1].Value, out code) && code >= 400 && code < 500;
+        }
+
+        // ==================== 稀疏文件（共写模式不再预占磁盘） ====================
+        // 用户反馈：共写模式把目标文件 SetLength(total) 后，空间**当场**被整块占掉，
+        // 而文件在下完前毫无用处 —— 下载中/取消后这几 GB 全是"不存在的空间"。
+        // 解法：先把文件标记为 NTFS 稀疏文件（FSCTL_SET_SPARSE），再 SetLength(total) ——
+        //   · 逻辑长度仍 = total（续传对账、单线程兜底的 preallocated 判据都依赖它）；
+        //   · 「占用空间」只随真实写入增长，未写入区间不分配簇；
+        //   · 资源管理器「大小」列显示完整尺寸、「占用空间」列才是真实占用（同 qBittorrent）。
+        // 标记失败（exFAT/FAT32、极端精简系统）只是退回旧的整块预留行为，功能无损。
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool DeviceIoControl(SafeFileHandle hDevice, uint ioControlCode,
+            IntPtr inBuffer, uint inBufferSize, IntPtr outBuffer, uint outBufferSize,
+            out uint bytesReturned, IntPtr overlapped);
+
+        /// <summary>FSCTL_SET_SPARSE：把卷上文件标记为稀疏文件（NTFS）。</summary>
+        private const uint FsctlSetSparse = 0x000900C4;
+
+        private static void TryMarkSparse(SafeFileHandle handle)
+        {
+            try
+            {
+                uint ignored;
+                DeviceIoControl(handle, FsctlSetSparse, IntPtr.Zero, 0, IntPtr.Zero, 0,
+                    out ignored, IntPtr.Zero);
+            }
+            catch { }
         }
 
         private void ClearPartial(string dest)
@@ -1862,14 +1899,37 @@ namespace GeZi.Core.Download
                     foreach (var p in plan.Parts) p.W = 0;
                 }
 
-                // 预分配目标文件：空间立即预留（磁盘满在这里立刻暴露，
-                // 而不是下到一半才炸还留一堆垃圾）。
+                // 空间预检（与合并模式同款）：稀疏文件不再在建文件阶段占满空间，
+                // "磁盘满"改由真实写入时暴露 —— 先查一次，明确拒绝，别让用户下到一半才炸。
+                try
+                {
+                    string root = Path.GetPathRoot(Path.GetFullPath(dest));
+                    long haveW = 0;
+                    foreach (var p in plan.Parts) haveW += p.W;
+                    long need = total - haveW;
+                    var di = new DriveInfo(root);
+                    if (!string.IsNullOrEmpty(root) && di.IsReady && di.AvailableFreeSpace < need)
+                    {
+                        return (false, string.Format(
+                            "磁盘空间不足：本次还需 {0}，而 {1} 仅剩 {2}。请清理空间后重试（已下载的部分会保留，可续传）。",
+                            Fmt(need), root, Fmt(di.AvailableFreeSpace)));
+                    }
+                }
+                catch { }
+
+                // 预分配目标文件（**稀疏**）：逻辑长度撑到 total，但只有真实写入的区间
+                // 占磁盘 —— 下载中/取消后不再整块占用"不存在的空间"。
+                // 逻辑长度必须 = total：上面的续传对账（dLen < total 作废记账）和
+                // 单线程兜底的 preallocated 判据都依赖它。
                 // OpenOrCreate：续传时必须保留已有内容，绝不能 Create 清掉。
                 try
                 {
                     using (var fs = new FileStream(dest, FileMode.OpenOrCreate, FileAccess.Write,
                                FileShare.ReadWrite | FileShare.Delete, 1, FileOptions.None))
+                    {
+                        TryMarkSparse(fs.SafeFileHandle);
                         fs.SetLength(total);
+                    }
                 }
                 catch (Exception ex)
                 {
@@ -1878,7 +1938,7 @@ namespace GeZi.Core.Download
 
                 SavePlan(metaPath, plan);
 
-                Log?.Invoke("写入方式: 共写单一文件（所有连接直写同一文件，下完即完成、无合并环节；下载中文件含未填充区间，不可边下边播）。");
+                Log?.Invoke("写入方式: 共写单一文件（所有连接直写同一文件，下完即完成、无合并环节；文件为稀疏文件，占用空间随下载增长，下载中不可边下边播）。");
             }
 
             var queue = new ConcurrentQueue<int>();

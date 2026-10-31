@@ -133,8 +133,11 @@ namespace GeZi.Core.Download
                 using (var linked = CancellationTokenSource.CreateLinkedTokenSource(globalCancel, job.Cancel.Token))
                 {
                     Report(progress, job, JobState.Downloading);
+                    // 分片根目录只对「独立分片」模式生效；单一文件（共写）的续传
+                    // 记账跟随目标文件（dest + ".qmeta"），不进 PartsRoot。
                     using (var dl = new SegmentedDownloader(threads: job.Threads, cookie: job.Cookie,
-                               partsRoot: job.PartsRoot, writeMode: job.WriteMode))
+                               partsRoot: job.WriteMode == WriteMode.SegmentedFiles ? job.PartsRoot : null,
+                               writeMode: job.WriteMode))
                     {
                         dl.Log = Log;
                         dl.Diagnostics = Diagnostics;

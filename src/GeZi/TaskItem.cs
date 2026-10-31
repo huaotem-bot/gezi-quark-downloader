@@ -36,7 +36,9 @@ namespace GeZi
         public JobState State
         {
             get => _state;
-            set { _state = value; OnChanged(nameof(State)); OnChanged(nameof(StatusText)); OnChanged(nameof(DetailText)); OnChanged(nameof(SpeedText)); OnChanged(nameof(CanPlay)); }
+            // 同值不重发：核心层每 500ms 的进度帧都会重赋一次当前状态，
+            // 无条件通知等于每帧白刷 5 个绑定，还会打进 MainWindow 的状态变化钩子。
+            set { if (_state == value) return; _state = value; OnChanged(nameof(State)); OnChanged(nameof(StatusText)); OnChanged(nameof(DetailText)); OnChanged(nameof(SpeedText)); OnChanged(nameof(CanPlay)); }
         }
 
         // ─────────────────────────────────────────────────────────────

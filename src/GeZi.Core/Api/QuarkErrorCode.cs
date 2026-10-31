@@ -41,6 +41,16 @@ namespace GeZi.Core.Api
         public const long ShareSaveCapacityInsufficientAlt = 23018;
 
         /// <summary>
+        /// 「download file size limit」：file/download 接口对大文件**拒发直链**的业务码。
+        /// <b>2026-10-31 实测</b>：限流窗口内该接口返回 <c>HTTP 400, code 23018,
+        /// message "download file size limit[fid]"</c>（服务端原文），同请求在窗口重开后即可通过 ——
+        /// 是动态开关的账号级限流，不是静态规则。⚠️ 与上面的 ShareSaveCapacityInsufficientAlt
+        /// 同码不同义：社区资料把 23018 记成「转存空间不足」，转存路径的容量判定（IsCapacityCode）
+        /// 保留兼容；下载取链路径按本常量的语义解读（见 QuarkClient.DescribeLinkError）。
+        /// </summary>
+        public const long DownloadFileSizeLimit = 23018;
+
+        /// <summary>
         /// 转存任务「成功」的终态值（/1/clouddrive/task 返回的 <c>data.status</c>）。
         /// 这个值是实测确认过的 —— 现有轮询逻辑一直以它作成功判据。
         /// </summary>

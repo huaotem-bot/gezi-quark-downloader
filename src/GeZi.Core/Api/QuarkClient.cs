@@ -175,6 +175,19 @@ namespace GeZi.Core.Api
             }
         }
 
+        /// <summary>
+        /// 下载取链失败时的文案加工：把限流类业务码翻译成用户能看懂、能行动的提示。
+        /// 23018 在 file/download 上是「大文件下载限制」（2026-10-31 实测：限流窗口内
+        /// 拒发直链、窗口重开后同请求可通过），不是转存路径那个「空间不足」含义。
+        /// </summary>
+        private static string DescribeLinkError(QuarkApiException ex)
+        {
+            if (AsLong(ex.Code) == QuarkErrorCode.DownloadFileSizeLimit)
+                return "触发夸克大文件下载限制(23018)：当前账号进入服务端限流窗口，"
+                     + "等待一段时间通常会自动解除，可稍后重试，或转存到自己网盘后再下载";
+            return null;
+        }
+
         private static object Check(object res, string what = "接口")
         {
             var d = AsDict(res);
@@ -717,7 +730,7 @@ namespace GeZi.Core.Api
                 }
                 catch (QuarkApiException ex)
                 {
-                    lastErr = ex.Message;
+                    lastErr = DescribeLinkError(ex) ?? ex.Message;
                 }
             }
 
@@ -764,7 +777,7 @@ namespace GeZi.Core.Api
                 }
                 catch (QuarkApiException ex)
                 {
-                    lastErr = ex.Message;
+                    lastErr = DescribeLinkError(ex) ?? ex.Message;
                 }
             }
 

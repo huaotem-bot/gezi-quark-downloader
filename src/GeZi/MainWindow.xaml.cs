@@ -265,6 +265,12 @@ namespace GeZi
                 new System.Windows.Controls.ScrollChangedEventHandler(OnFileListScrollChanged));
             _tasks.CollectionChanged += (s, e) =>
             {
+                // 每条任务挂上状态变化钩子（见 OnTaskItemStateChanged）：
+                // 只在这里挂，所有 _tasks.Add/Remove 路径就都被覆盖，不用逐个 Add 点去接。
+                if (e.NewItems != null)
+                    foreach (TaskItem t in e.NewItems) t.PropertyChanged += OnTaskItemStateChanged;
+                if (e.OldItems != null)
+                    foreach (TaskItem t in e.OldItems) t.PropertyChanged -= OnTaskItemStateChanged;
                 UpdateEmptyStates();
                 // 任务增删后同步分类 Tab 的计数（"共 N 条"）
                 UpdateTaskFilterCounts();
@@ -1495,6 +1501,23 @@ namespace GeZi
             {
                 Log("代理设置保存失败: " + ex.Message);
             }
+        }
+
+        /// <summary>
+        /// 「单文件并发连接数」旁的 ⚠ 按钮：二级窗口解释 HDD 寻道问题。
+        /// 高并发 = 大量分片随机写同一文件 —— SSD 无感；机械盘磁头来回寻道，
+        /// 并发越高有效速度越低，长时间满负载还加速损耗。
+        /// </summary>
+        private void OnThreadsHddTip(object sender, RoutedEventArgs e)
+        {
+            AppDialog.Show(this,
+                "「单文件并发连接数」越高，文件被切得越碎、写入越随机：\n\n"
+                + "· 固态硬盘（SSD）：随机写入很快，高并发没有问题，可放心用默认的 256。\n"
+                + "· 机械硬盘（HDD）：磁头要在盘片上不停来回寻道，并发越高寻道越频繁，"
+                + "速度可能不升反降，长时间满负载还会加速硬盘损耗。\n\n"
+                + "下载目录在机械硬盘上时，建议把并发调低到 16～64，「同时下载任务数」也控制在 1～2；"
+                + "SSD 用户无需调整。",
+                "机械硬盘（HDD）提示");
         }
 
         /// <summary>收到「剪贴板内容变了」的系统通知。</summary>
@@ -3320,7 +3343,8 @@ namespace GeZi
                 try { Directory.CreateDirectory(destDir); }
                 catch (Exception ex) { Log("创建下载目录失败: " + destDir + " — " + ex.Message); continue; }
 
-                string dest = PathUtil.UniquePath(Path.Combine(destDir, PathUtil.SanitizeFileName(it.Name)));
+                string dest = ResolveDownloadDest(destDir, it.Name);
+                if (dest == null) { Log("已跳过（用户取消）: " + it.Name); continue; }
                 var item = it;
                 jobs.Add(new DownloadJob
                 {
@@ -3449,7 +3473,8 @@ namespace GeZi
                     string destDir = Path.Combine(overrideRoot ?? _settings.OutDir, it.RelDir ?? "");
                     try { Directory.CreateDirectory(destDir); }
                     catch (Exception ex) { Log("创建下载目录失败: " + destDir + " — " + ex.Message); continue; }
-                    string dest = PathUtil.UniquePath(Path.Combine(destDir, PathUtil.SanitizeFileName(it.Name)));
+                    string dest = ResolveDownloadDest(destDir, it.Name);
+                    if (dest == null) { Log("已跳过（用户取消）: " + it.Name); continue; }
                     var item = it;   // 闭包捕获：每次循环一个新变量，避免所有回调指向同一个
                     jobs.Add(new DownloadJob
                     {
@@ -4096,6 +4121,11 @@ namespace GeZi
             {
                 Log("[" + item.Name + "] " + (u.State == JobState.Failed ? "失败" : "取消") + ": " + u.Error);
             }
+            // 失败 ≠ 丢进度：断点在磁盘上，告诉用户入口在哪（右键「恢复」）。
+            if (u.State == JobState.Failed && (item.Job?.Pending?.CanResume ?? false))
+            {
+                Log("[" + item.Name + "] 已下载的部分已保留，右键该任务选「恢复」可从断点继续（不会重下）。");
+            }
             if (u.Progress != null)
             {
                 item.Percent = u.Progress.Percent;
@@ -4134,8 +4164,10 @@ namespace GeZi
         private string _pendingSig;
 
         /// <summary>
-        /// 把当前"未完成"的任务（排队/下载/暂停）写进持久化记录，
-        /// 已完成的从记录里移除。供下次启动提示"有 N 个未完成任务"。
+        /// 把当前"未完成"的任务（排队/下载/暂停/失败）写进持久化记录，
+        /// 已完成/已取消的从记录里移除。供下次启动提示"有 N 个未完成任务"。
+        /// 失败也要进记录：断点（.qmeta/分片）在磁盘上留着，重启后启动对话框
+        /// 勾选「继续下载」即可续传；用户不想要时「仅移除记录」即可不再提醒。
         /// 节流：只有"未完成任务的名字 + 状态"组合变了才真正写盘 ——
         /// OnJobUpdate 每 500ms 就来一次，无条件写盘等于持续小额 IO。
         /// </summary>
@@ -4151,7 +4183,7 @@ namespace GeZi
                     if (t.Job.SkipPersist)
                         continue;
                     if (t.State == JobState.Queued || t.State == JobState.Downloading
-                        || t.State == JobState.Paused)
+                        || t.State == JobState.Paused || t.State == JobState.Failed)
                     {
                         sb.Append(t.Name).Append('|').Append(t.State).Append(';');
                         var pi = t.Job.Pending;
@@ -4456,6 +4488,35 @@ namespace GeZi
                 t.Job.ResumeJob();
                 t.State = JobState.Downloading;
                 Log("已恢复: " + t.Name);
+            }
+            else if (t.State == JobState.Failed && t.Job?.Pending != null)
+            {
+                // 失败任务走真正的「续传」：直链已失效，必须重新取链；
+                // 断点（.qmeta/分片）都还在磁盘上，新任务挂到同一 Dest 会自动接上。
+                // 复用启动续传那套链路（取链 + stoken 过期自动重解析），不做第二份实现。
+                var pi = t.Job.Pending;
+                var p = new PendingTask
+                {
+                    Name = t.Name,
+                    Dest = pi.Dest,
+                    Fid = pi.Fid,
+                    Token = pi.Token,
+                    FromShare = pi.FromShare,
+                    Size = t.Total > 0 ? t.Total : pi.Size,
+                    PwdId = pi.PwdId,
+                    Stoken = pi.Stoken,
+                    Passcode = pi.Passcode,
+                    RelDir = pi.RelDir,
+                    StartFid = pi.StartFid,
+                    ShareRelDir = pi.ShareRelDir,
+                };
+                if (!p.CanResume)
+                {
+                    Log("[" + t.Name + "] 该任务缺少续传所需信息（如免转存的分享凭证），无法恢复，请重新下载。");
+                    return;
+                }
+                Log("正在为 [" + t.Name + "] 重新获取直链，将从断点继续（不会重下）…");
+                _ = ResumePendingBatchAsync(new List<PendingTask> { p }, new List<TaskItem> { t });
             }
             else
             {
@@ -5055,6 +5116,23 @@ namespace GeZi
                 default:
                     return true;
             }
+        }
+
+        /// <summary>
+        /// 任务状态变化时让当前分类 Tab 立即跟上。
+        /// ICollectionView 的 Filter 只在 Refresh() 或集合增删时重新求值，
+        /// 单纯改 item.State（INPC 属性）不会触发 —— 用户停在「失败/已完成」页上时，
+        /// 刚失败/完成的任务永远不出现，页面看起来像坏的（用户反馈「完全不显示」）。
+        /// State 已在 TaskItem 里同值去重，这里只会被真正的状态翻转打到，
+        /// 不会吃进度帧；Refresh 仅在非「全部」页才需要（全部页本就都显示，
+        /// 且 Refresh 会重建视图，白白打断滚动位置和多选）。
+        /// </summary>
+        private void OnTaskItemStateChanged(object sender, PropertyChangedEventArgs e)
+        {
+            if (e.PropertyName != nameof(TaskItem.State)) return;
+            if (_taskFilter == "all" || _taskView == null) return;
+            _taskView.Refresh();
+            UpdateTaskFilterCounts();
         }
 
         /// <summary>
@@ -5784,7 +5862,13 @@ namespace GeZi
             return null;
         }
 
-        private async Task ResumePendingBatchAsync(List<PendingTask> tasks)
+        /// <summary>
+        /// 重取直链并把一批任务重新入队（启动续传与失败任务「恢复」共用）。
+        /// <paramref name="staleItems"/> 与 <paramref name="tasks"/> 按下标一一对应：
+        /// 某条成功取到新链时，把对应的旧任务行（如「失败」行）从列表移除，由新行接替；
+        /// 取链失败的保留旧行，用户不至于两头落空。
+        /// </summary>
+        private async Task ResumePendingBatchAsync(List<PendingTask> tasks, List<TaskItem> staleItems = null)
         {
             // 「弹出续传窗口时我点继续下载，但左下角的账号卡
             //  还没显示登录，这时会怎么样？」
@@ -5813,10 +5897,12 @@ namespace GeZi
 
             SetBusy(true);
             var jobs = new List<DownloadJob>();
+            var staleToRemove = new List<TaskItem>();
             try
             {
-                foreach (var p in tasks)
+                for (int i = 0; i < tasks.Count; i++)
                 {
+                    var p = tasks[i];
                     try
                     {
                         string url = null;
@@ -5828,6 +5914,10 @@ namespace GeZi
                             // stoken 一般几小时~几天就过期，过期后这一路必失败。
                             // 交给 GetShareLinkWithReResolveAsync：旧凭证失败就自动重解析分享
                             // （换新 stoken + 新 share_fid_token）再试 —— 用户点一次续传即自愈。
+                            // 此处不可加 ConfigureAwait(false)：本方法 await 之后还要回 UI 线程
+                            // （_tasks.Add / SetBusy / RunJobs）。甩到后台线程会抛
+                            // InvalidOperationException，而调用点是 fire-and-forget 无人观察，
+                            // 整批续传就静默死亡（startup-error.log 2026-10-31 实录）。
                             url = await GetShareLinkWithReResolveAsync(
                                 client, p.Fid, p.Token, p.PwdId, p.Stoken, p.Passcode,
                                 p.StartFid, p.ShareRelDir,
@@ -5838,7 +5928,7 @@ namespace GeZi
                                     // 写回记录：下面构造 job.Pending 时 Stoken = p.Stoken 用的就是新值
                                     p.Stoken = freshStoken;
                                     p.Token = freshToken;
-                                }, default(CancellationToken)).ConfigureAwait(false);
+                                }, default(CancellationToken));
                         }
                         else
                         {
@@ -5881,6 +5971,8 @@ namespace GeZi
                         // 免转存任务续传取不到新链（stoken 过期）→ 失败文案要说"需重新解析分享"
                         job.ResumeCannotRefresh = p.FromShare;
                         jobs.Add(job);
+                        if (staleItems != null && i < staleItems.Count && staleItems[i] != null)
+                            staleToRemove.Add(staleItems[i]);
                     }
                     catch (Exception ex)
                     {
@@ -5894,6 +5986,9 @@ namespace GeZi
                     return;
                 }
 
+                // 先摘旧行再挂新行：失败/被接替的行不在了，列表不会出现同一文件两行。
+                foreach (var old in staleToRemove)
+                    _tasks.Remove(old);
                 foreach (var job in jobs)
                     _tasks.Add(new TaskItem(job, job.Name));
                 Log("已续传 " + jobs.Count + " 个任务。");
@@ -6265,6 +6360,8 @@ namespace GeZi
                 UseSystemProxyCheck.IsChecked = _settings.UseSystemProxy;
                 // 外观主题：把配置里的选择回填到三个单选（_applyingSettings 已挡掉 Checked）
                 SyncThemeRadios();
+                // 按回填结果联动路径行显隐（下载目录 / 分片缓存目录）
+                UpdatePathRowsVisibility();
             }
             finally
             {
@@ -6544,6 +6641,7 @@ namespace GeZi
                     ? WriteMode.SharedFile
                     : WriteMode.SegmentedFiles;
                 _settings.AskSaveLocation = AskSaveLocationCheck.IsChecked == true;
+                UpdatePathRowsVisibility();
                 _settings.OnCloseButton = (CloseAction)Math.Max(0,
                     Math.Min(2, CloseActionBox.SelectedIndex));
 
@@ -6556,6 +6654,20 @@ namespace GeZi
             {
                 Log("设置保存失败：" + ex.Message);
             }
+        }
+
+        /// <summary>
+        /// 设置页路径行的联动显隐（启动回填与任意改动都会调用）：
+        ///   · 勾选「每次下载前询问保存位置」→ 每次都会现选目录，全局下载目录行用不上，隐藏；
+        ///   · 写入方式 = 共写单一文件 → 全程没有分片/缓存目录，整块隐藏（含「隐藏分片目录」）。
+        /// 只动 Visibility，控件值照常参与保存，取消勾选/切回分片后原样恢复。
+        /// </summary>
+        private void UpdatePathRowsVisibility()
+        {
+            OutDirRow.Visibility = AskSaveLocationCheck.IsChecked == true
+                ? Visibility.Collapsed : Visibility.Visible;
+            PartsRootRow.Visibility = WriteModeSharedRadio.IsChecked == true
+                ? Visibility.Collapsed : Visibility.Visible;
         }
 
         /// <summary>
@@ -6616,13 +6728,11 @@ namespace GeZi
         {
             string start = (PartsRootBox.Text ?? "").Trim();
             if (string.IsNullOrEmpty(start)) start = _settings.OutDir;
-            using (var dlg = new System.Windows.Forms.FolderBrowserDialog { SelectedPath = start })
+            string picked = FolderPicker.Pick(this, start, null);
+            if (picked != null)
             {
-                if (dlg.ShowDialog() == System.Windows.Forms.DialogResult.OK)
-                {
-                    PartsRootBox.Text = dlg.SelectedPath;
-                    ApplySettings();   // 即时生效（没有"保存"按钮了）
-                }
+                PartsRootBox.Text = picked;
+                ApplySettings();   // 即时生效（没有"保存"按钮了）
             }
         }
 
@@ -6631,28 +6741,77 @@ namespace GeZi
 
         /// <summary>
         /// 「每次下载前询问保存位置」开关开启时，点下载弹出的目录选择框。
-        /// 复用 OnBrowsePartsRoot 同款 FolderBrowserDialog（WinForms 自带，零新依赖）。
-        /// 返回 null = 用户取消；选中结果**仅对本次下载生效**，不改动全局下载目录。
+        /// 用 Windows 自带的现代目录框（FolderPicker：IFileDialog + FOS_PICKFOLDERS，
+        /// 有地址栏、能粘贴路径）。返回 null = 用户取消；
+        /// 选中结果**仅对本次下载生效**，不改动全局下载目录。
         /// 起始目录：本次会话上次选的 > 全局下载目录。
         /// </summary>
         private string PickDownloadFolder()
         {
             string start = _lastPickedDownloadDir;
             if (string.IsNullOrEmpty(start)) start = _settings.OutDir;
-            using (var dlg = new System.Windows.Forms.FolderBrowserDialog
+            string picked = FolderPicker.Pick(this,
+                string.IsNullOrEmpty(start) ? AppDomain.CurrentDomain.BaseDirectory : start,
+                "选择本次下载的保存位置（仅对本次下载生效）");
+            if (picked == null)
+                return null;
+            _lastPickedDownloadDir = picked;
+            return picked;
+        }
+
+        /// <summary>
+        /// 决定一次下载的落盘路径。目标目录已有同名文件时先问用户（按有无断点分流）：
+        ///   · 检测到 .qmeta（有未完成断点）→「继续下载 / 重新下载」：
+        ///     继续下载 = Dest 原样交回，核心层按 .qmeta 对账接着已下载的部分传，不删任何数据；
+        ///     重新下载 = 删掉旧文件与断点（.qmeta/分片），从零开始。
+        ///   · 无断点 →「重新下载 / 取消」：删掉重下，或跳过该文件。
+        /// 不再提供「另存 (1)(2)」：下载目录就是落盘的地方，同名即同一个任务。
+        /// 只在**新建任务**入口调用；续传用的是记录里的 Dest，不经过这里（续传不该弹窗）。
+        /// 返回 null = 用户取消，调用方跳过该文件。
+        /// </summary>
+        private string ResolveDownloadDest(string destDir, string rawName)
+        {
+            string candidate = Path.Combine(destDir, PathUtil.SanitizeFileName(rawName));
+            if (!File.Exists(candidate))
+                return candidate;
+
+            // 断点判据：目标文件旁有 .qmeta（下载器续传对账读的就是它）。
+            if (File.Exists(candidate + ".qmeta"))
             {
-                SelectedPath = string.IsNullOrEmpty(start) ? AppDomain.CurrentDomain.BaseDirectory : start,
-                Description = "选择本次下载的保存位置（仅对本次下载生效）",
-                ShowNewFolderButton = true,
-            })
-            {
-                // 无 owner 调用（与 OnBrowsePartsRoot 同款）：WPF Window 不实现
-                // WinForms 的 IWin32Window，直接传 this 会编译错 CS1503。
-                if (dlg.ShowDialog() != System.Windows.Forms.DialogResult.OK)
-                    return null;
-                _lastPickedDownloadDir = dlg.SelectedPath;
-                return dlg.SelectedPath;
+                // 槽位：左=OK、右=Cancel，X/Esc 也归 Cancel。
+                // 所以把「继续下载」（安全操作）放右边接住 Cancel：误按回车、误点 X
+                // 都不会误删 2GB 级的已下数据；「重新下载」必须显式去点左键。
+                var ans = AppDialog.ShowTwoButton(this,
+                    "保存位置已有同名文件：\n" + candidate
+                    + "\n\n检测到它有未完成的下载断点。"
+                    + "\n· 继续下载：接着已下载的部分往下传，不删任何数据"
+                    + "\n· 重新下载：删掉旧文件和断点，从零开始",
+                    "文件已存在",
+                    "重新下载", "继续下载",
+                    MessageBoxImage.Question,
+                    MessageBoxResult.Cancel);
+
+                if (ans == MessageBoxResult.Cancel)
+                    return candidate;          // 继续下载：同名 + .qmeta ⇒ 无损续传
+
+                // 重新下载：连 .qmeta 一起清 —— 否则新任务会被旧 .qmeta 接上，
+                // 变成"往旧数据里续写"，那不是重新下载的语义。
+                // 复用「删除本地文件」的同一轮删除：分片根目录的当前/历史位置都能覆盖到。
+                DeleteRound(candidate, out _, out _, new List<string>());
+                return candidate;
             }
+
+            var redownload = AppDialog.ShowTwoButton(this,
+                "保存位置已有同名文件：\n" + candidate
+                + "\n\n要删掉它重新下载吗？（关闭本窗则跳过该文件）",
+                "文件已存在",
+                "重新下载", "取消",
+                MessageBoxImage.Question,
+                MessageBoxResult.Cancel);
+            if (redownload != MessageBoxResult.OK)
+                return null;                   // 取消：跳过该文件，别动已有文件
+            DeleteRound(candidate, out _, out _, new List<string>());
+            return candidate;
         }
 
         /// <summary>
@@ -6744,13 +6903,11 @@ namespace GeZi
 
         private void OnBrowseOutDir(object sender, RoutedEventArgs e)
         {
-            using (var dlg = new System.Windows.Forms.FolderBrowserDialog { SelectedPath = _settings.OutDir })
+            string picked = FolderPicker.Pick(this, _settings.OutDir, null);
+            if (picked != null)
             {
-                if (dlg.ShowDialog() == System.Windows.Forms.DialogResult.OK)
-                {
-                    OutDirBox.Text = dlg.SelectedPath;
-                    ApplySettings();   // 即时生效（没有"保存"按钮了）
-                }
+                OutDirBox.Text = picked;
+                ApplySettings();   // 即时生效（没有"保存"按钮了）
             }
         }
 
