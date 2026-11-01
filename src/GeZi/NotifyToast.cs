@@ -1,4 +1,4 @@
-﻿// GeZi —— 多网盘下载器 (Multi-cloud downloader)
+// GeZi —— 多网盘下载器 (Multi-cloud downloader)
 // Copyright (C) 2026  Yi Yuan
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU Affero General Public License as published by
@@ -17,7 +17,15 @@ using System.Windows.Controls;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using System.Windows.Threading;
+using GeZi.Providers;
+using GeZi.Providers.Quark;
+using GeZi.Providers.Uc;
+using GeZi.Providers.Aliyun;
+using GeZi.Providers.Xunlei;
+using GeZi.Providers.Shared;
+using GeZi.Providers.Qr;
 
+using GeZi.Services;
 namespace GeZi
 {
     /// <summary>
@@ -76,7 +84,7 @@ namespace GeZi
             };
             // 用 SetResourceReference（= 代码版的 DynamicResource）：切主题时会**自己**变色。
             // 原来写的 TryFindResource(...) ?? fallback 是**快照**语义 —— 弹窗存活期间
-            // 用户手动切主题它不会变（虽然 toast 只有 3 秒，但既然统一走资源就统一到底）。
+            // 用户手动切主题它不会变（虽然 toast 只有 6 秒，但既然统一走资源就统一到底）。
             card.SetResourceReference(Border.BackgroundProperty, "SurfaceBrush");
             card.SetResourceReference(Border.BorderBrushProperty, "BorderBrushSoft");
 
@@ -126,6 +134,12 @@ namespace GeZi
             MouseEnter += (s, e) => _timer.Stop();
             MouseLeave += (s, e) => { _timer.Stop(); _timer.Start(); };
             MouseLeftButtonUp += (s, e) => Close();
+            // Esc 关掉：toast 抢了焦点时，键盘用户总得有办法把它弄走，
+            // 否则只能等它自己超时（或去够鼠标）。
+            PreviewKeyDown += (s, e) =>
+            {
+                if (e.Key == System.Windows.Input.Key.Escape) { Close(); e.Handled = true; }
+            };
             Loaded += (s, e) => DialogChrome.ApplyRoundedCorners(this);
             Closed += (s, e) =>
             {
@@ -156,7 +170,13 @@ namespace GeZi
                 t.Place();
                 t._timer.Start();
             }
-            catch { }
+            catch (Exception ex)
+            {
+                // 通知弹不出来**绝不能**影响主流程（它只是个提示），所以照旧吞掉，
+                // 但至少留一条可查的痕迹 —— 原来这里是裸 catch{}，
+                // 出问题时连"通知失败了"都不知道，只能看到"该有提示的地方没提示"。
+                System.Diagnostics.Debug.WriteLine("NotifyToast.Show 失败：" + ex);
+            }
         }
 
         /// <summary>

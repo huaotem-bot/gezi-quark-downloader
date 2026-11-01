@@ -1,0 +1,93 @@
+<!--
+    诊断表格
+    ============================================================
+    本文件是原 Styles.xaml（1930 行）按职责拆出的资源字典之一（2026-10-24 代码规范化）。
+    拆分原则：只按行区间搬运，成员文本一字未改；App.xaml 的合并顺序与拆分前一致。
+
+    规格要求（全项目通用，详见 Styles.Typography.xaml 头部）：
+      · 字体 Microsoft YaHei UI
+      · 数字/速度用 Consolas + TextFormattingMode="Display"（防跳动）
+      · 8px 栅格间距：4 / 8 / 12 / 16 / 24 / 32
+      · 圆角：卡片 12 / 按钮 8 / 输入框 10 / 徽章 6 / 导航项 8
+      · Style 用 StaticResource 引，颜色在 Style 内用 DynamicResource
+-->
+
+<ResourceDictionary xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+                    xmlns:sys="clr-namespace:System;assembly=mscorlib">
+
+
+    <!-- ============================================================
+         分割线
+         ============================================================ -->
+
+    <!-- ============================================================
+         诊断面板的表格
+         ============================================================
+         WPF 的 DataGrid 默认是「系统表格」观感：灰渐变表头 + 蓝底选中格 +
+         每格一圈边框。放在这套自绘界面里非常突兀（用户反馈「这个地方的 ui 也太丑了」）。
+         这里把表头 / 行 / 单元格全部换成主题令牌：表头是浅灰小字、行无边框、
+         悬停浅底、选中用主色浅底，网格线只保留很淡的横向分隔。
+    -->
+    <Style x:Key="DiagColumnHeader" TargetType="DataGridColumnHeader">
+        <Setter Property="Background" Value="Transparent"/>
+        <Setter Property="Foreground" Value="{DynamicResource TextTertiaryBrush}"/>
+        <Setter Property="FontSize" Value="11.5"/>
+        <Setter Property="FontWeight" Value="Normal"/>
+        <Setter Property="Padding" Value="12,0"/>
+        <Setter Property="Height" Value="32"/>
+        <Setter Property="HorizontalContentAlignment" Value="Left"/>
+        <Setter Property="VerticalContentAlignment" Value="Center"/>
+        <Setter Property="Template">
+            <Setter.Value>
+                <ControlTemplate TargetType="DataGridColumnHeader">
+                    <!-- 只用一条很淡的下边框当分隔，不要系统那套立体表头 -->
+                    <Border Background="{TemplateBinding Background}"
+                            BorderBrush="{DynamicResource BorderBrushSoft}"
+                            BorderThickness="0,0,0,1"
+                            Padding="{TemplateBinding Padding}">
+                        <ContentPresenter HorizontalAlignment="Left" VerticalAlignment="Center"/>
+                    </Border>
+                </ControlTemplate>
+            </Setter.Value>
+        </Setter>
+    </Style>
+
+    <Style x:Key="DiagCell" TargetType="DataGridCell">
+        <Setter Property="BorderThickness" Value="0"/>
+        <Setter Property="Padding" Value="12,0"/>
+        <Setter Property="VerticalContentAlignment" Value="Center"/>
+        <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}"/>
+        <Setter Property="Template">
+            <Setter.Value>
+                <ControlTemplate TargetType="DataGridCell">
+                    <Border Background="Transparent" Padding="{TemplateBinding Padding}">
+                        <ContentPresenter VerticalAlignment="Center"/>
+                    </Border>
+                </ControlTemplate>
+            </Setter.Value>
+        </Setter>
+        <!-- 去掉系统那圈蓝底"当前单元格"高亮（截图里最扎眼的就是它） -->
+        <Style.Triggers>
+            <Trigger Property="IsSelected" Value="True">
+                <Setter Property="Background" Value="Transparent"/>
+                <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}"/>
+            </Trigger>
+        </Style.Triggers>
+    </Style>
+
+    <Style x:Key="DiagRow" TargetType="DataGridRow">
+        <Setter Property="Background" Value="Transparent"/>
+        <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}"/>
+        <Setter Property="BorderThickness" Value="0"/>
+        <Style.Triggers>
+            <Trigger Property="IsMouseOver" Value="True">
+                <Setter Property="Background" Value="{DynamicResource SurfaceAltBrush}"/>
+            </Trigger>
+            <Trigger Property="IsSelected" Value="True">
+                <Setter Property="Background" Value="{DynamicResource SurfaceSunkenBrush}"/>
+            </Trigger>
+        </Style.Triggers>
+    </Style>
+
+</ResourceDictionary>

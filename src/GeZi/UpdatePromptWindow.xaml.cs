@@ -1,4 +1,4 @@
-﻿// GeZi —— 多网盘下载器 (Multi-cloud downloader)
+// GeZi —— 多网盘下载器 (Multi-cloud downloader)
 // Copyright (C) 2026  Yi Yuan
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU Affero General Public License as published by
@@ -13,7 +13,14 @@
 
 using System;
 using System.Windows;
-using GeZi.Core.Update;
+using GeZi.Services;
+using GeZi.Providers;
+using GeZi.Providers.Quark;
+using GeZi.Providers.Uc;
+using GeZi.Providers.Aliyun;
+using GeZi.Providers.Xunlei;
+using GeZi.Providers.Shared;
+using GeZi.Providers.Qr;
 
 namespace GeZi
 {
@@ -76,9 +83,11 @@ namespace GeZi
                 if (!ShellLaunch.OpenUrl(url))
                     AppDialog.Show(this, "打开浏览器失败，请手动访问：\n\n" + url, "更新");
             }
-            catch (Exception ex)
+            catch (Exception)
             {
-                AppDialog.Show(this, "打开浏览器失败：" + ex.Message, "更新");
+                // 两种失败（ShellLaunch 返回 false / 抛异常）给同一句可操作的话：
+                // 直接把网址摆出来让用户手动复制，不再贴异常原文。
+                AppDialog.Show(this, "打开浏览器失败，请手动访问：\n\n" + url, "更新");
             }
             try { Close(); } catch { }
         }

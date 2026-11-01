@@ -16,14 +16,22 @@ using System.Collections.Generic;
 using System.IO;
 using System.Xml.Serialization;
 using GeZi.Core.Support;
+using GeZi.Providers;
+using GeZi.Providers.Quark;
+using GeZi.Providers.Uc;
+using GeZi.Providers.Aliyun;
+using GeZi.Providers.Xunlei;
+using GeZi.Providers.Shared;
+using GeZi.Providers.Qr;
 
+using GeZi.Services;
 namespace GeZi
 {
     public class AppSettings
     {
         /// <summary>
         /// 单任务下载线程数（= 单文件最大并发连接）。默认 64，与 Python Flet 版一致
-        /// （core 的 DOWNLOAD_THREADS 也是 64）。上限见 SegmentedDownloader.MaxRealConcurrency。
+        /// （core 的 DOWNLOAD_THREADS 也是 64）。上限见 ChunkSplitter.MaxRealConcurrency。
         /// </summary>
         /// <summary>
         /// 单文件并发连接数。
@@ -40,6 +48,23 @@ namespace GeZi
         /// ⚠️ 默认值只影响新用户；老配置里已有的值不会被覆盖。
         /// </summary>
         public int Threads { get; set; } = 256;
+
+        /// <summary>
+        /// 目标在<b>机械盘</b>时的连接数上限（= 同时进行的 Range 请求数）。
+        /// <para>
+        /// 为什么机械盘要单独限：随机写的代价是磁头寻道（约 10 ms/次），
+        /// 512 条连接各写各的偏移 = 每秒上千次寻道，磁盘根本跟不上。
+        /// 所以机械盘上「并发越低越快」，与固态盘完全相反。
+        /// </para>
+        /// <para>
+        /// <b>默认 128</b>（2026-10-25 从 32 上调）：原来 32 是按「64 包 / 16 MB 批次」
+        /// 推算的保守值，后来机械盘的写合并批次放大到 512 包 / 64 MB，
+        /// 32 路会把网络饿死（夸克单连接约 51 KB/s，32 路只有 1.6 MB/s）。
+        /// 重算后 128 路 + 64 MB 批次约能到 12~25 MB/s，寻道压力仍可控。
+        /// </para>
+        /// <para>用户可以自己调：设置页「机械盘连接上限」。调低更护盘，调高更快。</para>
+        /// </summary>
+        public int HddMaxConcurrency { get; set; } = 128;
 
         public int ConcurrentTasks { get; set; } = 3;
         public string OutDir { get; set; } = "";
@@ -66,10 +91,71 @@ namespace GeZi
         public string PartsRoot { get; set; } = "";
 
         /// <summary>
-        /// 是否把分片目录设为「隐藏」。移植自 Python Flet 版的 hide_parts。
-        /// 只影响新建的分片目录在资源管理器里是否显示（不影响功能）。
+        /// 落盘方式：<b>-1 = 自动（默认）</b>，0 = 强制顺序写，1 = 强制随机写。
+        /// 存 int 而不是枚举，理由同 ActivePanKind：将来枚举增删值不会让整份配置反序列化失败。
+        /// <para><b>2026-10-24 起固定为 1（共写 + 16 MB 写合并）</b>，不再由用户选择。
+        /// 预分配 + 多连接各写最终偏移 + 批量排序刷盘 = 没有合并阶段，
+        /// 固态盘与机械盘走同一套（机械盘的寻道代价由写合并窗口压到每 16 MB 2~4 段）。</para>
+        /// <para>字段保留只为兼容老配置文件：读到 -1（旧的「自动」）或 0（旧的「顺序写」）
+        /// 都不再改变行为，调度器恒走共写。<see cref="GeZi.DownloadEngine.Storage.SequentialFileStorage"/>
+        /// 实现保留作兜底，但不再自动选用。</para>
+        /// <para>
+        /// 🚨 2026-10-28 兼容性修复：这个字段原来是枚举 <c>WriteMode</c>，
+        /// 老配置里存的是枚举**名字**（如 <c>&lt;StorageMode&gt;SharedFile&lt;/StorageMode&gt;</c>）。
+        /// 后来枚举被物理删除、字段改成 <c>int</c> —— 于是老用户升级后
+        /// <c>XmlSerializer</c> 在解析这一行时直接抛 <c>InvalidOperationException</c>，
+        /// 而 <c>LoadCore</c> 的 catch 会把它吞掉并返回一份**全默认**的设置：
+        /// 用户所有设置归零、9 个网盘凭证全变空串，随后任意一次保存又把默认值写回磁盘
+        /// （配置文件没有 .bak，救不回来）。
+        /// </para>
+        /// <para>
+        /// 现在序列化面上暴露的是字符串 <see cref="StorageModeText"/>，
+        /// 数字与老的枚举名都能读进来，未知值一律当作当前的固定值 1。
+        /// 对外的 <see cref="StorageMode"/> 仍然是 int，调用方无需改动。
+        /// </para>
         /// </summary>
-        public bool HideParts { get; set; } = true;
+        [XmlIgnore]
+        public int StorageMode { get; set; } = 1;
+
+        /// <summary>
+        /// <see cref="StorageMode"/> 的序列化载体（映射到 XML 元素 <c>StorageMode</c>）。
+        /// 只为了让老配置里的枚举名字（<c>SharedFile</c> / <c>Sequential</c> / …）
+        /// 不再炸掉整份配置。写出去永远是数字。
+        /// </summary>
+        [XmlElement("StorageMode")]
+        public string StorageModeText
+        {
+            get { return StorageMode.ToString(System.Globalization.CultureInfo.InvariantCulture); }
+            set { StorageMode = ParseStorageMode(value); }
+        }
+
+        /// <summary>
+        /// 把配置里的落盘方式文本解析成 int。
+        /// <para>
+        /// 数字直接认；老枚举名按语义归类；认不出的一律回落到 1（当前的固定行为），
+        /// <b>绝不抛异常</b> —— 这个函数存在的意义就是让一份老配置不要毁掉其他所有字段。
+        /// </para>
+        /// </summary>
+        private static int ParseStorageMode(string raw)
+        {
+            if (string.IsNullOrWhiteSpace(raw))
+                return 1;
+            string v = raw.Trim();
+            int n;
+            if (int.TryParse(v, System.Globalization.NumberStyles.Integer,
+                    System.Globalization.CultureInfo.InvariantCulture, out n))
+                return n;
+            // 老枚举名（枚举本身已删除，这里只做字符串识别，不引用任何类型）
+            if (string.Equals(v, "Sequential", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(v, "Ordered", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(v, "SequentialFile", StringComparison.OrdinalIgnoreCase))
+                return 0;
+            if (string.Equals(v, "Auto", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(v, "Default", StringComparison.OrdinalIgnoreCase))
+                return -1;
+            // SharedFile / Shared / Merge / Random / Concurrent … 以及任何未知值
+            return 1;
+        }
 
         /// <summary>
         /// 曾经用过的分片根目录清单（最多 <see cref="PartsDirsMax"/> 个，最近使用的在末尾）。
@@ -192,6 +278,19 @@ namespace GeZi
         public string Who { get; set; } = "";
 
         /// <summary>
+        /// <see cref="Who"/> / <see cref="AvatarUrl"/> 这两项缓存**属于哪个账号**（账号稳定 uid）。
+        /// <para>
+        /// 为什么不用 Cookie 判断：Cookie 里的 <c>__puus</c> 约 3 小时刷新一次，
+        /// 每次刷新整串都变。早先的缓存判据是 <c>_settings.Cookie == cookie</c>，
+        /// 于是「切到另一个账号再切回来」几乎必然对不上 → 每次都要起 Python 桥
+        /// 重新抓昵称头像（进程启动 + TLS 握手 5~6 秒）—— 这正是用户反馈
+        /// 「一切换到夸克就特别慢」的主要来源。
+        /// 换成稳定的 uid 之后，同一账号反复切换直接命中缓存，不再起进程。
+        /// </para>
+        /// </summary>
+        public string WhoAccountKey { get; set; } = "";
+
+        /// <summary>
         /// 账号头像 URL（登录时从 account/info 探测到的）。
         /// 留空 = 拿不到 → 界面回退到"昵称首字"头像。
         /// 头像链接可能带时效，每次登录/启动校验都会重新探测覆盖。
@@ -234,7 +333,7 @@ namespace GeZi
         public bool MiniPosSet { get; set; }
 
         /// <summary>
-        /// 复制到剪贴板的夸克分享链接是否**自动解析**（2026-10-08 新增）。默认开启。
+        /// 复制到剪贴板的网盘分享链接是否**自动解析**（夸克/UC/阿里/迅雷）。默认开启。
         /// 关掉后程序根本不注册剪贴板监听（见 <see cref="MainWindow"/> 的 ApplyClipboardListener），
         /// 不是"监听但忽略"—— 关闭状态下零开销，也不存在"读用户剪贴板"这件事。
         /// </summary>
@@ -396,6 +495,13 @@ namespace GeZi
             catch (Exception ex)
             {
                 LastError = ex.Message;
+                // 🚨 2026-10-28：读失败**必须先把坏文件挪走**，再降级到默认值。
+                //   原来的行为是只记一句 LastError（而且全项目没人读它），
+                //   然后继续用一份全新的 AppSettings —— 紧接着任意一次 Save
+                //   就会用默认值把用户的配置文件整个覆盖掉：设置全丢、9 个网盘凭证全空，
+                //   而配置文件没有 .bak，事后完全无法恢复。
+                //   挪成 .broken-时间戳 之后，至少原件还在，用户/我们都能从里面救回 Cookie。
+                TryQuarantineBrokenConfig();
             }
 
             // 兼容旧版明文 Cookie：解出来是明文就原样用，下次 Save 时会被自动加密
@@ -415,13 +521,50 @@ namespace GeZi
             // 旧配置里可能存着 512/8192 这类超出范围的值，读进来时夹到有效范围，
             // 免得 UI 上落不到任何一个合法档位。上限取自核心层常量，避免两处失配。
             if (s.Threads <= 0) s.Threads = 256;   // 与上面 Threads 的默认值保持一致
-            if (s.Threads > GeZi.Core.Download.SegmentedDownloader.MaxRealConcurrency)
-                s.Threads = GeZi.Core.Download.SegmentedDownloader.MaxRealConcurrency;
+            if (s.Threads > GeZi.DownloadEngine.Planning.ChunkSplitter.MaxRealConcurrency)
+                s.Threads = GeZi.DownloadEngine.Planning.ChunkSplitter.MaxRealConcurrency;
+            // 机械盘上限：老配置文件里没有这个字段，反序列化后是 0 —— 必须补默认值，
+            // 否则会变成「机械盘 0 条连接」直接下不动。
+            if (s.HddMaxConcurrency <= 0) s.HddMaxConcurrency = 128;
+            if (s.HddMaxConcurrency > GeZi.DownloadEngine.Planning.ChunkSplitter.MaxRealConcurrency)
+                s.HddMaxConcurrency = GeZi.DownloadEngine.Planning.ChunkSplitter.MaxRealConcurrency;
             if (s.ConcurrentTasks <= 0) s.ConcurrentTasks = 3;
             // 老配置（没有 ClipboardAutoParseSet 节点）→ 按默认值「开」，
             // 而不是让 default(bool) 的 false 把功能悄悄关掉。见该属性的注释。
             if (!s.ClipboardAutoParseSet) s.ClipboardAutoParse = true;
             return s;
+        }
+
+        /// <summary>
+        /// 把读不动的配置文件改名留档（<c>GeZi.config.xml.broken-yyyyMMddHHmmss</c>）。
+        /// <para>
+        /// 目的只有一个：<b>别让下一次保存把用户的原始配置覆盖掉</b>。
+        /// 读失败意味着内存里是一份全默认值，这时候任何 Save 都是破坏性的；
+        /// 把原件挪走，至少 Cookie / 刷新令牌还能从里面手工救回来。
+        /// </para>
+        /// <para>改名本身失败也不能影响启动 —— 全程吞异常。</para>
+        /// </summary>
+        private static void TryQuarantineBrokenConfig()
+        {
+            try
+            {
+                if (!File.Exists(FilePath))
+                    return;
+                string dest = FilePath + ".broken-" + DateTime.Now.ToString("yyyyMMddHHmmss");
+                // 极端情况下同一秒内重复失败：加序号，绝不覆盖已有的留档
+                int n = 1;
+                while (File.Exists(dest))
+                {
+                    dest = FilePath + ".broken-" + DateTime.Now.ToString("yyyyMMddHHmmss") + "-" + n;
+                    n++;
+                }
+                File.Move(FilePath, dest);
+                LastError = (LastError ?? "") + "；原配置已留档为 " + Path.GetFileName(dest);
+            }
+            catch
+            {
+                // 挪不动就算了，至少 LastError 里还有原始异常信息
+            }
         }
 
         /// <summary>写配置。加锁 —— 见 <see cref="IoLock"/> 的说明（并发写会丢设置）。</summary>

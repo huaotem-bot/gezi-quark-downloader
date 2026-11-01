@@ -21,7 +21,15 @@ using System.Net;
 using System.Net.Sockets;
 using System.Text;
 using System.Threading;
+using GeZi.Providers;
+using GeZi.Providers.Quark;
+using GeZi.Providers.Uc;
+using GeZi.Providers.Aliyun;
+using GeZi.Providers.Xunlei;
+using GeZi.Providers.Shared;
+using GeZi.Providers.Qr;
 
+using GeZi.Services;
 namespace GeZi.SelfTest
 {
     /// <summary>

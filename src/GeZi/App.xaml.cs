@@ -20,10 +20,18 @@ using System.Text;
 using System.Threading;
 using System.Windows;
 using GeZi.Core.Support;
-
+using GeZi.Providers;
+using GeZi.Providers.Quark;
+using GeZi.Providers.Uc;
+using GeZi.Providers.Aliyun;
+using GeZi.Providers.Xunlei;
+using GeZi.Providers.Shared;
+using GeZi.Providers.Qr;
+using GeZi.DownloadEngine;
+using GeZi.Services;
 namespace GeZi
 {
-    public partial class App : Application
+    public partial class App : System.Windows.Application
     {
         /// <summary>
         /// 单实例互斥体。命名带 Global\ 前缀会跨用户会话（服务场景），
@@ -45,6 +53,21 @@ namespace GeZi
         internal static MainWindow MainWin;
 
         /// <summary>
+        /// 界面日志接收器（MainWindow 构造时挂上）：<c>(文本, 是否专业级)</c>。
+        ///
+        /// <para>
+        /// 🚨 为什么需要它（2026-11-01 用户反馈「日志里显示的东西不够全面」）：
+        /// 全局异常原来只写 <c>startup-error.log</c> —— 那个文件在 exe 目录里，
+        /// 界面上看不到、诊断包里也没有、<c>GeZi.log</c> 里也没有。
+        /// 于是用户遇到「程序遇到一个内部错误：当前状态不允许这个操作」时，
+        /// 切到「详细」档位也**一个字都看不到**，只能看到弹窗，完全没法自查。
+        /// 现在全局异常同时进界面日志 + <c>GeZi.log</c>，用户能直接看到发生了什么。
+        /// </para>
+        /// <para>启动早期（主窗口还没建）时为 null，此时只落盘。</para>
+        /// </summary>
+        internal static Action<string, bool> LogSink;
+
+        /// <summary>
         /// 启动期崩溃日志。写在 exe 同目录的 startup-error.log。
         /// 为什么需要：XAML 解析错误发生在 MainWindow 构造里，
         /// 此时 DispatcherUnhandledException 的弹窗可能还没来得及显示，
@@ -59,6 +82,27 @@ namespace GeZi
                 System.IO.File.AppendAllText(path,
                     DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + "  [" + where + "]\r\n"
                     + ex + "\r\n\r\n");
+            }
+            catch { }
+
+            // 🚨 同时进「界面日志 + GeZi.log」（2026-11-01 修）：
+            // 用户反馈「日志里显示的东西不够全面」—— 根因就是这里只写了 startup-error.log，
+            // 界面与诊断包里都看不到异常。异常属于日常级（不是过程细节），
+            // 所以在「简要」档位也要显示，否则用户还是看不到。
+            try
+            {
+                string brief = "[异常] " + ErrorText.Describe(ex) + "（" + where + "）";
+                var sink = LogSink;
+                if (sink != null)
+                {
+                    // MainWindow 已在：走它的日志管线（会同时落 GeZi.log）
+                    sink(brief, false);
+                }
+                else
+                {
+                    // 主窗口还没建（启动期崩溃）：至少落一份到 GeZi.log，重启后能看到
+                    LogStore.Append(brief);
+                }
             }
             catch { }
         }
@@ -76,14 +120,18 @@ namespace GeZi
                 // owner 传当前活动窗口（可能为 null → 自动居中屏幕）。
                 try
                 {
+                    // 不给用户看 ex.Message 原文（多半是英文 .NET 消息，用户看不懂也做不了什么）；
+                    // 只说发生了什么 + 下一步。原始异常已由 LogFatal 落盘。
                     AppDialog.Show(Current != null ? Current.MainWindow : null,
-                        "程序发生未处理错误：\n\n" + args.Exception.Message,
+                        "程序遇到一个内部错误：" + ErrorText.Describe(args.Exception)
+                        + "。\n\n已记录到日志。请重启后再试；若反复出现，请把日志反馈给我们。",
                         "鸽子下载", MessageBoxButton.OK, MessageBoxImage.Error);
                 }
                 catch
                 {
                     // 对话框自身失败时退回系统弹窗，保证用户至少能看到错误
-                    MessageBox.Show("程序发生未处理错误：\n\n" + args.Exception.Message,
+                    MessageBox.Show("程序遇到一个内部错误：" + ErrorText.Describe(args.Exception)
+                        + "。\n\n已记录到日志，请重启后再试。",
                         "鸽子下载", MessageBoxButton.OK, MessageBoxImage.Error);
                 }
                 args.Handled = true;

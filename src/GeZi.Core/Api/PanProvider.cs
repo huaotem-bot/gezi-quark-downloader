@@ -188,6 +188,20 @@ namespace GeZi.Core.Api
         Task<IReadOnlyList<DownloadLink>> GetOwnDownloadLinksAsync(
             IList<PanFileEntry> files, CancellationToken cancel = default);
 
+        /// <summary>
+        /// 清理「为了取直链而转存」到自己网盘的临时文件/目录。
+        /// <para>
+        /// 🚨 为什么必须由上层在**下载结束后**调用，而不是取完链就删：
+        /// 直链是 CDN 回源模式，源文件一删，正在下的分片全部回源失败
+        /// → 服务端 503 洪泛 + 速度掉到 1 MB/s 以下（实测过）。
+        /// </para>
+        /// <para>
+        /// 免转存取链的实现（没有转存动作）直接返回已完成任务即可。
+        /// </para>
+        /// </summary>
+        /// <param name="storedIds">取自 <see cref="DownloadLink.StoredId"/> 的 id 列表。</param>
+        Task CleanupStoredAsync(IList<string> storedIds, CancellationToken cancel = default);
+
         // ---------------- 自有网盘浏览 ----------------
         // 下面三个是"登录后能看到自己的东西"所需：校验登录态、列目录、查容量。
         // 没有它们，用户登录完只会看到一句"登录成功"，却看不到网盘里有什么

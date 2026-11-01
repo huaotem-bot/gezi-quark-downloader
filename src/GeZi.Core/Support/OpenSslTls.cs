@@ -18,6 +18,8 @@ using System.Net.Sockets;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography.X509Certificates;
 using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
 
 namespace GeZi.Core.Support
 {
@@ -213,6 +215,19 @@ namespace GeZi.Core.Support
 
         // ---------------- 响应 ----------------
 
+        /// <summary>
+        /// 单次响应体最多读多少字节（16 MB）。
+        /// <para>
+        /// 🚨 2026-11-01：原来调用处硬编码 65536（64KB）。UC 的
+        /// <c>/1/clouddrive/share/sharepage/detail</c> 在目录文件较多时响应超过 64KB
+        /// （实测 64970 字节处被切断）→ 最后一段字符串没闭合 →
+        /// 上层 JavaScriptSerializer 抛「ArgumentException: 传入了未终止的字符串」，
+        /// 表现为「HTTP 200 + code:0 却报加载目录失败」。
+        /// 目录类接口的响应再大也就几百 KB，16MB 是绝对安全的上限。
+        /// </para>
+        /// </summary>
+        private const int MaxResponseBytes = 16 * 1024 * 1024;
+
         /// <summary>一次请求的结果。</summary>
         public sealed class Response
         {
@@ -228,6 +243,16 @@ namespace GeZi.Core.Support
             /// <summary>从响应头里解析出的所有 Set-Cookie（**只取名字=值，不含属性**）。</summary>
             public readonly List<KeyValuePair<string, string>> Cookies =
                 new List<KeyValuePair<string, string>>();
+
+            /// <summary>
+            /// 响应体是否**可能被截断**（读满了 <see cref="MaxResponseBytes"/> 仍未结束）。
+            /// <para>
+            /// 2026-11-01 新增：原来 <c>ReadAll</c> 硬编码 64KB 上限，UC 的目录响应
+            /// 超过 64KB 就会被切掉最后一个字符串 → 上层 JSON 解析抛「未终止的字符串」，
+            /// 而 HTTP 状态是 200，极难定位。现在上限放大，并保留这个标记供排查。
+            /// </para>
+            /// </summary>
+            public bool Truncated;
 
             public bool Ok { get { return StatusCode >= 200 && StatusCode < 400; } }
         }
@@ -293,8 +318,19 @@ namespace GeZi.Core.Support
                 if (Native.SSL_write(ssl, req, req.Length) <= 0)
                     throw new IOException("SSL_write 失败: " + Native.ErrText());
 
-                byte[] raw = ReadAll(ssl, 65536);
-                return ParseResponse(raw);
+                // 🚨🚨 2026-11-01 修复（用户报「UC 网盘无法正常获取文件目录」的真根因）：
+                //    这里原来是硬编码 **65536（64KB）** 上限。
+                //    UC 的 /sharepage/detail 响应在文件多时会超过 64KB
+                //    （实测 64970 字节处被切断），于是 JSON 最后一个字符串没有闭合，
+                //    上层 JavaScriptSerializer 抛「ArgumentException: 传入了未终止的字符串」，
+                //    而 HTTP 状态是 200、code 是 0 —— 表现就是"服务端明明成功，界面却报加载失败"。
+                //    ⇒ 上限提到 16MB（目录响应再大也够），并显式检测是否真被截断。
+                byte[] raw = ReadAll(ssl, MaxResponseBytes);
+                var parsed = ParseResponse(raw);
+                // 若读满上限仍未结束，说明响应可能不完整 —— 让上层能看见，而不是静默解析失败。
+                if (raw.Length >= MaxResponseBytes)
+                    parsed.Truncated = true;
+                return parsed;
             }
             finally
             {
@@ -513,6 +549,348 @@ namespace GeZi.Core.Support
                 if (ssl != IntPtr.Zero) Native.SSL_free(ssl);
                 if (ctx != IntPtr.Zero) Native.SSL_CTX_free(ctx);
                 if (tcp != null) tcp.Close();
+            }
+        }
+
+        // ---------------- 分片流式通道（供下载引擎的 IChunkTransport 使用） ----------------
+
+        /// <summary>
+        /// 一个已经握手、发完请求、读完响应头的只读流；每次 <see cref="Read"/> 直接从 SSL 连接读，
+        /// 不把整个分片先攒进内存。给 bezzad 那类"按 Range 拿 Stream 再自己 Read"的引擎用。
+        /// </summary>
+        /// <remarks>
+        /// 与 <see cref="DownloadTo"/> 的区别：那个是"一次调用读完一段写进目标流"，
+        /// 这个是"交出一个 Stream，由调用方决定读多少、什么时候停"，因此支持引擎侧
+        /// 的暂停、取消、超时和慢连接抢占。
+        /// </remarks>
+        public sealed class OpenChunkStream : Stream
+        {
+            private IntPtr _ssl;
+            private IntPtr _ctx;
+            private TcpClient _tcp;
+            private readonly byte[] _readBuf = new byte[65536];
+            private byte[] _pending;
+            private int _pendingPos;
+            private int _pendingLen;
+            private long _remaining;
+            private volatile bool _disposed;
+            private int _disposeOnce;
+
+            // 🚨 2026-10-25 修「下 UC 大文件突然闪退」：
+            //    原来是 Dispose 里 _tcp.Close() 之后**立刻** SSL_free，
+            //    而此刻另一个线程可能正卡在 SSL_read 里面还没返回。
+            //    socket 关闭只是让 SSL_read 尽快出错，**不保证读线程已经离开
+            //    libssl 内部代码**；SSL_free 一执行，读线程再碰那块内存就是
+            //    use-after-free → 原生访问违规（0xC0000005）→ 托管层 catch 不到
+            //    → 进程直接消失（事件日志里栈顶就是 SSL_read）。
+            //    片数越多、抢占越频繁（UC 大文件必然如此）命中率越高。
+            //
+            // 修法：引用计数。读线程进 SSL_read 前 _readers++，出来后 --；
+            //    Dispose 只置「待释放」标记，最后一个退出的读线程负责真正 free。
+            //    这样 SSL_free 永远不可能和 SSL_read 并发，也不用任何锁阻塞取消。
+            private int _readers;
+            private int _freePending;
+            private int _freeOnce;
+
+            /// <summary>HTTP 状态码。</summary>
+            public int StatusCode { get; private set; }
+
+            /// <summary>响应头原文。</summary>
+            public string RawHeaders { get; private set; }
+
+            /// <summary><c>Content-Range</c> 起点（没有则 -1）。</summary>
+            public long ContentRangeStart { get; private set; }
+
+            /// <summary><c>Content-Range</c> 里的资源总长（没有则 -1）。</summary>
+            public long ContentRangeTotal { get; private set; }
+
+            /// <summary>响应头里的 <c>ETag</c>（没有则 null）。</summary>
+            public string ETag { get; private set; }
+
+            /// <summary>响应头里的 <c>Last-Modified</c>（没有则 null）。</summary>
+            public string LastModified { get; private set; }
+
+            internal OpenChunkStream(IntPtr ctx, IntPtr ssl, TcpClient tcp,
+                byte[] pending, int pendingLen, int statusCode, string rawHeaders,
+                long rangeStart, long rangeTotal, string etag, string lastModified,
+                long expected)
+            {
+                _ctx = ctx;
+                _ssl = ssl;
+                _tcp = tcp;
+                _pending = pending;
+                _pendingPos = 0;
+                _pendingLen = pendingLen;
+                StatusCode = statusCode;
+                RawHeaders = rawHeaders;
+                ContentRangeStart = rangeStart;
+                ContentRangeTotal = rangeTotal;
+                ETag = etag;
+                LastModified = lastModified;
+                _remaining = expected > 0 ? expected : -1;
+            }
+
+            public override bool CanRead { get { return !_disposed; } }
+            public override bool CanSeek { get { return false; } }
+            public override bool CanWrite { get { return false; } }
+            public override long Length { get { throw new NotSupportedException(); } }
+
+            public override long Position
+            {
+                get { throw new NotSupportedException(); }
+                set { throw new NotSupportedException(); }
+            }
+
+            public override int Read(byte[] buffer, int offset, int count)
+            {
+                if (buffer == null) throw new ArgumentNullException("buffer");
+                if (offset < 0 || count < 0 || offset + count > buffer.Length)
+                    throw new ArgumentOutOfRangeException("count");
+                if (_disposed) throw new ObjectDisposedException("OpenChunkStream");
+                if (count == 0) return 0;
+                if (_remaining == 0) return 0;
+
+                // 1. 先把响应头之后顺手读到的那点响应体吐出去
+                if (_pendingLen > _pendingPos)
+                {
+                    int n = Math.Min(count, _pendingLen - _pendingPos);
+                    Buffer.BlockCopy(_pending, _pendingPos, buffer, offset, n);
+                    _pendingPos += n;
+                    if (_remaining > 0) _remaining -= n;
+                    return n;
+                }
+                _pending = null;
+
+                // 2. 直接从 SSL 连接读（SSL_read 只能写进缓冲起点，所以先读进内部缓冲）
+                int want = count;
+                if (want > _readBuf.Length) want = _readBuf.Length;
+                if (_remaining > 0 && want > _remaining) want = (int)_remaining;
+
+                // 🚨 登记「我正在用原生句柄」，Dispose 看到 _readers > 0 就不会 free。
+                //    自增**必须**在检查 _disposed 之前：否则 Dispose 可能正好在
+                //    「检查通过」与「自增」之间读到 0 而释放句柄 → 这里拿到悬空指针。
+                Interlocked.Increment(ref _readers);
+                try
+                {
+                    if (_disposed || _ssl == IntPtr.Zero)
+                        throw new ObjectDisposedException("OpenChunkStream");
+
+                    int rc = Native.SSL_read(_ssl, _readBuf, want);
+                    if (rc > 0)
+                    {
+                        Buffer.BlockCopy(_readBuf, 0, buffer, offset, rc);
+                        if (_remaining > 0) _remaining -= rc;
+                        return rc;
+                    }
+
+                    int err = Native.SSL_get_error(_ssl, rc);
+                    // 连接被 Close() 强行打断：bezzad 靠 ObjectDisposedException 识别"读超时"
+                    if (_disposed) throw new ObjectDisposedException("OpenChunkStream");
+                    // 6 = SSL_ERROR_ZERO_RETURN，对端正常关闭，等价 EOF
+                    if (err == 6) return 0;
+                    // 5 = SSL_ERROR_SYSCALL：socket 被关闭或读超时
+                    if (err == 5) throw new IOException("OpenSSL 连接中断（SSL_ERROR_SYSCALL）");
+                    throw new IOException("SSL_read 失败 (SSL_get_error=" + err + "): " + Native.ErrText());
+                }
+                finally
+                {
+                    // 我是最后一个退出的读线程、且 Dispose 已经在等 → 由我来 free。
+                    if (Interlocked.Decrement(ref _readers) == 0
+                        && Volatile.Read(ref _freePending) != 0)
+                        FreeNative();
+                }
+            }
+
+            public override void Flush() { }
+            public override long Seek(long offset, SeekOrigin origin) { throw new NotSupportedException(); }
+            public override void SetLength(long value) { throw new NotSupportedException(); }
+            public override void Write(byte[] buffer, int offset, int count) { throw new NotSupportedException(); }
+
+            /// <summary>
+            /// 同步读的异步包装。
+            ///
+            /// **为什么必须重写**：<c>SSL_read</c> 本身就是阻塞调用，而 .NET Framework 4.8 里
+            /// <see cref="Stream.ReadAsync(byte[],int,int,CancellationToken)"/> 的默认实现会走
+            /// <c>BeginRead/EndRead</c> → 基类用 <c>Task.Run</c> 把同步 <c>Read</c> 丢到线程池。
+            /// 一个 186MB 的文件按 8~16KB 一次读，就是 **2 万多次线程池调度**，
+            /// 每次还伴随 bezzad 那边新建 <c>CancellationTokenSource</c> 与注册回调 ——
+            /// 实测把每连接吞吐从 168 KB/s 压到 28 KB/s（2.69 MB/s → 0.90 MB/s）。
+            ///
+            /// 这里直接在当前线程同步读、返回已完成的 Task。调用链
+            /// （<c>OpenSslChunkTransport</c> 已用 <c>Task.Run</c> 隔离）本来就在线程池线程上，
+            /// 因此不会阻塞 UI；效果等价于自研引擎「每个 worker 一条线程同步读」的模型。
+            /// 取消语义不变：连接被 <see cref="Dispose"/> 打断时 <see cref="Read"/> 抛
+            /// <c>ObjectDisposedException</c>，bezzad 据此识别读超时并重试。
+            /// </summary>
+            public override Task<int> ReadAsync(byte[] buffer, int offset, int count,
+                CancellationToken cancellationToken)
+            {
+                if (cancellationToken.IsCancellationRequested)
+                {
+                    var tcs = new TaskCompletionSource<int>();
+                    tcs.SetCanceled();
+                    return tcs.Task;
+                }
+
+                try
+                {
+                    return Task.FromResult(Read(buffer, offset, count));
+                }
+                catch (Exception ex)
+                {
+                    var tcs = new TaskCompletionSource<int>();
+                    tcs.SetException(ex);
+                    return tcs.Task;
+                }
+            }
+
+            /// <summary>
+            /// 关闭连接。**必须幂等** —— 这条流会被多层包装各释放一次：
+            /// <c>ThrottledStream.Dispose</c> → <c>_baseStream.Close()</c>，
+            /// 外层 <c>ChunkResponse.Dispose</c> → <c>Stream.Dispose()</c>，
+            /// 还有 bezzad 的取消注册 <c>cancelToken.Register(stream.Close)</c>。
+            /// 2026-10-24 实测踩到：原实现直接 <c>SSL_free(_ssl)</c> 且不置零，
+            /// 第二次进入就是 **double free** —— 进程以 0xC0000374（堆损坏）
+            /// 或 0xC0000005（访问冲突）直接崩，托管层 catch 不到，表现为
+            /// 「下到 10% 突然消失」且没有任何异常文本。
+            /// 片数越多（adaptive 256 片）释放路径越频繁，越容易命中。
+            /// 所以这里用 Interlocked 抢一个一次性标记，谁先到谁真正释放，
+            /// 并把句柄置零，后续调用直接返回。
+            /// </summary>
+            protected override void Dispose(bool disposing)
+            {
+                if (Interlocked.Exchange(ref _disposeOnce, 1) != 0)
+                    return;   // 已经释放过，绝不能再 SSL_free 一次
+
+                _disposed = true;
+
+                // 先断 socket：把卡在 SSL_read 里的线程尽快踢出来。
+                try { if (_tcp != null) { _tcp.Close(); _tcp = null; } } catch { }
+
+                // 再登记「待释放」。此刻如果还有读线程在 SSL_read 里，
+                // 由最后一个退出的那个负责 free（见 Read 的 finally）——
+                // 绝不在这里直接 SSL_free，那正是闪退的根因。
+                Interlocked.Exchange(ref _freePending, 1);
+                if (Volatile.Read(ref _readers) == 0)
+                    FreeNative();
+
+                base.Dispose(disposing);
+            }
+
+
+            /// <summary>
+            /// 真正释放原生句柄。**幂等**：Read 的 finally 与 Dispose 都可能调到这里，
+            /// 靠 <c>_freeOnce</c> 保证只生效一次。
+            /// ⚠️ 必须先 <c>SSL_free</c> 再 <c>SSL_CTX_free</c> —— 顺序反了同样是悬空指针。
+            /// </summary>
+            private void FreeNative()
+            {
+                if (Interlocked.Exchange(ref _freeOnce, 1) != 0)
+                    return;
+                try
+                {
+                    if (_ssl != IntPtr.Zero) { Native.SSL_free(_ssl); _ssl = IntPtr.Zero; }
+                }
+                catch { }
+                try
+                {
+                    if (_ctx != IntPtr.Zero) { Native.SSL_CTX_free(_ctx); _ctx = IntPtr.Zero; }
+                }
+                catch { }
+            }
+        }
+
+        /// <summary>
+        /// 走 OpenSSL 打开一个 Range 请求，返回可逐块读取的流（响应头已解析完毕）。
+        /// </summary>
+        /// <param name="host">主机名（同时用作 SNI 与 Host 头）。</param>
+        /// <param name="pathAndQuery">以 <c>/</c> 开头的路径 + 查询串。</param>
+        /// <param name="headers">额外请求头（Range 必填）。</param>
+        /// <param name="timeoutMs">连接超时。</param>
+        /// <param name="readTimeoutMs">单次读超时；&lt;=0 时沿用 <paramref name="timeoutMs"/>。</param>
+        /// <param name="expectedBytes">期望字节数；&gt;0 时读到这么多即 EOF，&lt;=0 时读到对端关闭。</param>
+        public static OpenChunkStream OpenChunk(string host, string pathAndQuery,
+            IDictionary<string, string> headers, int timeoutMs, int readTimeoutMs = 0,
+            long expectedBytes = 0)
+        {
+            if (string.IsNullOrEmpty(host)) throw new ArgumentNullException("host");
+            if (string.IsNullOrEmpty(pathAndQuery)) pathAndQuery = "/";
+            if (!pathAndQuery.StartsWith("/")) pathAndQuery = "/" + pathAndQuery;
+
+            EnsureProbed();
+            if (!_available)
+                throw new IOException("OpenSSL 不可用（" + _probeError + "）");
+
+            IntPtr ctx = IntPtr.Zero, ssl = IntPtr.Zero;
+            TcpClient tcp = null;
+            bool handoff = false;
+            try
+            {
+                OpenTls(host, timeoutMs, out ctx, out ssl, out tcp);
+                if (readTimeoutMs > 0) tcp.ReceiveTimeout = readTimeoutMs;
+
+                byte[] head = Encoding.UTF8.GetBytes(BuildRequest(host, "GET", pathAndQuery, headers, 0));
+                if (Native.SSL_write(ssl, head, head.Length) <= 0)
+                    throw new IOException("SSL_write 失败: " + Native.ErrText());
+
+                // 读响应头（到 \r\n\r\n 为止，上限 64 KiB）
+                var headerBuf = new MemoryStream();
+                byte[] buf = new byte[65536];
+                int headerEnd = -1;
+                byte[] sep = new byte[] { 13, 10, 13, 10 };
+                while (headerEnd < 0)
+                {
+                    int n = Native.SSL_read(ssl, buf, buf.Length);
+                    if (n <= 0)
+                    {
+                        int e = Native.SSL_get_error(ssl, n);
+                        if (headerBuf.Length == 0)
+                            throw new IOException("读响应头失败 (SSL_get_error=" + e + "): " + Native.ErrText());
+                        break;
+                    }
+                    headerBuf.Write(buf, 0, n);
+                    if (headerBuf.Length > 65536)
+                        throw new IOException("响应头超过 64 KiB，疑似不是 HTTP 响应");
+                    headerEnd = IndexOf(headerBuf.ToArray(), sep);
+                }
+
+                byte[] all = headerBuf.ToArray();
+                int bodyStart = headerEnd >= 0 ? headerEnd + 4 : all.Length;
+                byte[] headBytes = Sub(all, 0, headerEnd >= 0 ? headerEnd : all.Length);
+                string rawHeaders = Encoding.UTF8.GetString(headBytes);
+
+                var probe = new StreamResult();
+                ParseStatusAndRange(probe, rawHeaders);
+
+                int already = all.Length - bodyStart;
+                byte[] pending = new byte[already];
+                if (already > 0) Buffer.BlockCopy(all, bodyStart, pending, 0, already);
+
+                string etag = null, lastMod = null;
+                foreach (string ln in rawHeaders.Split(new[] { "\r\n" }, StringSplitOptions.None))
+                {
+                    int colon = ln.IndexOf(':');
+                    if (colon <= 0) continue;
+                    string name = ln.Substring(0, colon).Trim();
+                    string val = ln.Substring(colon + 1).Trim();
+                    if (string.Equals(name, "ETag", StringComparison.OrdinalIgnoreCase)) etag = val;
+                    else if (string.Equals(name, "Last-Modified", StringComparison.OrdinalIgnoreCase)) lastMod = val;
+                }
+
+                var stream = new OpenChunkStream(ctx, ssl, tcp, pending, already,
+                    probe.StatusCode, rawHeaders, probe.ContentRangeStart,
+                    probe.ContentRangeTotal, etag, lastMod, expectedBytes);
+                handoff = true;
+                return stream;
+            }
+            finally
+            {
+                if (!handoff)
+                {
+                    if (ssl != IntPtr.Zero) Native.SSL_free(ssl);
+                    if (ctx != IntPtr.Zero) Native.SSL_CTX_free(ctx);
+                    if (tcp != null) tcp.Close();
+                }
             }
         }
 

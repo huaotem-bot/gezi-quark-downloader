@@ -17,7 +17,16 @@
 using System;
 using System.Collections.Generic;
 using GeZi.Core.Models;
+using GeZi.Core.Support;
+using GeZi.Providers;
+using GeZi.Providers.Quark;
+using GeZi.Providers.Uc;
+using GeZi.Providers.Aliyun;
+using GeZi.Providers.Xunlei;
+using GeZi.Providers.Shared;
+using GeZi.Providers.Qr;
 
+using GeZi.Services;
 namespace GeZi
 {
     /// <summary>
@@ -37,8 +46,11 @@ namespace GeZi
     /// </summary>
     internal sealed class LinkCache
     {
-        /// <summary>直链缓存有效期（秒）。与 Python 版一致，取 600s = 10 分钟。</summary>
-        private const int TtlSeconds = 600;
+        /// <summary>
+        /// 直链缓存有效期（秒）。取自 <see cref="LinkLifetime.CacheSeconds"/>，
+        /// 必须小于服务端有效期，否则缓存命中时会直接发出死链。
+        /// </summary>
+        private const int TtlSeconds = LinkLifetime.CacheSeconds;
 
         private sealed class Entry
         {

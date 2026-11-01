@@ -1,4 +1,4 @@
-﻿// GeZi —— 多网盘下载器 (Multi-cloud downloader)
+// GeZi —— 多网盘下载器 (Multi-cloud downloader)
 // Copyright (C) 2026  Yi Yuan
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU Affero General Public License as published by
@@ -13,11 +13,20 @@
 
 using System;
 using System.Collections.Generic;
+using System.Runtime.CompilerServices;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Media;
 using System.Windows.Media.Animation;
+using GeZi.Providers;
+using GeZi.Providers.Quark;
+using GeZi.Providers.Uc;
+using GeZi.Providers.Aliyun;
+using GeZi.Providers.Xunlei;
+using GeZi.Providers.Shared;
+using GeZi.Providers.Qr;
 
+using GeZi.Services;
 namespace GeZi
 {
     /// <summary>
@@ -79,16 +88,28 @@ namespace GeZi
         private const int SlideMs = 200;
 
         /// <summary>
-        /// 动画进行中的截止时刻（UTC）。此期间 <see cref="OnContainerSizeChanged"/> 直接忽略，
-        /// 不做"无动画吸附"。
-        /// 滑块自己的 Width 动画会让容器（auto 宽）跟着变 → 触发 SizeChanged →
-        /// 旧代码在这里 MoveThumb(animate:false) → **第一帧就把动画打断、直接落到终值**，
-        /// 用户看到的就是"选中态瞬间跳过去，没有滑动"。
-        /// 实测复现（tmp-links/SepSlideProbe）：点击后 thumb x/Width 一步到位，无中间帧。
-        /// 同理，分段控件旁边 UI 显隐（获取直链对话框的"正在切换到…"提示行）也会
-        /// 改变容器高度 → 同样踩这个坑。
+        /// 每个分段控件各自的「动画截止时刻」。
+        /// <para>
+        /// 🚨 原来是一个 <c>private static DateTime _animUntil</c> —— 全程序五个分段控件
+        /// （模式 / 网盘页签 / 任务筛选 / 日志档位 / 主题）**共用同一个截止时刻**。
+        /// 后果：点了 A 控件之后 280ms 内，B 控件只要发生一次容器尺寸变化
+        /// （窗口缩放、字号变化、旁边提示行显隐），就会因为「动画中」而跳过吸附，
+        /// B 的滑块停在错位置，直到下次点击才纠正。
+        /// </para>
+        /// <para>
+        /// 用 <see cref="ConditionalWeakTable{TKey,TValue}"/> 而不是 Dictionary：
+        /// 键是控件，控件被回收时条目自动消失，不会像 Dictionary 那样把整棵可视树钉住。
+        /// </para>
         /// </summary>
-        private static DateTime _animUntil = DateTime.MinValue;
+        private sealed class AnimState { public DateTime Until = DateTime.MinValue; }
+
+        private static readonly ConditionalWeakTable<FrameworkElement, AnimState> _animStates =
+            new ConditionalWeakTable<FrameworkElement, AnimState>();
+
+        private static AnimState StateOf(FrameworkElement panel)
+        {
+            return panel == null ? new AnimState() : _animStates.GetOrCreateValue(panel);
+        }
 
         private static void OnIsEnabledChanged(DependencyObject d, DependencyPropertyChangedEventArgs e)
         {
@@ -117,9 +138,10 @@ namespace GeZi
         {
             // 容器变宽/变窄（窗口缩放、字号变化）后重新吸附，不用动画。
             // ⚠️ 但动画进行中必须跳过：滑块 Width 动画本身就会改变容器尺寸，
-            //    在这里重置会把 200ms 滑动在第 1 帧打成瞬移（见 _animUntil 注释）。
-            if (DateTime.UtcNow < _animUntil) return;
-            MoveThumb(sender as FrameworkElement, animate: false);
+            //    在这里重置会把 200ms 滑动在第 1 帧打成瞬移（见 _animStates 注释）。
+            var panel = sender as FrameworkElement;
+            if (DateTime.UtcNow < StateOf(panel).Until) return;
+            MoveThumb(panel, animate: false);
         }
 
         private static void OnAnyChecked(object sender, RoutedEventArgs e)
@@ -128,7 +150,7 @@ namespace GeZi
             // 布局未完成（初始 IsChecked）时 ActualWidth=0，交给 Loaded 兜底
             if (panel == null || !panel.IsLoaded) return;
             // 宽限 80ms：真正挡住的是动画头几帧内的 SizeChanged，不是整段动画
-            _animUntil = DateTime.UtcNow.AddMilliseconds(SlideMs + 80);
+            StateOf(panel).Until = DateTime.UtcNow.AddMilliseconds(SlideMs + 80);
             MoveThumb(panel, animate: true);
         }
 
@@ -145,6 +167,16 @@ namespace GeZi
 
             // 目标位置 = 选中项左上角相对滑块父容器的偏移
             var parent = thumb.Parent as FrameworkElement ?? panel;
+
+            // 🚨 2026-10-26 最终结论（用户二次反馈 + 截图对照）：
+            //   「滑块宽度 = 按钮整体宽度」。
+            //   中间那版改成按**文字宽度**算（贴合文字），结果相邻按钮的滑块之间留出缝隙，
+            //   四个网盘页签切换时中间会露出一截空白 —— 用户原话「那四个网盘不是一个整体，
+            //   切换滑块的时候中间会有断的部分」。
+            //   正解：滑块覆盖整个按钮，相邻按钮的滑块恰好**首尾相接**，
+            //   视觉上就是一条连续的线在滑动，整体感才成立；
+            //   「贴合文字」的观感由按钮自身的左右 Padding（10,4 / 18,7）保证，
+            //   不需要再单独缩窄滑块。
             Point at = target.TranslatePoint(new Point(0, 0), parent);
             double x = at.X;
             double w = target.ActualWidth;

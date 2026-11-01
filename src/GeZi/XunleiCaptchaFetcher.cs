@@ -6,7 +6,15 @@ using GeZi.Core.Api;
 using GeZi.Core.Support;
 using Microsoft.Web.WebView2.Core;
 using Microsoft.Web.WebView2.Wpf;
+using GeZi.Providers;
+using GeZi.Providers.Quark;
+using GeZi.Providers.Uc;
+using GeZi.Providers.Aliyun;
+using GeZi.Providers.Xunlei;
+using GeZi.Providers.Shared;
+using GeZi.Providers.Qr;
 
+using GeZi.Services;
 namespace GeZi
 {
     /// <summary>
@@ -37,6 +45,24 @@ namespace GeZi
         private const int WaitMs = 12000;
 
         /// <summary>
+        /// 「现在能不能开 WebView2」的判据（由 <c>MainWindow</c> 挂上）。
+        ///
+        /// <para>
+        /// 🚨 这个取码器和「内嵌登录」窗口用的是**同一个 WebView2 用户数据目录**
+        /// （<c>profile-xunlei</c>，见 <see cref="WebView2Runtime.CreateIsolatedDataFolder"/>）。
+        /// 而 WebView2 对同一个用户数据目录**不允许两个环境同时打开** ——
+        /// 用户正在内嵌登录页里操作时，这里再开一个只会静默失败，
+        /// 表现为「刷新列表一直失败、日志里什么都没有」。
+        /// </para>
+        /// <para>
+        /// 更不能给它换一个独立目录：迅雷的 deviceid 与 captcha 是**成对**签发的，
+        /// 换目录就换了设备号，captcha 直接判 <c>client_id not match</c>。
+        /// 所以正确做法是「登录窗口开着时不要抢」，等它关掉再取。
+        /// </para>
+        /// </summary>
+        public static Func<bool> IsBlocked { get; set; }
+
+        /// <summary>
         /// 打开一次隐藏的 WebView2，读出网页当前的 captcha 与 deviceid。
         /// 失败返回 <c>(null, null)</c>，调用方按「没有可用 captcha」处理。
         /// </summary>
@@ -45,6 +71,19 @@ namespace GeZi
             var app = Application.Current;
             if (app == null)
                 return (null, null);
+
+            // 内嵌登录窗口正开着 → 同一个 profile 抢不到，直接放弃。
+            // 返回 null 让调用方走「暂时没有 captcha」的降级，而不是去开一个必然失败的窗口。
+            try
+            {
+                var blocked = IsBlocked;
+                if (blocked != null && blocked())
+                    return (null, null);
+            }
+            catch
+            {
+                return (null, null);
+            }
 
             try
             {

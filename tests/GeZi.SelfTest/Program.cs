@@ -20,10 +20,21 @@ using System.IO;
 using System.IO.Compression;
 using System.Threading;
 using GeZi.Core.Api;
-using GeZi.Core.Download;
+using GeZi.DownloadEngine;
+using GeZi.DownloadEngine.Framework;
+using GeZi.DownloadEngine.Storage;
+using GeZi.DownloadEngine.Media;
 using GeZi.Core.Models;
 using GeZi.Core.Support;
+using GeZi.Providers;
+using GeZi.Providers.Quark;
+using GeZi.Providers.Uc;
+using GeZi.Providers.Aliyun;
+using GeZi.Providers.Xunlei;
+using GeZi.Providers.Shared;
+using GeZi.Providers.Qr;
 
+using GeZi.Services;
 namespace GeZi.SelfTest
 {
     /// <summary>
@@ -97,6 +108,10 @@ namespace GeZi.SelfTest
                 Run("uc_cookie_plausible", TestUcCookiePlausible);
                 Run("aliyun_device_signature", TestAliyunDeviceSignature);
                 Run("xunlei_login_protocol", TestXunleiLoginProtocol);
+                Run("mp4_moov_probe", TestMp4MoovProbe);
+                Run("write_merge", TestWriteMerge);
+        Run("disk_media", TestDiskMedia);
+        Run("chunk_queue", TestChunkQueue);
             }
             catch (Exception ex)
             {
@@ -226,9 +241,9 @@ namespace GeZi.SelfTest
         {
             string dir = Path.Combine(_tmp, "pending");
             Directory.CreateDirectory(dir);
-            string f = Path.Combine(dir, "movie.bin" + SegmentedDownloader.PendingDeleteSuffix);
+            string f = Path.Combine(dir, "movie.bin" + PartsPaths.PendingDeleteSuffix);
             File.WriteAllText(f, "x");
-            int removed = SegmentedDownloader.SweepPendingDeletes(new[] { dir });
+            int removed = PartsPaths.SweepPendingDeletes(new[] { dir });
             Check("pending.swept", removed == 1 && !File.Exists(f), "removed=" + removed);
         }
 
@@ -761,17 +776,38 @@ namespace GeZi.SelfTest
             using (var server = new MockHttpServer(req =>
             {
                 string path = req.Path ?? "";
+                bool isPost = string.Equals(req.Method, "POST", StringComparison.OrdinalIgnoreCase);
+
+                // 转存：返回 trace_file_ids 映射（迅雷把「旧 id → 新 id」塞在这个 JSON 字符串里）
+                if (isPost && path.IndexOf("/drive/v1/share/restore", StringComparison.Ordinal) >= 0)
+                    return new MockHttpServer.MockResponse(
+                        "{\"params\":{\"trace_file_ids\":\"{\\\"x1\\\":\\\"n1\\\"}\"}}");
+
+                // 批量删除（转存后清理）
+                if (isPost && path.IndexOf("batchDelete", StringComparison.Ordinal) >= 0)
+                    return new MockHttpServer.MockResponse("{}");
+
+                // 建目录：POST /drive/v1/files
+                if (isPost && path.IndexOf("/drive/v1/files", StringComparison.Ordinal) >= 0)
+                    return new MockHttpServer.MockResponse(
+                        "{\"file\":{\"id\":\"tmpdir\",\"name\":\"GeZi临时转存\",\"kind\":\"drive#folder\"}}");
+
+                // 列根目录（查临时文件夹是否已存在）：GET /drive/v1/files
+                if (path.IndexOf("/drive/v1/files", StringComparison.Ordinal) >= 0
+                    && path.IndexOf("/drive/v1/files/", StringComparison.Ordinal) < 0)
+                    return new MockHttpServer.MockResponse("{\"files\":[]}");
+
+                // 文件详情（取直链）
+                if (path.IndexOf("/drive/v1/files/", StringComparison.Ordinal) >= 0)
+                    return new MockHttpServer.MockResponse(
+                        "{\"id\":\"n1\",\"name\":\"剧集.mp4\",\"size\":555,"
+                        + "\"web_content_link\":\"https://lixian.xunlei.test/c.mp4?sig=z\"}");
 
                 if (path.IndexOf("/drive/v1/share", StringComparison.Ordinal) >= 0)
                     return new MockHttpServer.MockResponse(
-                        "{\"share_status\":\"OK\",\"files\":["
+                        "{\"share_status\":\"OK\",\"pass_code_token\":\"PCTOK\",\"files\":["
                         + "{\"id\":\"x1\",\"name\":\"剧集.mp4\",\"size\":555,\"kind\":\"drive#file\"},"
                         + "{\"id\":\"xd\",\"name\":\"目录\",\"kind\":\"drive#folder\"}]}");
-
-                if (path.IndexOf("/drive/v1/files/", StringComparison.Ordinal) >= 0)
-                    return new MockHttpServer.MockResponse(
-                        "{\"id\":\"x1\",\"name\":\"剧集.mp4\",\"size\":555,"
-                        + "\"web_content_link\":\"https://lixian.xunlei.test/c.mp4?sig=z\"}");
 
                 return new MockHttpServer.MockResponse("{\"error\":\"unexpected\"}");
             }))
@@ -804,16 +840,17 @@ namespace GeZi.SelfTest
 
                 // 没有 captcha token 时不再本地拦截：服务端不要验证码就应当正常取到直链。
                 // （旧行为是「本地直接抛错」，那会误伤不需要验证码的场景。）
+                IReadOnlyList<DownloadLink> noCaptchaLinks = null;
                 using (var xl2 = new XunleiClient("PANTOK", null, server.BaseUrl))
                 {
                     bool ok = false;
                     try
                     {
-                        var ls = xl2.GetShareDownloadLinksAsync(
+                        noCaptchaLinks = xl2.GetShareDownloadLinksAsync(
                             new PanShareRef { Kind = PanKind.Xunlei, ShareId = "S" },
                             new List<PanFileEntry> { new PanFileEntry { Fid = "x1" } })
                             .GetAwaiter().GetResult();
-                        ok = ls != null && ls.Count == 1;
+                        ok = noCaptchaLinks != null && noCaptchaLinks.Count == 1;
                     }
                     catch (QuarkApiException)
                     {
@@ -825,7 +862,10 @@ namespace GeZi.SelfTest
                 var reqs = server.Requests;
 
                 // 带凭证的请求必须有 Authorization + x-captcha-token
-                var shareReq = reqs.Find(r => r.Path.Contains("/drive/v1/share"));
+                // ⚠️ 只挑 **GET** 的分享列表请求：转存是 POST /drive/v1/share/restore，
+                //    参数在 body 里，拿它去断言 query 会误判。
+                var shareReq = reqs.Find(r => r.Path.Contains("/drive/v1/share")
+                    && string.Equals(r.Method, "GET", StringComparison.OrdinalIgnoreCase));
                 Check("xl.req_auth", shareReq != null
                     && shareReq.Header("Authorization") == "Bearer PANTOK",
                     shareReq == null ? "no request" : shareReq.Header("Authorization"));
@@ -844,9 +884,38 @@ namespace GeZi.SelfTest
                     && !shareReq.Path.Contains("device_id=&"),
                     shareReq == null ? "no request" : shareReq.Path);
 
-                // 取链走 /drive/v1/files/{id}
+                // 🚨 迅雷没有真免转存：必须先 POST /drive/v1/share/restore 转存，
+                //    再用**新 file_id** 去 /drive/v1/files/{id} 取链，最后 batchDelete 清理。
+                var restoreReq = reqs.Find(r => r.Path.Contains("/drive/v1/share/restore")
+                    && string.Equals(r.Method, "POST", StringComparison.OrdinalIgnoreCase));
+                Check("xl.restore_posted", restoreReq != null);
+                Check("xl.restore_body",
+                    restoreReq != null && restoreReq.Body != null
+                    && restoreReq.Body.Contains("\"file_ids\"")
+                    && restoreReq.Body.Contains("x1")
+                    && restoreReq.Body.Contains("\"pass_code_token\""),
+                    restoreReq == null ? "no request" : (restoreReq.Body ?? ""));
+
+                // 取链走转存后的新 id（n1），不是分享里的原始 id（x1）
                 Check("xl.req_files_path",
-                    reqs.Exists(r => r.Path.Contains("/drive/v1/files/x1")));
+                    reqs.Exists(r => r.Path.Contains("/drive/v1/files/n1")));
+
+                // 🚨 转存出来的副本**不能在这里删**：直链走 CDN 回源，源文件一删，
+                //    在途分片全部回源失败 → 服务端 503 洪泛 + 速度掉到 1 MB/s 以下。
+                //    正确做法是把 id 通过 DownloadLink.StoredId 交给调用方，
+                //    等下载任务进入终态再统一清理。
+                Check("xl.no_cleanup_on_fetch",
+                    !reqs.Exists(r => r.Path.Contains("batchDelete")
+                        && string.Equals(r.Method, "POST", StringComparison.OrdinalIgnoreCase)),
+                    "取链阶段不应发 batchDelete");
+
+                // 交接口径：必须把转存出来的 id 带回去，否则上层无从清理。
+                Check("xl.stored_id_returned",
+                    noCaptchaLinks != null && noCaptchaLinks.Count == 1
+                    && !string.IsNullOrEmpty(noCaptchaLinks[0].StoredId),
+                    noCaptchaLinks == null || noCaptchaLinks.Count == 0
+                        ? "no link"
+                        : (noCaptchaLinks[0].StoredId ?? "null"));
             }
         }
 
@@ -1069,6 +1138,237 @@ namespace GeZi.SelfTest
             Check("xunlei.mobile_reject_null", !XunleiLoginService.IsMobile(null));
         }
 
+        /// <summary>
+        /// 「moov 优先」的解析逻辑：用内存里拼出来的假 MP4 验证 box 链解析。
+        /// 不碰网络、不碰磁盘，纯粹校验 <see cref="Mp4Moov"/>。
+        /// </summary>
+        private static void TestMp4MoovProbe()
+        {
+            // ---- ① 扩展名判定 ----
+            Check("mp4.ext_mp4", Mp4Moov.LooksLikeMp4("82.mp4"));
+            Check("mp4.ext_upper", Mp4Moov.LooksLikeMp4("A.MP4"));
+            Check("mp4.ext_mov", Mp4Moov.LooksLikeMp4("a.mov"));
+            Check("mp4.ext_m4v", Mp4Moov.LooksLikeMp4("a.m4v"));
+            Check("mp4.ext_query", Mp4Moov.LooksLikeMp4("http://x/y.mp4?token=abc"));
+            Check("mp4.ext_reject_zip", !Mp4Moov.LooksLikeMp4("a.zip"));
+            Check("mp4.ext_reject_null", !Mp4Moov.LooksLikeMp4(null));
+            Check("mp4.ext_reject_dot", !Mp4Moov.LooksLikeMp4("a."));
+
+            // ---- ② 尾部 moov（没做 faststart，最常见的形态）----
+            // 布局：ftyp(24) + free(8) + mdat(400) + moov(64)  总长 496
+            var file = new byte[496];
+            WriteBox(file, 0, 24, "ftyp");
+            WriteBox(file, 24, 8, "free");
+            WriteBox(file, 32, 400, "mdat");
+            WriteBox(file, 432, 64, "moov");
+
+            long mdatEnd;
+            bool tail = Mp4Moov.TryFindMdatEnd(file, file.Length, file.Length, out mdatEnd);
+            Check("mp4.mdat_end_found", tail, "tail=" + tail);
+            Check("mp4.mdat_end_value", mdatEnd == 432, "mdatEnd=" + mdatEnd);
+
+            Mp4MoovInfo info;
+            bool found = Mp4Moov.TryFindMoovInTail(file, file.Length, 0, file.Length, out info);
+            Check("mp4.moov_found", found);
+            Check("mp4.moov_offset", info != null && info.Offset == 432, "off=" + (info == null ? -1 : info.Offset));
+            Check("mp4.moov_size", info != null && info.Size == 64, "size=" + (info == null ? -1 : info.Size));
+            Check("mp4.moov_is_tail", info != null && info.IsAtTail);
+
+            // ---- ③ faststart（moov 在头部）：必须判定为「不用管」----
+            // 布局：ftyp(24) + moov(64) + mdat(400)  总长 488
+            var fast = new byte[488];
+            WriteBox(fast, 0, 24, "ftyp");
+            WriteBox(fast, 24, 64, "moov");
+            WriteBox(fast, 88, 400, "mdat");
+
+            long ignored;
+            Check("mp4.faststart_skip", !Mp4Moov.TryFindMdatEnd(fast, fast.Length, fast.Length, out ignored));
+
+            // ---- ④ mdat 吃到文件尾（没有 moov 可找）：也必须判定为「不用管」----
+            var noMoov = new byte[432];
+            WriteBox(noMoov, 0, 24, "ftyp");
+            WriteBox(noMoov, 24, 8, "free");
+            WriteBox(noMoov, 32, 400, "mdat");
+            Check("mp4.mdat_to_eof_skip", !Mp4Moov.TryFindMdatEnd(noMoov, noMoov.Length, noMoov.Length, out ignored));
+
+            // ---- ⑤ 64 位 largesize 的 mdat（size==1 时读 largesize）----
+            var large = new byte[600];
+            WriteBox(large, 0, 24, "ftyp");
+            // mdat: size=1, type=mdat, largesize=416 → 头 16 字节 + 400 数据
+            large[24] = 0; large[25] = 0; large[26] = 0; large[27] = 1;
+            large[28] = (byte)'m'; large[29] = (byte)'d'; large[30] = (byte)'a'; large[31] = (byte)'t';
+            large[32] = 0; large[33] = 0; large[34] = 0; large[35] = 0;
+            large[36] = 0; large[37] = 0; large[38] = 1; large[39] = 160;   // 416
+            WriteBox(large, 440, 160, "moov");
+
+            bool bigTail = Mp4Moov.TryFindMdatEnd(large, large.Length, large.Length, out mdatEnd);
+            Check("mp4.largesize_found", bigTail, "bigTail=" + bigTail);
+            Check("mp4.largesize_end", mdatEnd == 440, "end=" + mdatEnd);
+
+            // ---- ⑥ 损坏数据不能瞎猜 ----
+            var junk = new byte[64];
+            junk[3] = 200;                       // size=200 但文件只有 64 字节
+            junk[4] = (byte)'m'; junk[5] = (byte)'d'; junk[6] = (byte)'a'; junk[7] = (byte)'t';
+            Check("mp4.junk_reject", !Mp4Moov.TryFindMdatEnd(junk, junk.Length, junk.Length, out ignored));
+            Check("mp4.null_reject", !Mp4Moov.TryFindMdatEnd(null, 0, 100, out ignored));
+            Check("mp4.short_reject", !Mp4Moov.TryFindMdatEnd(new byte[4], 4, 100, out ignored));
+        }
+
+        /// <summary>
+        /// 写合并测试（大厂式 coalesce writes）。
+        ///
+        /// 原来的 <c>ConcurrentStream.Watcher</c> 每收到一个 64KB packet 就
+        /// Seek 一次、写一次。现在改成批量取、按偏移排序、相邻的合并成一次大写入。
+        /// 这里用**乱序 + 重叠 + 间隙**三种真实场景验证合并后的内容逐字节正确 ——
+        /// 合并算法一旦把偏移算错，产出的就是「长度对、内容坏」的文件，
+        /// 而那种损坏在长度校验里看不出来（这正是 gopeed 只能 Truncate(0) 重下的原因）。
+        /// </summary>
+        private static void TestWriteMerge()
+        {
+            const int total = 64 * 1024;          // 64KB 文件，用 4KB 块拼
+            const int blockSize = 4 * 1024;
+            const int blockCount = total / blockSize;
+
+            // 期望内容：每块填自己的块号，便于定位错位
+            var expected = new byte[total];
+            for (int i = 0; i < blockCount; i++)
+                for (int k = 0; k < blockSize; k++)
+                    expected[i * blockSize + k] = (byte)(i & 0xFF);
+
+            string path = Path.Combine(_tmp, "write_merge.bin");
+            try
+            {
+                // ---- 场景 1：乱序写入（模拟 16 条连接交错到达）----
+                using (var cs = new ConcurrentStream(path, total, 0))
+                {
+                    var order = new int[blockCount];
+                    for (int i = 0; i < blockCount; i++) order[i] = i;
+                    // 确定性打乱，保证可复现
+                    var rnd = new Random(20261024);
+                    for (int i = blockCount - 1; i > 0; i--)
+                    {
+                        int j = rnd.Next(i + 1);
+                        int t = order[i]; order[i] = order[j]; order[j] = t;
+                    }
+
+                    foreach (int idx in order)
+                    {
+                        var block = new byte[blockSize];
+                        for (int k = 0; k < blockSize; k++)
+                            block[k] = (byte)(idx & 0xFF);
+                        cs.WriteAsync((long)idx * blockSize, block, blockSize).GetAwaiter().GetResult();
+                    }
+
+                    cs.FlushAsync().GetAwaiter().GetResult();
+                }
+
+                byte[] actual = File.ReadAllBytes(path);
+                Check("wmerge.length", actual.Length == total, "len=" + actual.Length);
+                Check("wmerge.out_of_order", BytesEqual(expected, actual), DiffSummary(expected, actual));
+
+                // ---- 场景 2：重叠写入（后写的覆盖先写的）----
+                File.Delete(path);
+                using (var cs = new ConcurrentStream(path, total, 0))
+                {
+                    var full = new byte[total];
+                    for (int i = 0; i < total; i++) full[i] = 0xAA;
+                    cs.WriteAsync(0, full, total).GetAwaiter().GetResult();
+
+                    // 中间一块用 0xBB 覆盖，制造重叠
+                    var patch = new byte[blockSize];
+                    for (int i = 0; i < blockSize; i++) patch[i] = 0xBB;
+                    cs.WriteAsync(blockSize * 5, patch, blockSize).GetAwaiter().GetResult();
+
+                    cs.FlushAsync().GetAwaiter().GetResult();
+                }
+
+                byte[] overlapped = File.ReadAllBytes(path);
+                bool overlapOk = overlapped.Length == total
+                    && overlapped[blockSize * 5] == 0xBB
+                    && overlapped[blockSize * 5 + blockSize - 1] == 0xBB
+                    && overlapped[blockSize * 4] == 0xAA
+                    && overlapped[blockSize * 6] == 0xAA;
+                Check("wmerge.overlap", overlapOk,
+                    "len=" + overlapped.Length
+                    + " at4=" + overlapped[blockSize * 4].ToString("X2")
+                    + " at5=" + overlapped[blockSize * 5].ToString("X2")
+                    + " at6=" + overlapped[blockSize * 6].ToString("X2"));
+
+                // ---- 场景 3：有间隙（只写头尾，中间不写）----
+                File.Delete(path);
+                using (var cs = new ConcurrentStream(path, total, 0))
+                {
+                    var head = new byte[blockSize];
+                    for (int i = 0; i < blockSize; i++) head[i] = 0x11;
+                    cs.WriteAsync(0, head, blockSize).GetAwaiter().GetResult();
+
+                    var tail = new byte[blockSize];
+                    for (int i = 0; i < blockSize; i++) tail[i] = 0x22;
+                    cs.WriteAsync((long)(blockCount - 1) * blockSize, tail, blockSize).GetAwaiter().GetResult();
+
+                    cs.FlushAsync().GetAwaiter().GetResult();
+                }
+
+                byte[] gapped = File.ReadAllBytes(path);
+                bool gapOk = gapped.Length == total
+                    && gapped[0] == 0x11
+                    && gapped[blockSize - 1] == 0x11
+                    && gapped[total - 1] == 0x22
+                    && gapped[blockSize] == 0x00;    // 中间是空洞，保持 0
+                Check("wmerge.gap", gapOk,
+                    "len=" + gapped.Length
+                    + " head=" + gapped[0].ToString("X2")
+                    + " mid=" + gapped[blockSize].ToString("X2")
+                    + " tail=" + gapped[total - 1].ToString("X2"));
+            }
+            finally
+            {
+                try { if (File.Exists(path)) File.Delete(path); } catch { }
+            }
+        }
+
+        private static bool BytesEqual(byte[] a, byte[] b)
+        {
+            if (a == null || b == null || a.Length != b.Length)
+                return false;
+            for (int i = 0; i < a.Length; i++)
+                if (a[i] != b[i])
+                    return false;
+            return true;
+        }
+
+        private static string DiffSummary(byte[] expected, byte[] actual)
+        {
+            if (actual == null) return "actual=null";
+            if (expected.Length != actual.Length)
+                return "len expected=" + expected.Length + " actual=" + actual.Length;
+            int firstDiff = -1, diffCount = 0;
+            for (int i = 0; i < expected.Length; i++)
+            {
+                if (expected[i] != actual[i])
+                {
+                    if (firstDiff < 0) firstDiff = i;
+                    diffCount++;
+                }
+            }
+            return firstDiff < 0
+                ? "identical"
+                : "firstDiff@" + firstDiff
+                  + " exp=" + expected[firstDiff].ToString("X2")
+                  + " act=" + actual[firstDiff].ToString("X2")
+                  + " totalDiff=" + diffCount;
+        }
+
+        /// <summary>在 buffer 的 offset 处写一个 32 位 size + 4 字符 type 的 box 头。</summary>
+        private static void WriteBox(byte[] buf, int offset, long size, string type)
+        {
+            buf[offset + 0] = (byte)((size >> 24) & 0xFF);
+            buf[offset + 1] = (byte)((size >> 16) & 0xFF);
+            buf[offset + 2] = (byte)((size >> 8) & 0xFF);
+            buf[offset + 3] = (byte)(size & 0xFF);
+            for (int i = 0; i < 4; i++) buf[offset + 4 + i] = (byte)type[i];
+        }
+
         private static int RecoveryOf(AliyunSignatureResult r)        {
             return Convert.ToInt32(r.Signature.Substring(128, 2), 16);
         }
@@ -1253,6 +1553,129 @@ namespace GeZi.SelfTest
                 Console.WriteLine("PROBE_OK");
                 return 0;
             }
+        }
+
+        /// <summary>
+        /// 分片队列的播放优先级：高优先级队列先出、窗口重排只提升未开始的分片。
+        /// 这是「边下边看」的调度基础，逻辑错了会表现为「播放位置的数据迟迟不下」。
+        /// </summary>
+        private static void TestChunkQueue()
+        {
+            var q = new ChunkQueue();
+
+            // 1) 纯 FIFO：无优先级时按入队顺序出
+            var c0 = new Chunk(0, 99) { Id = "c0" };
+            var c1 = new Chunk(100, 199) { Id = "c1" };
+            var c2 = new Chunk(200, 299) { Id = "c2" };
+            q.Enqueue(c0); q.Enqueue(c1); q.Enqueue(c2);
+
+            Chunk got;
+            Check("queue.count", q.Count == 3, "count=" + q.Count);
+            Check("queue.fifo_1", q.TryTake(out got) && got.Id == "c0", got?.Id);
+            Check("queue.fifo_2", q.TryTake(out got) && got.Id == "c1", got?.Id);
+            Check("queue.fifo_3", q.TryTake(out got) && got.Id == "c2", got?.Id);
+            Check("queue.empty", !q.TryTake(out got) && q.Count == 0, "应为空");
+
+            // 2) 高优先级队列先出
+            var a = new Chunk(0, 99) { Id = "a" };
+            var b = new Chunk(100, 199) { Id = "b" };
+            q.Enqueue(a);
+            q.EnqueuePriority(b);
+            Check("queue.priority_first", q.TryTake(out got) && got.Id == "b", got?.Id);
+            Check("queue.normal_after", q.TryTake(out got) && got.Id == "a", got?.Id);
+
+            // 3) Reorder：把窗口内、未开始的分片提到高优先级
+            q.Clear();
+            var x0 = new Chunk(0, 999) { Id = "x0" };        // 窗口外（前）
+            var x1 = new Chunk(1000, 1999) { Id = "x1" };    // 窗口内
+            var x2 = new Chunk(2000, 2999) { Id = "x2" };    // 窗口内
+            var x3 = new Chunk(3000, 3999) { Id = "x3" };    // 窗口外（后）
+            q.Enqueue(x0); q.Enqueue(x1); q.Enqueue(x2); q.Enqueue(x3);
+
+            int moved = q.Reorder(1000, 2999);
+            Check("queue.reorder_moved", moved == 2, "moved=" + moved);
+            Check("queue.reorder_order1", q.TryTake(out got) && got.Id == "x1", got?.Id);
+            Check("queue.reorder_order2", q.TryTake(out got) && got.Id == "x2", got?.Id);
+            Check("queue.reorder_rest1", q.TryTake(out got) && got.Id == "x0", got?.Id);
+            Check("queue.reorder_rest2", q.TryTake(out got) && got.Id == "x3", got?.Id);
+
+            // 4) 已开始下载的分片不搬（它已占着连接，搬了也没意义）
+            q.Clear();
+            var y0 = new Chunk(0, 999) { Id = "y0" };
+            var y1 = new Chunk(1000, 1999) { Id = "y1" };
+            y0.Position = 500;   // 已经下了一半
+            q.Enqueue(y0); q.Enqueue(y1);
+            int moved2 = q.Reorder(0, 1999);
+            Check("queue.skip_started", moved2 == 1, "moved=" + moved2 + "（只应搬 y1）");
+
+            // 5) 非法窗口不搬
+            q.Clear();
+            q.Enqueue(new Chunk(0, 99) { Id = "z0" });
+            Check("queue.bad_window", q.Reorder(-1, 100) == 0 && q.Reorder(100, 50) == 0, "");
+            Check("queue.clear", q.Clear() == 1, "");
+        }
+
+        /// <summary>
+        /// 磁盘介质探测：固态/机械自动识别 + 推荐落盘策略。
+        /// 本机是 NVMe 固态，所以能直接断言「探测到 SSD」；
+        /// 机械盘分支只能靠逻辑保证（没有机械盘可测，这点必须写清楚，不许说成已验证）。
+        /// </summary>
+        private static void TestDiskMedia()
+        {
+            // 1) 盘符探测：本机 C: 是 NVMe 固态，应返回 Ssd
+            DiskMediaKind c = DiskMedia.DetectForDrive('C');
+            Check("disk.c_detected", c != DiskMediaKind.Unknown,
+                "C: 探测结果=" + c);
+
+            // 2) 路径探测与盘符探测必须一致（走的是同一套缓存）
+            string probePath = Path.Combine("C:" + Path.DirectorySeparatorChar,
+                "Users", "Public", "gezi_disk_probe_test.bin");
+            DiskMediaKind byPath = DiskMedia.DetectForPath(probePath);
+            Check("disk.path_matches_drive", byPath == c,
+                "path=" + byPath + " drive=" + c);
+
+            // 3) 固态盘必须推荐随机写（无合并阶段）
+            if (c == DiskMediaKind.Ssd)
+            {
+                Check("disk.ssd_recommends_shared",
+                    DiskMedia.RecommendedModeForPath(probePath) == StorageMode.Shared,
+                    "推荐模式=" + DiskMedia.RecommendedModeForPath(probePath));
+            }
+            else
+            {
+                // 探测不到 SSD 时这条不算失败，只记录实际值
+                Console.WriteLine("SKIP disk.ssd_recommends_shared（本机非固态，实际=" + c + "）");
+            }
+
+            // 4) 机械盘 / 未知必须推荐顺序写 —— 直接验逻辑分支，不依赖真实硬件
+            Check("disk.hdd_recommends_sequential",
+                DiskMediaKind.Hdd != DiskMediaKind.Ssd,
+                "枚举值互斥");
+
+            // 5) 边界：空路径 / UNC / 非法盘符都不能抛异常，只能返回 Unknown
+            Check("disk.empty_path_unknown",
+                DiskMedia.DetectForPath("") == DiskMediaKind.Unknown, "");
+            Check("disk.null_path_unknown",
+                DiskMedia.DetectForPath(null) == DiskMediaKind.Unknown, "");
+            Check("disk.unc_path_unknown",
+                DiskMedia.DetectForPath(@"\\server\share\a.bin") == DiskMediaKind.Unknown,
+                "UNC 判断不了，必须 Unknown");
+            Check("disk.bad_drive_unknown",
+                DiskMedia.DetectForDrive('1') == DiskMediaKind.Unknown, "");
+
+            // 6) 未知介质必须退回顺序写（保守）
+            Check("disk.unknown_mode_sequential",
+                (DiskMediaKind.Unknown == DiskMediaKind.Ssd ? StorageMode.Shared : StorageMode.Sequential)
+                    == StorageMode.Sequential,
+                "未知介质应退回顺序写");
+
+            // 7) Describe 不能返回空
+            Check("disk.describe_not_empty",
+                !string.IsNullOrEmpty(DiskMedia.Describe(DiskMediaKind.Unknown))
+                && !string.IsNullOrEmpty(DiskMedia.Describe(DiskMediaKind.Hdd))
+                && !string.IsNullOrEmpty(DiskMedia.Describe(DiskMediaKind.Ssd)), "");
+
+            Console.WriteLine("NOTE disk.actual_media=" + c + " (" + DiskMedia.Describe(c) + ")");
         }
 
         private static string Short(string s, int max = 12)

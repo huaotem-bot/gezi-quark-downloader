@@ -1,0 +1,41 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net48</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>disable</Nullable>
+    <AssemblyName>GeZi.Providers</AssemblyName>
+    <RootNamespace>GeZi.Providers</RootNamespace>
+    <Product>鸽子下载</Product>
+    <AssemblyTitle>鸽子下载</AssemblyTitle>
+    <Version>2.4.0</Version>
+    <!-- 与主程序一致：统一 x64（混用位数会 0x8007000B）。 -->
+    <PlatformTarget>x64</PlatformTarget>
+    <Prefer32Bit>false</Prefer32Bit>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <PathMap>$(MSBuildProjectDirectory)=/_/</PathMap>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\GeZi.Core\GeZi.Core.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Reference Include="System.Net.Http" />
+    <!-- JSON：与 Core 一致用框架自带 JavaScriptSerializer -->
+    <Reference Include="System.Web.Extensions" />
+    <!-- 阿里云盘设备签名（secp256k1）的模运算 -->
+    <Reference Include="System.Numerics" />
+    <!-- 迅雷登录窗口/协议里用到（保持与 Core 相同集合，避免漏引用） -->
+    <Reference Include="System.Security" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- ★ 二维码解码：ZXing.Net（Apache-2.0）。只有 QrDecoder 用它，所以跟着本项目的 Qr 目录走。 -->
+    <Reference Include="ZXing">
+      <HintPath>lib\ZXing\zxing.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+  </ItemGroup>
+
+</Project>

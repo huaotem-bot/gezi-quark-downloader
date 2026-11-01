@@ -1,6 +1,7 @@
 <Application x:Class="GeZi.App"
              xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:local="clr-namespace:GeZi"
              ShutdownMode="OnExplicitShutdown">
     <!--
         ⚠️ 这里**故意不写 StartupUri**（2026-10-03 改）。
@@ -19,7 +20,16 @@
             <!--
                 资源字典合并顺序很重要：
                 Colors（Color）→ Brushes（由 Colors 派生）→ Icons → ScrollBar（依赖 Brushes）
-                → Styles（依赖以上全部）。
+                → Styles.*（依赖以上全部）。
+
+                2026-10-24 代码规范化：原 Styles.xaml（1930 行 / 65 个成员）按职责拆成
+                Styles.Typography / Cards / Buttons / SmallControls / Inputs / Lists /
+                DataGrid / Menus / Navigation / Misc 共 10 个字典。拆分只按行区间搬运，
+                成员文本一字未改，且这 10 项之间的先后顺序与拆分前的原始定义顺序完全一致
+                （原来 3 处 BasedOn 依赖 —— PrimaryCard→Card、CaptionCloseButton→CaptionButton、
+                AppTextBoxMultiline→AppTextBox —— 的两端都还在同一个文件里）。
+                ⚠️ 以后往这些文件里加新 Style 时，若它 BasedOn 另一个文件里的 Style，
+                   必须把被依赖的文件排在前面。
                 调试技巧：XAML 里 <Style> 必须用 StaticResource 引（net48 的 DynamicResource
                 引 Style 有 bug），但 Style 内部的颜色/画刷一律 DynamicResource，换主题才能即时生效。
 
@@ -34,8 +44,20 @@
                 <ResourceDictionary Source="Resources/Brushes.xaml" />
                 <ResourceDictionary Source="Resources/Icons.xaml" />
                 <ResourceDictionary Source="Resources/ScrollBar.xaml" />
-                <ResourceDictionary Source="Resources/Styles.xaml" />
+                <ResourceDictionary Source="Resources/Styles.Typography.xaml" />
+                <ResourceDictionary Source="Resources/Styles.Cards.xaml" />
+                <ResourceDictionary Source="Resources/Styles.Buttons.xaml" />
+                <ResourceDictionary Source="Resources/Styles.SmallControls.xaml" />
+                <ResourceDictionary Source="Resources/Styles.Inputs.xaml" />
+                <ResourceDictionary Source="Resources/Styles.Lists.xaml" />
+                <ResourceDictionary Source="Resources/Styles.DataGrid.xaml" />
+                <ResourceDictionary Source="Resources/Styles.Menus.xaml" />
+                <ResourceDictionary Source="Resources/Styles.Navigation.xaml" />
+                <ResourceDictionary Source="Resources/Styles.Misc.xaml" />
             </ResourceDictionary.MergedDictionaries>
+
+            <!-- 文件类型 → 图标/颜色（文件列表按扩展名区分图片/视频/音频/PDF/压缩包/文档/表格/演示/代码/文本/可执行） -->
+            <local:FileTypeIconConverter x:Key="FileTypeIcon" />
         </ResourceDictionary>
     </Application.Resources>
 </Application>

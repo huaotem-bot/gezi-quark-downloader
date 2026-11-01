@@ -16,6 +16,7 @@
 
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Text;
 using System.Threading.Tasks;
 using System.Windows;
@@ -25,7 +26,15 @@ using Microsoft.Web.WebView2.Core;
 using Microsoft.Web.WebView2.Wpf;
 using GeZi.Core.Api;
 using GeZi.Core.Support;
+using GeZi.Providers;
+using GeZi.Providers.Quark;
+using GeZi.Providers.Uc;
+using GeZi.Providers.Aliyun;
+using GeZi.Providers.Xunlei;
+using GeZi.Providers.Shared;
+using GeZi.Providers.Qr;
 
+using GeZi.Services;
 namespace GeZi
 {
     /// <summary>
@@ -61,6 +70,7 @@ namespace GeZi
         private WebView2 _web;
         private TextBlock _status;
         private Button _manualBtn;
+        private Button _switchBtn;
 
         private System.Windows.Threading.DispatcherTimer _poll;
         private DateTime _lastValidateAt = DateTime.MinValue;
@@ -87,11 +97,9 @@ namespace GeZi
             _log = log;
 
             Title = PanUrlParser.DisplayNameOf(kind) + " 登录";
-            Width = 960;
-            Height = 760;
-            WindowStartupLocation = WindowStartupLocation.CenterOwner;
-            ShowInTaskbar = false;
-            Background = Brushes.White;
+            // 与其它弹窗统一：自绘标题栏 + 主题背景 + 主题字体。
+            // ⚠️ 这里**不再**自己设 Width/Height/Background —— StyleWindow 会把高度补上标题栏那一截。
+            DialogChrome.StyleWindow(this, 960, 760);
 
             BuildLayout();
             Loaded += OnLoaded;
@@ -105,27 +113,47 @@ namespace GeZi
             root.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
             root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
 
-            // 顶部说明
+            // ---------- 顶部说明 ----------
+            // 原来是一整条 #F5F5F4 死灰 + 两行小字，跟主界面完全是两套东西。
+            // 现在改成「网盘名大标题 + 一行副标题 + 状态」，与其它弹窗的 PageTitle 一致。
             var top = new Border
             {
-                Background = new SolidColorBrush(Color.FromRgb(0xF5, 0xF5, 0xF4)),
-                Padding = new Thickness(16, 10, 16, 10),
+                Padding = new Thickness(20, 14, 20, 14),
+                BorderThickness = new Thickness(0, 0, 0, 1),
             };
+            top.SetResourceReference(Border.BackgroundProperty, "AppBgBrush");
+            top.SetResourceReference(Border.BorderBrushProperty, "BorderBrushSoft");
+
             var topPanel = new StackPanel();
-            topPanel.Children.Add(new TextBlock
+            var titleRow = new StackPanel { Orientation = Orientation.Horizontal };
+            var titleText = new TextBlock
             {
-                Text = "在下方页面完成登录，成功后会自动填好凭证（无需手动复制 Cookie）。",
+                Text = PanUrlParser.DisplayNameOf(_kind) + " 登录",
+                FontSize = 16,
+                FontWeight = FontWeights.SemiBold,
+                VerticalAlignment = VerticalAlignment.Center,
+            };
+            titleText.SetResourceReference(TextBlock.ForegroundProperty, "TextPrimaryBrush");
+            titleRow.Children.Add(titleText);
+            topPanel.Children.Add(titleRow);
+
+            var subText = new TextBlock
+            {
+                Text = "在下方页面完成登录，成功后会自动保存凭证。",
                 FontSize = 12,
-                Foreground = new SolidColorBrush(Color.FromRgb(0x44, 0x40, 0x3C)),
-            });
+                Margin = new Thickness(0, 4, 0, 0),
+            };
+            subText.SetResourceReference(TextBlock.ForegroundProperty, "TextTertiaryBrush");
+            topPanel.Children.Add(subText);
+
             _status = new TextBlock
             {
                 Text = "正在加载登录页…",
                 FontSize = 12,
-                Margin = new Thickness(0, 6, 0, 0),
-                Foreground = new SolidColorBrush(Color.FromRgb(0x78, 0x71, 0x6C)),
+                Margin = new Thickness(0, 8, 0, 0),
                 TextWrapping = TextWrapping.Wrap,
             };
+            _status.SetResourceReference(TextBlock.ForegroundProperty, "TextSecondaryBrush");
             topPanel.Children.Add(_status);
             top.Child = topPanel;
             Grid.SetRow(top, 0);
@@ -136,34 +164,38 @@ namespace GeZi
             Grid.SetRow(_web, 1);
             root.Children.Add(_web);
 
-            // 底部兜底
+            // ---------- 底部按钮 ----------
             var bottom = new Border
             {
-                Padding = new Thickness(16, 10, 16, 12),
-                BorderBrush = new SolidColorBrush(Color.FromRgb(0xE7, 0xE5, 0xE4)),
+                Padding = new Thickness(20, 12, 20, 14),
                 BorderThickness = new Thickness(0, 1, 0, 0),
             };
-            var btnRow = new StackPanel { Orientation = Orientation.Horizontal };
+            bottom.SetResourceReference(Border.BackgroundProperty, "AppBgBrush");
+            bottom.SetResourceReference(Border.BorderBrushProperty, "BorderBrushSoft");
 
-            _manualBtn = new Button
-            {
-                Content = "手动复制 Cookie…",
-                Padding = new Thickness(14, 6, 14, 6),
-                Margin = new Thickness(0, 0, 8, 0),
-                ToolTip = "自动检测没反应时，从浏览器 DevTools 复制整串 Cookie 粘贴进来",
-            };
+            _manualBtn = DialogChrome.SecondaryButton("导入 Cookie");
+            _manualBtn.ToolTip = "自动检测没反应时，从浏览器 DevTools 复制整串 Cookie 粘贴进来";
             _manualBtn.Click += (s, e) => ShowManualInput();
-            btnRow.Children.Add(_manualBtn);
 
-            var closeBtn = new Button
-            {
-                Content = "取消",
-                Padding = new Thickness(14, 6, 14, 6),
-                IsCancel = true,
-            };
+            // 🚨 2026-10-26 用户反馈：「点了内嵌登录之后，窗口一出现就自动登录回之前的账号，
+            //   这样我永远没法登录阿里的新账号。」
+            //   根因：内嵌浏览器用的是**按网盘固定的 profile 目录**（profile-aliyun / -quark …），
+            //   上一次登录留下的 Cookie 一直在，页面一打开服务端就把你当老用户，直接跳进已登录页。
+            //   修法：给一个「换账号」——只清**内嵌浏览器自己的** Cookie 与本地存储，
+            //   软件里已经保存的账号凭证（Settings 里的 Cookie / refresh_token）**一个字都不动**，
+            //   所以自动续期的账号不会掉；清完重新打开登录页就是干净的登录界面。
+            _switchBtn = DialogChrome.SecondaryButton("换账号");
+            _switchBtn.ToolTip = "清掉内嵌浏览器记住的上次登录状态，用另一个账号登录。\n"
+                + "已保存的账号不受影响，不会被登出。";
+            _switchBtn.Click += async (s, e) => await SwitchAccountAsync();
+            _switchBtn.IsEnabled = false;   // CoreWebView2 就绪后才可用
+
+            var closeBtn = DialogChrome.SecondaryButton("取消");
+            closeBtn.IsCancel = true;
             closeBtn.Click += (s, e) => Close();
-            btnRow.Children.Add(closeBtn);
 
+            var btnRow = DialogChrome.ButtonRow(_switchBtn, _manualBtn, closeBtn);
+            btnRow.HorizontalAlignment = HorizontalAlignment.Right;
             bottom.Child = btnRow;
             Grid.SetRow(bottom, 2);
             root.Children.Add(bottom);
@@ -205,10 +237,11 @@ namespace GeZi
                 {
                     _status.Text = e2.IsSuccess
                         ? "请在页面中完成登录。登录成功后本窗口会自动关闭。"
-                        : "页面加载失败（" + e2.WebErrorStatus + "），可点「手动复制 Cookie…」。";
+                        : "页面加载失败（" + e2.WebErrorStatus + "），可点「导入 Cookie」。";
                 };
 
                 _web.Visibility = Visibility.Visible;
+                if (_switchBtn != null) _switchBtn.IsEnabled = true;
                 _web.CoreWebView2.Navigate(LoginUrlFor(_kind));
 
                 StartPolling();
@@ -217,8 +250,74 @@ namespace GeZi
             {
                 // 运行时缺失 / 创建失败：明确告知，并引导手动通道
                 _status.Text = "内嵌登录无法启动：" + ex.Message
-                    + "。可点下方「手动复制 Cookie…」继续。";
+                    + "。可点下方「导入 Cookie」继续。";
                 _log?.Invoke("[登录] WebView2 启动失败: " + ex.Message);
+            }
+        }
+
+        /// <summary>
+        /// 「换账号」：清掉内嵌浏览器记住的登录状态，回到干净的登录页。
+        /// <para>
+        /// ⚠️ 只动 **WebView2 自己的** Cookie / localStorage / IndexedDB，
+        /// 绝不碰软件已保存的凭证（<c>Settings</c> 里的 Cookie、refresh_token）——
+        /// 所以「换账号登录」不会把当前正在自动续期的账号踢掉。
+        /// </para>
+        /// 清完必须**重新导航**：有些站点的登录态存在内存里的 SPA store，光清 Cookie 页面不会变。
+        /// </summary>
+        private async Task SwitchAccountAsync()
+        {
+            var core = _web != null ? _web.CoreWebView2 : null;
+            if (core == null) return;
+
+            _switchBtn.IsEnabled = false;
+            _status.Text = "正在清除内嵌浏览器记住的登录状态…";
+            try
+            {
+                // 🚨 2026-10-28 重写这段。原来的做法是两半：
+                //   ① core.CookieManager.DeleteAllCookies()   —— 清整个 profile 的 Cookie，够彻底；
+                //   ② core.ExecuteScriptAsync(wipe)          —— 清 localStorage / IndexedDB，
+                //      但脚本只跑在**当前页面**所在的 origin 上。
+                //   于是阿里这类多子域的站点清不干净：当前页在 www.alipan.com，
+                //   passport.alipan.com / auth.alipan.com 下的登录态原封不动，
+                //   用户点完「换账号」刷新一下还是已登录的那个号。
+                //
+                //   现在改用 Profile.ClearBrowsingDataAsync(kinds)：按**数据类型**清，
+                //   一次覆盖 profile 里所有 origin，不再受「当前页面在哪个域」限制。
+                //   只清登录态相关的几类，保留 Cache —— 否则重新加载登录页会慢一大截。
+                await core.Profile.ClearBrowsingDataAsync(
+                    CoreWebView2BrowsingDataKinds.Cookies
+                    | CoreWebView2BrowsingDataKinds.LocalStorage
+                    | CoreWebView2BrowsingDataKinds.IndexedDb);
+
+                // 再补一发页面内清理：有些 SPA 把状态挂在内存 store 里，
+                // 光清存储不清内存，页面自己还以为登着。这发只作为兜底，
+                // 清不干净也没关系（上面那步已经把持久化存储清空了）。
+                try
+                {
+                    const string wipe =
+                        "try{localStorage.clear();}catch(e){}"
+                        + "try{sessionStorage.clear();}catch(e){}";
+                    await core.ExecuteScriptAsync(wipe);
+                }
+                catch { }
+
+                // 给 Cookie 管理器一点落盘时间，然后重新打开登录页（加时间戳绕开缓存）
+                await Task.Delay(300);
+                string url = LoginUrlFor(_kind);
+                core.Navigate(url + (url.Contains("?") ? "&" : "?") + "_r="
+                    + DateTime.Now.Ticks.ToString(CultureInfo.InvariantCulture));
+
+                _status.Text = "已清除上次的登录状态，请用另一个账号登录。已保存的账号不受影响。";
+                _log?.Invoke("[登录] 已清除内嵌浏览器的登录状态（换账号）");
+            }
+            catch (Exception ex)
+            {
+                _status.Text = "清除登录状态失败：" + ex.Message + "，可直接点「导入 Cookie」。";
+                _log?.Invoke("[登录] 清除内嵌登录状态失败: " + ex.Message);
+            }
+            finally
+            {
+                if (_switchBtn != null) _switchBtn.IsEnabled = true;
             }
         }
 
@@ -1077,16 +1176,18 @@ namespace GeZi
         public ManualCookieDialog(Window owner, PanKind kind)
         {
             Owner = owner;
-            Title = "手动粘贴 " + PanUrlParser.DisplayNameOf(kind) + " Cookie";
-            Width = 640;
-            Height = 320;
-            WindowStartupLocation = WindowStartupLocation.CenterOwner;
-            ShowInTaskbar = false;
+            Title = "导入 " + PanUrlParser.DisplayNameOf(kind) + " Cookie";
+            // 与其它弹窗统一外壳（自绘标题栏 + 主题背景 + 主题字体）
+            DialogChrome.StyleWindow(this, 640, 340);
 
-            var grid = new Grid { Margin = new Thickness(16) };
-            grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-            grid.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
-            grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+            var root = DialogChrome.DialogRoot();
+            root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+            root.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
+            root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+
+            // ⚠️ 这里**不再**画 <c>PageTitle</c>：标题栏（BuildCaption）已经把
+            //    「导入 UC网盘 Cookie」画在顶部条里了，内容区再画一遍就是上下两个标题。
+            //    DialogChrome 的约定是「标题只在标题栏里出现一次」。
 
             string hint = kind == PanKind.Uc
                 ? "需要同时包含 __pus 与 __puus。获取方式：登录 drive.uc.cn → F12 → Application → Cookies → 复制整串。"
@@ -1094,52 +1195,58 @@ namespace GeZi
                     ? "需要同时包含 __pus 与 __puus。获取方式：登录 pan.quark.cn → F12 → Application → Cookies → 复制整串。"
                     : "请粘贴完整的凭证串。";
 
-            var tip = new TextBlock
-            {
-                Text = hint,
-                TextWrapping = TextWrapping.Wrap,
-                FontSize = 12,
-                Margin = new Thickness(0, 0, 0, 8),
-            };
-            Grid.SetRow(tip, 0);
-            grid.Children.Add(tip);
+            var body = new Grid { Margin = new Thickness(0, 10, 0, 0) };
+            body.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+            body.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
 
+            var tip = DialogChrome.Hint(hint, 0, 8);
+            Grid.SetRow(tip, 0);
+            body.Children.Add(tip);
+
+            // 🚨 2026-10-26 用户反馈（附截图）：「这个输入框太丑太僵硬」。
+            //   根因：这个 TextBox 原来**没有套任何样式**，走的是 WPF 默认外观 ——
+            //   直角、1px 浅灰边、内边距几乎没有，和周围圆角卡片完全不搭。
+            //   → 套上全项目通用的 AppTextBox（圆角 10 + 主题描边 + 聚焦高亮），
+            //     再按多行输入的需要覆盖三处：滚动条改 Auto（默认是 Disabled，长 Cookie 会看不到末尾）、
+            //     内容贴顶（默认居中，多行会飘在中间）、内边距放大到 12,10。
             var box = new TextBox
             {
                 AcceptsReturn = true,
                 TextWrapping = TextWrapping.Wrap,
-                VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
                 FontFamily = new FontFamily("Consolas, monospace"),
                 FontSize = 12,
+                Padding = new Thickness(12, 10, 12, 10),
+                VerticalContentAlignment = VerticalAlignment.Top,
             };
+            var tbStyle = TryFindResource("AppTextBox") as Style;
+            if (tbStyle != null) box.Style = tbStyle;
+            // 样式里的单行约定（Disabled）在样式应用之后覆盖，顺序不能反。
+            box.VerticalScrollBarVisibility = ScrollBarVisibility.Auto;
+            box.HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled;
             Grid.SetRow(box, 1);
-            grid.Children.Add(box);
+            body.Children.Add(box);
+            Grid.SetRow(body, 1);
+            root.Children.Add(body);
 
-            var row = new StackPanel
-            {
-                Orientation = Orientation.Horizontal,
-                HorizontalAlignment = HorizontalAlignment.Right,
-                Margin = new Thickness(0, 10, 0, 0),
-            };
-            var ok = new Button { Content = "确定", Padding = new Thickness(18, 6, 18, 6), IsDefault = true };
+            var ok = DialogChrome.PrimaryButton("确定");
+            ok.IsDefault = true;
+            ok.MinWidth = 84;
             ok.Click += (s, e) =>
             {
                 Cookie = box.Text;
                 DialogResult = true;
             };
-            var cancel = new Button
-            {
-                Content = "取消",
-                Padding = new Thickness(18, 6, 18, 6),
-                Margin = new Thickness(8, 0, 0, 0),
-                IsCancel = true,
-            };
-            row.Children.Add(ok);
-            row.Children.Add(cancel);
-            Grid.SetRow(row, 2);
-            grid.Children.Add(row);
+            var cancel = DialogChrome.SecondaryButton("取消");
+            cancel.IsCancel = true;
+            cancel.MinWidth = 84;
 
-            Content = grid;
+            var row = DialogChrome.ButtonRow(ok, cancel);
+            row.HorizontalAlignment = HorizontalAlignment.Right;
+            row.Margin = new Thickness(0, 12, 0, 0);
+            Grid.SetRow(row, 2);
+            root.Children.Add(row);
+
+            Content = root;
         }
     }
 }

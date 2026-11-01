@@ -19,7 +19,15 @@ using System.Collections.Generic;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Threading;
+using GeZi.Providers;
+using GeZi.Providers.Quark;
+using GeZi.Providers.Uc;
+using GeZi.Providers.Aliyun;
+using GeZi.Providers.Xunlei;
+using GeZi.Providers.Shared;
+using GeZi.Providers.Qr;
 
+using GeZi.Services;
 namespace GeZi
 {
     /// <summary>
@@ -44,13 +52,48 @@ namespace GeZi
         [DllImport("ole32.dll")]
         private static extern void CoUninitialize();
 
+        /// <summary>0x80070005 = E_ACCESSDENIED：进程权限不够（最常见是程序放在受限制目录里运行）。</summary>
+        private const int EAccessDenied = unchecked((int)0x80070005);
+
         public static bool Reveal(string path)
         {
-            if (string.IsNullOrEmpty(path)) return false;
+            string ignored;
+            return Reveal(path, out ignored);
+        }
+
+        /// <summary>
+        /// 定位并在资源管理器中选中文件。
+        /// <paramref name="failReason"/> 失败时给出<b>人话原因</b>，成功时为 null。
+        /// <para></para>
+        /// <para>
+        /// 为什么要区分原因：早先一律报「找不到该文件或所在目录」，但实测最常见的失败
+        /// 其实是<b>权限不足</b>（日志里 <c>hr=-2147024891</c> = 0x80070005、<c>open=5</c>），
+        /// 文件明明就在那里。报错文案指错方向，用户会以为文件丢了。
+        /// </para>
+        /// </summary>
+        public static bool Reveal(string path, out string failReason)
+        {
+            failReason = null;
+            if (string.IsNullOrEmpty(path))
+            {
+                failReason = "路径为空";
+                return false;
+            }
 
             string parent = Path.GetDirectoryName(path);
             if (!File.Exists(path))
-                return !string.IsNullOrEmpty(parent) && ShellLaunch.OpenFolder(parent);
+            {
+                // 文件还没落盘（例如下载中被取消）→ 退到打开所在目录
+                if (!string.IsNullOrEmpty(parent) && ShellLaunch.OpenFolder(parent))
+                {
+                    failReason = null;
+                    return true;
+                }
+                failReason = Directory.Exists(parent)
+                    ? "文件还没写盘，打开所在目录也被系统拒绝"
+                    : "找不到该文件或所在目录";
+                return false;
+            }
 
             List<IntPtr> before = ShellLaunch.ExplorerWindows();
             string folderName = Path.GetFileName(parent ?? "");
@@ -62,10 +105,15 @@ namespace GeZi
             // ② 返回码可疑时再用"窗口是否出现"复核
             if (ShellLaunch.WaitForExplorerWindow(before, folderName, 1200)) return true;
 
-            // ② 退到打开所在目录（与 Python 的兜底一致）
+            // ③ 退到打开所在目录（与 Python 的兜底一致）
             if (!string.IsNullOrEmpty(parent) && ShellLaunch.OpenFolder(parent)) return true;
 
             try { ShellLaunch.Log?.Invoke("[Shell] Reveal 失败 hr=" + hr + " path=" + path); } catch { }
+
+            // 文件确实存在，那失败就不是"找不到"，而是权限/环境问题
+            failReason = (hr == EAccessDenied)
+                ? "系统拒绝了资源管理器调用（权限不足）。把本程序复制到普通目录（如 D:\\GeZi）再运行即可"
+                : "系统拒绝了资源管理器调用（错误码 " + hr + "），可手动打开下载目录查看";
             return false;
         }
 

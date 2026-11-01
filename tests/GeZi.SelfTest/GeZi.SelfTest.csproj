@@ -1,4 +1,4 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
   <!--
     零 NuGet 的自测宿主。
@@ -21,6 +21,9 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\GeZi.Core\GeZi.Core.csproj" />
+    <ProjectReference Include="..\..\src\GeZi.Providers\GeZi.Providers.csproj" />
+    <ProjectReference Include="..\..\src\GeZi.DownloadEngine\GeZi.DownloadEngine.csproj" />
+    <ProjectReference Include="..\..\src\GeZi.Application\GeZi.Application.csproj" />
   </ItemGroup>
 
   <ItemGroup>

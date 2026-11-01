@@ -1,4 +1,4 @@
-﻿// GeZi —— 多网盘下载器 (Multi-cloud downloader)
+// GeZi —— 多网盘下载器 (Multi-cloud downloader)
 // Copyright (C) 2026  Yi Yuan
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU Affero General Public License as published by
@@ -13,8 +13,16 @@
 
 using System;
 using System.ComponentModel;
-using GeZi.Core.Download;
+using GeZi.DownloadEngine;
+using GeZi.Providers;
+using GeZi.Providers.Quark;
+using GeZi.Providers.Uc;
+using GeZi.Providers.Aliyun;
+using GeZi.Providers.Xunlei;
+using GeZi.Providers.Shared;
+using GeZi.Providers.Qr;
 
+using GeZi.Services;
 namespace GeZi
 {
     /// <summary>任务列表条目（带变更通知，供进度条/状态实时刷新）。</summary>
@@ -23,6 +31,16 @@ namespace GeZi
         public DownloadJob Job { get; }
         public string Name { get; }
 
+        /// <summary>
+        /// 任务所属网盘的中文名（夸克 / UC / 阿里云盘 / 迅雷云盘）。
+        /// <para>
+        /// 任务列表按这个字段分组折叠（用户要求：第一级是网盘，网盘之下才是任务）。
+        /// 取的是**这条任务来自哪家网盘**（<c>Pending.PanKind</c>），
+        /// 不是当前登录账号的网盘 —— 登录夸克去下 UC 分享时，任务应该归到 UC 下面。
+        /// </para>
+        /// </summary>
+        public string PanGroup { get; }
+
         /// <summary>是否已写入下载历史。终态只记一次，防止重复上报把历史刷屏。</summary>
         public bool HistoryRecorded { get; set; }
 
@@ -30,6 +48,20 @@ namespace GeZi
         {
             Job = job;
             Name = name;
+
+            // 分组名：兜底必须和 PanUrlParser.DisplayNameOf 的返回值**完全一致**，
+            // 否则同一家网盘会裂成两个分组（历史上兜底写的是「夸克」，而正常路径
+            // 返回「夸克网盘」⇒ 列表里出现「夸克」和「夸克网盘」两组）。
+            string group = PanUrlParser.DisplayNameOf(GeZi.Core.Api.PanKind.Quark);
+            try
+            {
+                if (job != null && job.Pending != null)
+                    group = PanUrlParser.DisplayNameOf((GeZi.Core.Api.PanKind)job.Pending.PanKind);
+            }
+            catch { }
+            PanGroup = string.IsNullOrWhiteSpace(group)
+                ? PanUrlParser.DisplayNameOf(GeZi.Core.Api.PanKind.Quark)
+                : group;
         }
 
         private JobState _state = JobState.Queued;
@@ -62,7 +94,7 @@ namespace GeZi
                 if (_activeConns == value) return;
                 _activeConns = value;
                 OnChanged(nameof(ActiveConnections));
-                OnChanged(nameof(Lanes));
+                OnChanged(nameof(LaneFilled));
                 OnChanged(nameof(LaneText));
             }
         }
@@ -77,7 +109,7 @@ namespace GeZi
                 if (_workerCount == value) return;
                 _workerCount = value;
                 OnChanged(nameof(WorkerCount));
-                OnChanged(nameof(Lanes));
+                OnChanged(nameof(LaneFilled));
                 OnChanged(nameof(LaneText));
             }
         }
@@ -86,7 +118,14 @@ namespace GeZi
         /// 车道格子：长度固定 <see cref="LaneSlots"/>，前 N 个为 true（= 点亮）。
         /// N = round(活跃/上限 × 20)，所以"格子亮了多少"直接反映并发占用率。
         /// </summary>
-        public System.Collections.Generic.IEnumerable<bool> Lanes
+        /// <remarks>
+        /// 🚨 2026-10-31：原先这里是个返回 <c>bool[]</c> 的属性，每次读取都新建数组，
+        /// 绑到 <c>ItemsControl.ItemsSource</c> 上 → 进度每 500ms 报一次，每个在跑的
+        /// 任务就要把 20 个 Border 全部销毁重建（3 个并发 = 每秒 120 个 Border 的创建销毁）。
+        /// 现在改成只暴露**点亮的格子数**，由自绘控件 <see cref="LaneStrip"/> 画出来：
+        /// 一个元素、零子项、零数据绑定。
+        /// </remarks>
+        public int LaneFilled
         {
             get
             {
@@ -94,10 +133,22 @@ namespace GeZi
                 int ac = _activeConns;
                 if (ac < 0) ac = 0;
                 if (wc > 0 && ac > wc) ac = wc;
-                int filled = wc > 0 ? (int)System.Math.Round((double)ac / wc * LaneSlots) : 0;
-                var arr = new bool[LaneSlots];
-                for (int i = 0; i < filled && i < LaneSlots; i++) arr[i] = true;
-                return arr;
+                // 小并发时按比例四舍五入会得到 0 → 20 格全灰，看起来像「车道根本没显示」。
+                // 只要确实有活跃连接就至少点亮一格，让用户看得到「连接在跑」。
+                int filled;
+                if (wc > 0)
+                {
+                    filled = (int)System.Math.Round((double)ac / wc * LaneSlots);
+                }
+                else
+                {
+                    // 上限还没送到（内核要等分片规划完），但有活跃连接 → 先亮一格占位，
+                    // 避免整条车道看起来是空的。
+                    filled = ac > 0 ? 1 : 0;
+                }
+                if (ac > 0 && filled < 1) filled = 1;
+                if (filled > LaneSlots) filled = LaneSlots;
+                return filled;
             }
         }
 
@@ -145,11 +196,20 @@ namespace GeZi
         public double Percent
         {
             get => _percent;
-            set { _percent = value; OnChanged(nameof(Percent)); OnChanged(nameof(PercentText)); }
+            set
+            {
+                // 🚨 值没变就什么都不做（2026-10-31）。进度帧每秒上百次，
+                //    每次无条件 OnChanged 都会让绑定重算目标属性 ——
+                //    2000 行的列表里这是纯粹的浪费（值根本没变，画出来一模一样）。
+                if (value == _percent) return;
+                _percent = value;
+                OnChanged(nameof(Percent));
+                OnChanged(nameof(PercentText));
+            }
         }
 
         /// <summary>
-        /// 当前阶段说明（来自核心层的 <see cref="GeZi.Core.Download.DownloadProgress.Phase"/>）。
+        /// 当前阶段说明（来自核心层的 <see cref="GeZi.DownloadEngine.DownloadProgress.Phase"/>）。
         /// 空串 = 常规下载阶段。非空时 <see cref="StatusText"/> 直接显示它
         /// （例如「正在合并分片」），避免收尾期界面看起来像卡死。
         /// </summary>
@@ -172,7 +232,14 @@ namespace GeZi
         {
             get => _speed;
             // SpeedText 要看它决定显示速度还是「0 B/s」/留空（见下）。
-            set { _speed = value; OnChanged(nameof(SpeedText)); OnChanged(nameof(StatusText)); }
+            set
+            {
+                // 值没变就别推（暂停中、卡住、0 速度时这一帧毫无意义）
+                if (value == _speed) return;
+                _speed = value;
+                OnChanged(nameof(SpeedText));
+                OnChanged(nameof(StatusText));
+            }
         }
 
         /// <summary>
@@ -234,7 +301,13 @@ namespace GeZi
         public long Total
         {
             get => _total;
-            set { _total = value; OnChanged(nameof(DoneText)); }
+            set
+            {
+                // 总大小在一次任务里基本恒定，每帧无条件刷 DoneText 纯浪费
+                if (value == _total) return;
+                _total = value;
+                OnChanged(nameof(DoneText));
+            }
         }
 
         public string StatusText

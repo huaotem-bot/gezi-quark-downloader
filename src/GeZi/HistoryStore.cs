@@ -18,7 +18,15 @@ using System.Runtime.Serialization;
 using System.Runtime.Serialization.Json;
 using System.Text;
 using GeZi.Core.Support;
+using GeZi.Providers;
+using GeZi.Providers.Quark;
+using GeZi.Providers.Uc;
+using GeZi.Providers.Aliyun;
+using GeZi.Providers.Xunlei;
+using GeZi.Providers.Shared;
+using GeZi.Providers.Qr;
 
+using GeZi.Services;
 namespace GeZi
 {
     /// <summary>一条下载历史记录。字段与 Python 版 records 对齐。</summary>
@@ -66,6 +74,30 @@ namespace GeZi
         /// 会变成谎话（明明是上周解析的，却写着"今天"）。
         /// </summary>
         [DataMember(Order = 7)] public bool Pinned { get; set; }
+
+        /// <summary>
+        /// 这条分享属于哪家网盘（<c>GeZi.Core.Api.PanKind</c> 的整数值，默认 0 = 夸克）。
+        /// 历史面板要用它决定「失效校验」走哪套接口 —— 拿夸克客户端去探阿里分享
+        /// 会一律抛异常，把好链接标成「已失效」。旧文件没有这个字段时反序列化为 0（夸克），
+        /// 与加入这个字段之前的实际行为一致。
+        /// </summary>
+        [DataMember(Order = 8)] public int PanKind { get; set; }
+
+        /// <summary>
+        /// 上次校验出来的**有效性**结论，落盘保存：<c>0</c> = 还不知道，<c>1</c> = 有效，<c>2</c> = 已失效。
+        /// <para>
+        /// 🚨 2026-10-26 用户反馈「为什么只显示一次哪个链接失效了，后面再打开就不显示了」。
+        /// 根因：原来结论只存在内存里（<c>_historyProbedAt</c> 只记时刻、不记结论），
+        /// 面板一重建就是一批全新的行，标签默认 Collapsed；而 10 分钟缓存又让校验被跳过，
+        /// 于是「第一次探测标红 → 关掉再开 → 什么都不显示」。
+        /// 结论落盘之后，重开面板（甚至重启软件）都能立刻看到上次的判定。
+        /// </para>
+        /// 旧 state.json 没有这两个字段 → 反序列化成 0 / null，等价于「还没探过」，行为不变。
+        /// </summary>
+        [DataMember(Order = 9)] public int Validity { get; set; }
+
+        /// <summary>上面那次结论的时刻（"yyyy-MM-dd HH:mm:ss"），用来做跨会话的缓存有效期。</summary>
+        [DataMember(Order = 10)] public string ValidityAt { get; set; }
     }
 
     /// <summary>
@@ -87,6 +119,38 @@ namespace GeZi
         /// 而且每条都要在面板里画出来。
         /// </summary>
         private const int MaxShareHistory = 50;
+
+        /// <summary>
+        /// 整个 state.json 的读改写互斥锁。
+        /// <para>
+        /// 🚨 2026-10-28 补：这是项目里**唯一**没有锁的持久化点
+        /// （<c>SettingsStore.IoLock</c>、<c>AccountStore.Locker</c>、<c>LogStore.Gate</c> 都有）。
+        /// </para>
+        /// <para>
+        /// 竞态双方是真实存在的：
+        /// ① <c>MainWindow.Pending.SyncPending</c> 在 UI 线程调 <c>SetPending</c>；
+        /// ② <c>MainWindow.History</c> 里分享有效性校验跑在
+        ///   <c>await Task.WhenAll(...).ConfigureAwait(false)</c> 之后的**线程池线程**上，
+        ///   调 <c>SetShareValidity</c>。
+        /// </para>
+        /// <para>
+        /// 每个方法都是「Load 整份 → 改一块 → Save 整份」，两份整表没有锁就会
+        /// 后写者用**陈旧快照**覆盖前者 —— 表现就是「刚保存的未完成任务凭空消失」。
+        /// </para>
+        /// <para>
+        /// 只锁**改**操作，不锁纯读（<c>GetHistory</c>/<c>GetPending</c> 等）：
+        /// 读路径每次 Load 都从磁盘新建一个 State 对象，不存在共享可变对象；
+        /// 而 Save 用 GUID 临时文件 + File.Replace 原子替换，读到的要么是旧版要么是新版。
+        /// </para>
+        /// </summary>
+        private static readonly object Gate = new object();
+
+        /// <summary>
+        /// 可选的日志出口（由 <c>MainWindow</c> 启动时挂上）。
+        /// 历史记录读坏属于「用户该知道」的事，但这个类本身不依赖任何 UI，
+        /// 所以用可空回调，没挂就当哑巴。
+        /// </summary>
+        public static Action<string> LogSink { get; set; }
 
         [DataContract]
         private sealed class State
@@ -136,13 +200,56 @@ namespace GeZi
                     }
                 }
             }
-            catch { }
+            catch (Exception ex)
+            {
+                // 🚨 原来这里是裸 catch {}：文件读坏了照样返回空 State，
+                // 而下一次任何写入（AddHistory / SetPending / AddShareHistory 全是
+                // Load→改→Save）都会把这份空状态写回去，**原始记录被永久覆盖**，
+                // 未完成任务的分片从此变成没人认领的孤儿。
+                //
+                // 所以读失败时先把坏文件改名留档，再降级成空状态。
+                QuarantineBrokenState(ex);
+            }
             return new State
             {
                 Records = new List<HistoryRecord>(),
                 Pending = new List<PendingTask>(),
                 Shares = new List<ShareHistoryEntry>(),
             };
+        }
+
+        /// <summary>
+        /// 把读不动的 <c>GeZi.state.json</c> 改名留档（<c>.broken-yyyyMMddHHmmss</c>）。
+        /// 绝不覆盖已有的留档，失败就静默放弃 —— 这里本身已经在异常路径上，
+        /// 再抛一次只会把问题放大成「连界面都打不开」。
+        /// </summary>
+        private static void QuarantineBrokenState(Exception cause)
+        {
+            try
+            {
+                string path = StatePath;
+                if (!File.Exists(path)) return;
+
+                string stamp = DateTime.Now.ToString("yyyyMMddHHmmss");
+                string target = path + ".broken-" + stamp;
+                int n = 1;
+                while (File.Exists(target))
+                {
+                    target = path + ".broken-" + stamp + "-" + n;
+                    n++;
+                }
+                File.Move(path, target);
+
+                // 留档成功 → 之后写的都是新文件，不会覆盖用户原有记录。
+                // 原始异常文本不写进日志（可能含路径），只记一句人话。
+                LogSink?.Invoke("历史记录文件读不动（" + cause.GetType().Name +
+                                "），已留档为 " + Path.GetFileName(target) + "，本次以空记录启动。");
+            }
+            catch
+            {
+                // 留档失败（文件被占用/无权限）：仍然降级成空状态，
+                // 至少保证程序能启动；用户原文件没被删。
+            }
         }
 
         private static void Save(State s)
@@ -284,25 +391,31 @@ namespace GeZi
         /// <summary>追加一条历史。超出上限时丢最旧的。</summary>
         public static void AddHistory(string name, string size, string path, string status)
         {
-            var s = Load();
-            s.Records.Add(new HistoryRecord
+            lock (Gate)
             {
-                Name = name,
-                Size = size,
-                Path = path,
-                Status = status,
-                Time = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"),
-            });
-            if (s.Records.Count > MaxRecords)
-                s.Records.RemoveRange(0, s.Records.Count - MaxRecords);
-            Save(s);
+                var s = Load();
+                s.Records.Add(new HistoryRecord
+                {
+                    Name = name,
+                    Size = size,
+                    Path = path,
+                    Status = status,
+                    Time = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"),
+                });
+                if (s.Records.Count > MaxRecords)
+                    s.Records.RemoveRange(0, s.Records.Count - MaxRecords);
+                Save(s);
+            }
         }
 
         public static void ClearHistory()
         {
-            var s = Load();
-            s.Records.Clear();
-            Save(s);
+            lock (Gate)
+            {
+                var s = Load();
+                s.Records.Clear();
+                Save(s);
+            }
         }
 
         // ---------------- 解析历史（按 h 唤出的面板用） ----------------
@@ -331,11 +444,13 @@ namespace GeZi
         ///    不能因为他又点了一次这条链接就悄悄取消。
         /// </summary>
         public static void AddShareHistory(string pwdId, string passcode, string startFid,
-            string name, bool isFolder)
+            string name, bool isFolder, int panKind = 0)
         {
             if (string.IsNullOrEmpty(pwdId)) return;
             try
             {
+                lock (Gate)
+                {
                 var s = Load();
                 bool wasPinned = false;
                 for (int i = s.Shares.Count - 1; i >= 0; i--)
@@ -354,11 +469,13 @@ namespace GeZi
                     Name = name ?? "",
                     IsFolder = isFolder,
                     Pinned = wasPinned,
+                    PanKind = panKind,
                     Time = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"),
                 });
                 if (s.Shares.Count > MaxShareHistory)
                     s.Shares.RemoveRange(0, s.Shares.Count - MaxShareHistory);
                 Save(s);
+                }
             }
             catch { }
         }
@@ -369,13 +486,50 @@ namespace GeZi
             if (string.IsNullOrEmpty(pwdId)) return;
             try
             {
+                lock (Gate)
+                {
+                    var s = Load();
+                    foreach (var e in s.Shares)
+                    {
+                        if (string.Equals(e.PwdId, pwdId, StringComparison.Ordinal))
+                            e.Pinned = pinned;
+                    }
+                    Save(s);
+                }
+            }
+            catch { }
+        }
+
+        /// <summary>
+        /// 把一批「分享是否有效」的校验结论落盘（0 未知 / 1 有效 / 2 失效）。
+        /// <para>
+        /// 一次探测可能同时得出好几条结论，这里**只写一次盘** —— 逐条 Save 会让
+        /// state.json 在一个面板打开期间被反复重写（每条一次全量序列化）。
+        /// </para>
+        /// 找不到对应 pwd_id 的（面板期间被删了）直接忽略。
+        /// </summary>
+        public static void SetShareValidity(IDictionary<string, int> results)
+        {
+            if (results == null || results.Count == 0) return;
+            try
+            {
+                lock (Gate)
+                {
                 var s = Load();
+                string now = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
+                bool changed = false;
                 foreach (var e in s.Shares)
                 {
-                    if (string.Equals(e.PwdId, pwdId, StringComparison.Ordinal))
-                        e.Pinned = pinned;
+                    int v;
+                    if (e == null || e.PwdId == null) continue;
+                    if (!results.TryGetValue(e.PwdId, out v)) continue;
+                    if (e.Validity == v && !string.IsNullOrEmpty(e.ValidityAt)) continue;
+                    e.Validity = v;
+                    e.ValidityAt = now;
+                    changed = true;
                 }
-                Save(s);
+                if (changed) Save(s);
+                }
             }
             catch { }
         }
@@ -386,22 +540,27 @@ namespace GeZi
             if (string.IsNullOrEmpty(pwdId)) return;
             try
             {
-                var s = Load();
-                for (int i = s.Shares.Count - 1; i >= 0; i--)
+                lock (Gate)
                 {
-                    if (string.Equals(s.Shares[i].PwdId, pwdId, StringComparison.Ordinal))
-                        s.Shares.RemoveAt(i);
+                    var s = Load();
+                    for (int i = s.Shares.Count - 1; i >= 0; i--)
+                    {
+                        if (string.Equals(s.Shares[i].PwdId, pwdId, StringComparison.Ordinal))
+                            s.Shares.RemoveAt(i);
+                    }
+                    Save(s);
                 }
-                Save(s);
             }
             catch { }
         }
-
         public static void ClearShareHistory()
         {
-            var s = Load();
-            s.Shares.Clear();
-            Save(s);
+            lock (Gate)
+            {
+                var s = Load();
+                s.Shares.Clear();
+                Save(s);
+            }
         }
 
         // ---------------- 未完成任务 ----------------
@@ -414,16 +573,22 @@ namespace GeZi
         /// <summary>整体覆盖未完成任务列表（由 UI 在任务状态变化时调用）。</summary>
         public static void SetPending(List<PendingTask> pending)
         {
-            var s = Load();
-            s.Pending = pending ?? new List<PendingTask>();
-            Save(s);
+            lock (Gate)
+            {
+                var s = Load();
+                s.Pending = pending ?? new List<PendingTask>();
+                Save(s);
+            }
         }
 
         public static void ClearPending()
         {
-            var s = Load();
-            s.Pending.Clear();
-            Save(s);
+            lock (Gate)
+            {
+                var s = Load();
+                s.Pending.Clear();
+                Save(s);
+            }
         }
     }
 

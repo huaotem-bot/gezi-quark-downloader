@@ -1,0 +1,383 @@
+<!--
+    进度条 / 文件列表 / 页签 / 任务列表
+    ============================================================
+    本文件是原 Styles.xaml（1930 行）按职责拆出的资源字典之一（2026-10-24 代码规范化）。
+    拆分原则：只按行区间搬运，成员文本一字未改；App.xaml 的合并顺序与拆分前一致。
+
+    规格要求（全项目通用，详见 Styles.Typography.xaml 头部）：
+      · 字体 Microsoft YaHei UI
+      · 数字/速度用 Consolas + TextFormattingMode="Display"（防跳动）
+      · 8px 栅格间距：4 / 8 / 12 / 16 / 24 / 32
+      · 圆角：卡片 12 / 按钮 8 / 输入框 10 / 徽章 6 / 导航项 8
+      · Style 用 StaticResource 引，颜色在 Style 内用 DynamicResource
+-->
+
+<ResourceDictionary xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+                    xmlns:sys="clr-namespace:System;assembly=mscorlib">
+
+
+    <!-- ============================================================
+         进度条：6px 圆角，底色 PrimaryLight，填充 Success，200ms 补间
+         ============================================================ -->
+    <Style x:Key="SlimProgressBar" TargetType="ProgressBar">
+        <Setter Property="Height" Value="6"/>
+        <Setter Property="Minimum" Value="0"/>
+        <Setter Property="Maximum" Value="100"/>
+        <Setter Property="Background" Value="{DynamicResource SurfaceSunkenBrush}"/>
+        <Setter Property="Foreground" Value="{DynamicResource SuccessBrush}"/>
+        <Setter Property="Template">
+            <Setter.Value>
+                <ControlTemplate TargetType="ProgressBar">
+                    <Grid>
+                        <Border Background="{TemplateBinding Background}" CornerRadius="3"/>
+                        <Border x:Name="PART_Track" Background="Transparent"/>
+                        <Border x:Name="PART_Indicator"
+                                Background="{TemplateBinding Foreground}"
+                                CornerRadius="3" HorizontalAlignment="Left"/>
+                    </Grid>
+                </ControlTemplate>
+            </Setter.Value>
+        </Setter>
+    </Style>
+
+    <!-- ============================================================
+         列表（文件列表 / 任务列表）
+         ============================================================ -->
+    <!-- 文件列表项：行高 40，悬停浅底，选中左侧 2px 主色竖线 -->
+    <Style x:Key="FileListItem" TargetType="ListBoxItem">
+        <Setter Property="Padding" Value="0"/>
+        <Setter Property="HorizontalContentAlignment" Value="Stretch"/>
+        <Setter Property="SnapsToDevicePixels" Value="True"/>
+        <Setter Property="Template">
+            <Setter.Value>
+                <ControlTemplate TargetType="ListBoxItem">
+                    <!--
+                        布局要点（两条都是用户实拍反馈修出来的）：
+                        ① 高亮块 Bd 必须是**圆角 + 左右留边**，否则它的直角会盖住外层
+                           列表卡（Card，CornerRadius=12）的圆角 —— 用户原话
+                           「原本是有圆角的但我一选中这个文件它的阴影就把圆角遮住了」。
+                        ② 左侧的选中指示条**不要另开一个 Border**，直接用 Bd 自己的
+                           「左侧 3px 主色边框」。
+                           历轮踩过两次坑：
+                             · SelBar 挂在外层 Grid → 比 Bd 高 1px → 圆角外露蓝尖角；
+                             · SelBar 挪进内层 Grid 但**加在 Bd 之前** → 同一 Grid 里
+                               后加的在上层，不透明的 Bd 把竖线中间整段盖住，
+                               只剩上下两端圆角"退让"处露出来 → **两个蓝点**
+                               （用户原话「我选中的文件夹的左边有两个蓝点儿」，
+                               实测 x=41 列：y46~54 蓝、y55~85 被盖、y86~95 蓝）。
+                           ✅ 正解：让 Bd 自己带 BorderThickness="3,0,0,0"，
+                              Border 会**沿着 8px 圆角把这条边描成曲线**，
+                              天然不可能溢出圆角，也不存在遮挡问题。
+                           ③ BorderThickness 恒定（未选中时 Brush=Transparent），
+                              这样内容偏移不变；Padding 由 12 减到 9 补偿那 3px。
+                    -->
+                    <Grid Background="Transparent">
+                        <Border x:Name="Bd" Background="Transparent" MinHeight="40"
+                                BorderBrush="Transparent" BorderThickness="3,0,0,0"
+                                CornerRadius="8" Margin="4,1" Padding="9,0">
+                            <ContentPresenter VerticalAlignment="Center"/>
+                        </Border>
+                    </Grid>
+                    <ControlTemplate.Triggers>
+                        <Trigger Property="IsMouseOver" Value="True">
+                            <Setter TargetName="Bd" Property="Background"
+                                    Value="{DynamicResource SurfaceAltBrush}"/>
+                        </Trigger>
+                        <Trigger Property="IsSelected" Value="True">
+                            <Setter TargetName="Bd" Property="Background"
+                                    Value="{DynamicResource SurfaceSunkenBrush}"/>
+                            <Setter TargetName="Bd" Property="BorderBrush"
+                                    Value="{DynamicResource TextPrimaryBrush}"/>
+                        </Trigger>
+                    </ControlTemplate.Triggers>
+                </ControlTemplate>
+            </Setter.Value>
+        </Setter>
+    </Style>
+
+    <!-- ============================================================
+         「获取直链」弹窗：文件管理器式页签 + 连体列表
+         ============================================================
+         用户要求「将顶上的这三个按钮变成下面文件夹的三种标签页」，
+         并明确选择「顶部文件夹标签」形态 —— 也就是资源管理器那种：
+         选中页签是白底、上沿圆角、**底边与下方内容区齐平无缝连成一体**，
+         未选中页签是灰底、略微下沉。
+
+         实现分工：
+           · TabStripBorder  —— 页签条底部的 1px 分隔线（未选中页签坐在它上面）
+           · FileTabItem     —— 单个页签（ToggleButton，圆形选中互斥）
+           · TabHostCard     —— 页签条 + 内容区的外框：只圆上面两个角，
+                                内容区白底、上边线被选中页签"吃掉"，形成连体感
+    -->
+    <Style x:Key="TabStripBorder" TargetType="Border">
+        <Setter Property="Height" Value="1"/>
+        <Setter Property="Background" Value="{DynamicResource BorderBrushSoft}"/>
+        <Setter Property="VerticalAlignment" Value="Bottom"/>
+        <Setter Property="SnapsToDevicePixels" Value="True"/>
+    </Style>
+
+    <Style x:Key="FileTabItem" TargetType="ToggleButton">
+        <Setter Property="FontFamily" Value="{StaticResource AppFontFamily}"/>
+        <Setter Property="FontSize" Value="13"/>
+        <Setter Property="Foreground" Value="{DynamicResource TextSecondaryBrush}"/>
+        <Setter Property="Cursor" Value="Hand"/>
+        <Setter Property="SnapsToDevicePixels" Value="True"/>
+        <!-- 页签之间**不留间隙**：相邻页签直接拼在一起，形成一条连续的页签带 -->
+        <Setter Property="Margin" Value="0"/>
+        <Setter Property="Padding" Value="18,7"/>
+        <!-- 页签不做键盘焦点框（弹窗里 Tab 到它反而突兀） -->
+        <Setter Property="FocusVisualStyle" Value="{x:Null}"/>
+        <Setter Property="Template">
+            <Setter.Value>
+                <ControlTemplate TargetType="ToggleButton">
+                    <!--
+                        页签观感（用户反馈「这个地方做的感觉好僵硬」后重做）：
+                        实测旧版有三处硬伤：
+                          ① 每个页签左右各 1px 边框 + 3px 间隙 → 相邻页签之间出现
+                             **双竖线**（实测 x=181 与 x=186 两条灰线夹 3px 白），
+                             读起来是"三个各自带框的盒子"而不是一条页签带；
+                          ② 选中的页签也画整圈边框 → 像按钮不像页签；
+                          ③ 未选中填充 SurfaceAlt(249,250,252) 与卡片白(255,255,255)
+                             只差 6 个灰阶，肉眼几乎看不出 → 视觉上只剩边框在起作用，
+                             机械感就是这么来的。
+
+                        ✅ 现在：**去掉全部边框、去掉间隙**，靠"填充色差"区分状态：
+                           · 未选中 → 下沉灰底 SurfaceSunkenBrush，上沿圆角
+                           · 悬停   → 再深一档（用 BorderBrushSoft 的灰，比 sunken 深）
+                           · 选中   → 纯白底 + **顶部 2px 主色高亮线**
+                                      （用 Bd 自己的 BorderThickness="0,2,0,0"，
+                                        Border 会沿圆角把这条线描成曲线，不会溢出）
+                           · 底边 Margin 下移 1px 吃掉页签条分隔线，与下方列表连体
+                        BorderThickness 恒定（未选中时 Brush=Transparent），
+                        这样选中/未选中的内容偏移完全一致，文字不会上下跳。
+                    -->
+                    <Border x:Name="Bd"
+                            Background="{DynamicResource SurfaceSunkenBrush}"
+                            BorderBrush="Transparent"
+                            BorderThickness="0,2,0,0"
+                            CornerRadius="8,8,0,0"
+                            Padding="{TemplateBinding Padding}"
+                            MinWidth="104" MinHeight="34">
+                        <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                    </Border>
+                    <ControlTemplate.Triggers>
+                        <Trigger Property="IsMouseOver" Value="True">
+                            <Setter TargetName="Bd" Property="Background"
+                                    Value="{DynamicResource BorderBrushSoft}"/>
+                        </Trigger>
+                        <!-- 选中：白底 + 顶部主色高亮线 + 主色文字，底边压掉分隔线 -->
+                        <Trigger Property="IsChecked" Value="True">
+                            <Setter TargetName="Bd" Property="Background"
+                                    Value="{DynamicResource SurfaceBrush}"/>
+                            <Setter TargetName="Bd" Property="BorderBrush"
+                                    Value="{DynamicResource TextPrimaryBrush}"/>
+                            <Setter TargetName="Bd" Property="Margin" Value="0,0,0,-1"/>
+                            <Setter Property="Foreground"
+                                    Value="{DynamicResource TextPrimaryBrush}"/>
+                            <Setter Property="FontWeight" Value="SemiBold"/>
+                        </Trigger>
+                    </ControlTemplate.Triggers>
+                </ControlTemplate>
+            </Setter.Value>
+        </Setter>
+    </Style>
+
+    <!-- 页签条 + 内容区的外框：上面两角圆、下面两角方，内容区白底无边 -->
+    <Style x:Key="TabHostCard" TargetType="Border">
+        <Setter Property="Background" Value="{DynamicResource SurfaceBrush}"/>
+        <Setter Property="BorderBrush" Value="{DynamicResource BorderBrushSoft}"/>
+        <Setter Property="BorderThickness" Value="1,0,1,1"/>
+        <Setter Property="CornerRadius" Value="0,0,10,10"/>
+        <Setter Property="SnapsToDevicePixels" Value="True"/>
+    </Style>
+
+    <!--
+        弹窗里的朴素列表项：圆角高亮 + 悬停，左右留边不糊住外层卡片圆角。
+        给「获取直链」这类自绘弹窗用 —— 与 FileListItem 的观感一致，
+        但更紧凑（弹窗内容密度高）。
+    -->
+    <Style x:Key="DialogListItem" TargetType="ListBoxItem">
+        <Setter Property="Padding" Value="0"/>
+        <Setter Property="HorizontalContentAlignment" Value="Stretch"/>
+        <Setter Property="SnapsToDevicePixels" Value="True"/>
+        <Setter Property="Template">
+            <Setter.Value>
+                <ControlTemplate TargetType="ListBoxItem">
+                    <Border x:Name="Bd" Background="Transparent"
+                            CornerRadius="6" Margin="4,1" Padding="10,0" MinHeight="30">
+                        <ContentPresenter VerticalAlignment="Center"/>
+                    </Border>
+                    <ControlTemplate.Triggers>
+                        <Trigger Property="IsMouseOver" Value="True">
+                            <Setter TargetName="Bd" Property="Background"
+                                    Value="{DynamicResource SurfaceAltBrush}"/>
+                        </Trigger>
+                        <Trigger Property="IsSelected" Value="True">
+                            <Setter TargetName="Bd" Property="Background"
+                                    Value="{DynamicResource SurfaceSunkenBrush}"/>
+                        </Trigger>
+                    </ControlTemplate.Triggers>
+                </ControlTemplate>
+            </Setter.Value>
+        </Setter>
+    </Style>
+
+    <!--
+        无装饰的列表行容器 —— `PlainListBox` 的默认 ItemContainerStyle。
+
+        WPF 默认的 ListBoxItem 模板自带两条「系统蓝」：
+          · IsSelected  → 蓝底 + 白字（SystemColors.HighlightBrush）
+          · IsKeyboardFocusWithin → **1px 浅蓝描边**（ListBoxItemKeyboardFocusVisualBrushKey）
+        在这套自绘界面里非常突兀 —— 用户截图反馈「这个选定窗口的蓝边太丑了」，
+        而且那圈蓝框是**矩形**，套在圆角行卡片外面，边缘还是错开的。
+
+        行内容自己就是一张完整卡片（背景/描边/圆角/内边距全在行里画），
+        所以容器只需要原样呈现内容：纯 ContentPresenter，选中/焦点一律不给任何视觉。
+        ⚠️ 别在这里加 Border/Padding —— 行卡片的留白由行自己控制，加了会双重内缩。
+    -->
+    <Style x:Key="PlainListRow" TargetType="ListBoxItem">
+        <Setter Property="Padding" Value="0"/>
+        <Setter Property="HorizontalContentAlignment" Value="Stretch"/>
+        <Setter Property="SnapsToDevicePixels" Value="True"/>
+        <!-- 去掉键盘焦点那圈虚线/蓝框 -->
+        <Setter Property="FocusVisualStyle" Value="{x:Null}"/>
+        <Setter Property="Template">
+            <Setter.Value>
+                <ControlTemplate TargetType="ListBoxItem">
+                    <ContentPresenter HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}"
+                                      VerticalAlignment="{TemplateBinding VerticalContentAlignment}"
+                                      SnapsToDevicePixels="{TemplateBinding SnapsToDevicePixels}"/>
+                </ControlTemplate>
+            </Setter.Value>
+        </Setter>
+    </Style>
+
+    <!--
+        任务行上的「播放 / 暂停」图标按钮（无文字，图标随状态互换）。
+
+        控制**这个下载任务**的暂停 / 恢复 —— 与右键菜单的「暂停 / 恢复」同一套逻辑。
+        ⚠️ **不是"控制播放器"**：GeZi 是把文件交给 VLC 等**外部播放器**打开的，
+        控制不了外部播放器的播放/暂停；要做那个就得内置播放器，是另一个量级的功能。
+
+        图标：进行中/排队中 → ⏸（点它=暂停）；已暂停 → ▶（点它=继续，同时染成警示黄）。
+        终态（完成/失败/已取消）没有暂停恢复的意义 → 整个按钮收起，不占位置。
+    -->
+    <Style x:Key="TaskPauseButton" TargetType="Button">
+        <Setter Property="Width" Value="28"/>
+        <Setter Property="Height" Value="28"/>
+        <Setter Property="Cursor" Value="Hand"/>
+        <Setter Property="FocusVisualStyle" Value="{x:Null}"/>
+        <Setter Property="ToolTip" Value="暂停这个任务"/>
+        <Setter Property="Template">
+            <Setter.Value>
+                <ControlTemplate TargetType="Button">
+                    <Border x:Name="Bd" Background="Transparent" CornerRadius="6">
+                        <Path x:Name="Ico" Data="{StaticResource IconPause}"
+                              Stretch="Uniform" Width="11" Height="11"
+                              HorizontalAlignment="Center" VerticalAlignment="Center"
+                              Stroke="{DynamicResource TextSecondaryBrush}"
+                              StrokeThickness="2"
+                              StrokeStartLineCap="Round" StrokeEndLineCap="Round"
+                              StrokeLineJoin="Round"/>
+                    </Border>
+                    <ControlTemplate.Triggers>
+                        <Trigger Property="IsMouseOver" Value="True">
+                            <Setter TargetName="Bd" Property="Background"
+                                    Value="{DynamicResource SurfaceAltBrush}"/>
+                            <Setter TargetName="Ico" Property="Stroke"
+                                    Value="{DynamicResource TextPrimaryBrush}"/>
+                        </Trigger>
+                        <!-- 已暂停 → 换成播放三角，并染成警示色，一眼看出"点它能继续" -->
+                        <DataTrigger Binding="{Binding State}" Value="Paused">
+                            <Setter TargetName="Ico" Property="Data"
+                                    Value="{StaticResource IconPlay}"/>
+                            <Setter TargetName="Ico" Property="Stroke"
+                                    Value="{DynamicResource WarningBrush}"/>
+                            <Setter Property="ToolTip" Value="继续这个任务"/>
+                        </DataTrigger>
+                        <!-- 终态：没有暂停/恢复的意义，收起按钮（Collapsed 不占位） -->
+                        <DataTrigger Binding="{Binding State}" Value="Completed">
+                            <Setter Property="Visibility" Value="Collapsed"/>
+                        </DataTrigger>
+                        <DataTrigger Binding="{Binding State}" Value="Failed">
+                            <Setter Property="Visibility" Value="Collapsed"/>
+                        </DataTrigger>
+                        <DataTrigger Binding="{Binding State}" Value="Cancelled">
+                            <Setter Property="Visibility" Value="Collapsed"/>
+                        </DataTrigger>
+                    </ControlTemplate.Triggers>
+                </ControlTemplate>
+            </Setter.Value>
+        </Setter>
+    </Style>
+
+    <!-- 任务列表项（卡片式，高度自适应） -->
+    <Style x:Key="TaskListItem" TargetType="ListBoxItem">
+        <Setter Property="Padding" Value="0"/>
+        <!-- 🚨 2026-10-26 用户要求（第 8 张图）：「在不删任何按钮和显示的前提下，把上下间距变小，
+             让一屏能显示更多任务」。
+             原来卡片内边距 14,12 + 卡片间距 8 = 单行约 70px，一屏只放得下 6 条。
+             现在 12,9 + 间距 6（第二排的上边距同时从 8 收到 4），单行约 58px，
+             同样的高度能多显示 2 条；按钮、车道、进度条一个都没动。 -->
+        <Setter Property="Margin" Value="0,0,0,6"/>
+        <Setter Property="HorizontalContentAlignment" Value="Stretch"/>
+        <Setter Property="SnapsToDevicePixels" Value="True"/>
+        <!-- 关掉系统虚线焦点框，改由模板里的 IsKeyboardFocused 触发器用主色描边表示焦点。 -->
+        <Setter Property="FocusVisualStyle" Value="{x:Null}"/>
+        <Setter Property="Template">
+            <Setter.Value>
+                <ControlTemplate TargetType="ListBoxItem">
+                    <Border x:Name="Bd" CornerRadius="12"
+                            Background="{DynamicResource SurfaceBrush}"
+                            BorderBrush="{DynamicResource BorderBrushSoft}"
+                            BorderThickness="1"
+                            Padding="12,9">
+                        <ContentPresenter/>
+                    </Border>
+                    <ControlTemplate.Triggers>
+                        <Trigger Property="IsMouseOver" Value="True">
+                            <Setter TargetName="Bd" Property="BorderBrush"
+                                    Value="{DynamicResource BorderBrushStrong}"/>
+                        </Trigger>
+                        <Trigger Property="IsSelected" Value="True">
+                            <Setter TargetName="Bd" Property="BorderBrush"
+                                    Value="{DynamicResource TextPrimaryBrush}"/>
+                            <Setter TargetName="Bd" Property="Background"
+                                    Value="{DynamicResource SurfaceSunkenBrush}"/>
+                        </Trigger>
+                        <!-- 键盘焦点：WPF 默认会给一个虚线焦点框，套在圆角卡片上很难看，
+                             所以 FocusVisualStyle 已被关掉（见下方 Setter）。这里用主色描边
+                             顶上 —— 否则纯键盘操作时「当前落在哪一条」完全看不出来。
+                             只在 IsKeyboardFocused（不是 IsKeyboardFocusWithin）时生效：
+                             焦点落到卡片内部的按钮上时不该再高亮整张卡。 -->
+                        <Trigger Property="IsKeyboardFocused" Value="True">
+                            <Setter TargetName="Bd" Property="BorderBrush"
+                                    Value="{DynamicResource PrimaryBrush}"/>
+                        </Trigger>
+                    </ControlTemplate.Triggers>
+                </ControlTemplate>
+            </Setter.Value>
+        </Setter>
+    </Style>
+
+    <!-- 容器级：关掉 ListBox 默认边框与选中高亮 -->
+    <Style x:Key="PlainListBox" TargetType="ListBox">        <Setter Property="Background" Value="Transparent"/>
+        <Setter Property="BorderThickness" Value="0"/>
+        <Setter Property="HorizontalContentAlignment" Value="Stretch"/>
+        <Setter Property="ScrollViewer.HorizontalScrollBarVisibility" Value="Disabled"/>
+        <Setter Property="VirtualizingPanel.IsVirtualizing" Value="True"/>
+        <Setter Property="VirtualizingPanel.VirtualizationMode" Value="Recycling"/>
+        <Setter Property="ScrollViewer.CanContentScroll" Value="True"/>
+        <Setter Property="Template">
+            <Setter.Value>
+                <ControlTemplate TargetType="ListBox">
+                    <ScrollViewer Focusable="False" Padding="{TemplateBinding Padding}">
+                        <ItemsPresenter/>
+                    </ScrollViewer>
+                </ControlTemplate>
+            </Setter.Value>
+        </Setter>
+    </Style>
+
+</ResourceDictionary>

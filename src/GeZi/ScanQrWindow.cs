@@ -1,4 +1,4 @@
-﻿// GeZi —— 多网盘下载器 (Multi-cloud downloader)
+// GeZi —— 多网盘下载器 (Multi-cloud downloader)
 // Copyright (C) 2026  Yi Yuan
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU Affero General Public License as published by
@@ -22,6 +22,14 @@ using System.Windows.Controls;
 using System.Windows.Input;
 using System.Windows.Media.Imaging;
 using GeZi.Core.Support;
+using GeZi.Providers;
+using GeZi.Providers.Quark;
+using GeZi.Providers.Uc;
+using GeZi.Providers.Aliyun;
+using GeZi.Providers.Xunlei;
+using GeZi.Providers.Shared;
+using GeZi.Providers.Qr;
+using GeZi.Services;
 using WpfImage = System.Windows.Controls.Image;   // 避免与 System.Drawing.Image 撞名
 
 namespace GeZi
@@ -66,7 +74,8 @@ namespace GeZi
             //   原来预览卡是 Star 行拉伸占满整个窗口（白框巨大），
             //   现在预览卡固定 220 高、居中，窗口跟着收小。
             DialogChrome.StyleWindow(this, 440, 440);
-            DialogChrome.ApplyRoundedCorners(this);
+            // 圆角与标题栏深浅在 OnSourceInitialized 里设 —— 构造函数里窗口句柄还是
+            // IntPtr.Zero，那里调是静默无效的（曾经因为这一行以为"圆角已经加过了"）。
         }
 
         protected override void OnSourceInitialized(EventArgs e)
@@ -99,9 +108,7 @@ namespace GeZi
             root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });   // 状态
             root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });   // 按钮
 
-            var title = DialogChrome.PageTitle("识别二维码");
-            Grid.SetRow(title, 0);
-            root.Children.Add(title);
+            // 标题已画在自绘标题栏里（2026-10-26），内容区不再重复。
 
             // 原本这里有一段三行的操作说明文字
             //（"把夸克分享二维码图片识别成链接。支持三种方式：…"），已**删除**。

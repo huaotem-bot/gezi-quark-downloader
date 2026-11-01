@@ -32,8 +32,13 @@ namespace GeZi.Core.Api
     /// 注意：这是**新网盘客户端专用**的工具类。夸克的 <c>QuarkClient</c> 保留自己的
     /// 私有辅助方法不动 —— 那是已经跑通的代码，没必要为了复用去改它。
     /// </para>
+    /// <para>
+    /// ⚠️ 可见性必须是 <c>public</c>：本项目拆成 GeZi.Core / GeZi.Providers 两个程序集后，
+    /// Providers 里的四家网盘客户端都要用它。原先同程序集时写的是 internal，
+    /// 拆分后会报 CS0122（"不可访问，因为它具有一定的保护级别"）。
+    /// </para>
     /// </summary>
-    internal static class PanJson
+    public static class PanJson
     {
         public static object Deserialize(string json)
         {

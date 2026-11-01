@@ -1,0 +1,367 @@
+<!--
+    侧栏导航 / 头像 / 容量条
+    ============================================================
+    本文件是原 Styles.xaml（1930 行）按职责拆出的资源字典之一（2026-10-24 代码规范化）。
+    拆分原则：只按行区间搬运，成员文本一字未改；App.xaml 的合并顺序与拆分前一致。
+
+    规格要求（全项目通用，详见 Styles.Typography.xaml 头部）：
+      · 字体 Microsoft YaHei UI
+      · 数字/速度用 Consolas + TextFormattingMode="Display"（防跳动）
+      · 8px 栅格间距：4 / 8 / 12 / 16 / 24 / 32
+      · 圆角：卡片 12 / 按钮 8 / 输入框 10 / 徽章 6 / 导航项 8
+      · Style 用 StaticResource 引，颜色在 Style 内用 DynamicResource
+-->
+
+<ResourceDictionary xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+                    xmlns:sys="clr-namespace:System;assembly=mscorlib">
+
+
+    <!-- ============================================================
+         内容区（原「左侧导航 + 右侧内容」TabControl，2026-10-02 拆分）
+         ============================================================
+         设计取舍：MainWindow 的 code-behind 里大量使用
+         `Tabs.SelectedIndex = n` 切换页面（登录跳转、下载后跳任务页等）。
+         为了「只换皮肤不动逻辑」，这里**保留真实 TabControl**，
+         但只让它负责**内容区** —— 左侧导航改由 MainWindow.xaml 里的
+         独立 ListBox 承担，两者用 SelectedIndex 双向同步。
+
+         为什么必须搬出来（不是审美问题，是硬的编译约束）：
+         ControlTemplate 里的 `x:Name` **不是**类的字段。上一轮把
+         AccountText / CapacityText 放进这个模板的侧栏里，直接导致
+         `CS0103: 当前上下文中不存在名称"AccountText"`（6 处）。
+         侧栏里有账号卡，账号卡要被 code-behind 读写，就必须待在
+         真实可视树里。所以侧栏整体搬出模板。
+
+         ⚠️ 内容呈现的坑（已实测）：
+         WPF 的 TabControl **不通过 SelectedContent 呈现内容**，
+         而是让**每个 TabItem 自己的模板**用 ContentPresenter 呈现 Content。
+         所以在 TabControl 模板里放 `ContentPresenter ContentSource="SelectedContent"`
+         会拿到空内容（UIA 里内容区整棵子树消失）。
+         正确做法：TabControl 模板里只放 ItemsPresenter 的宿主，
+         内容由 TabItem 模板里的 ContentPresenter 负责。
+         ============================================================ -->
+    <Style x:Key="NavTabControl" TargetType="TabControl">
+        <Setter Property="Background" Value="Transparent"/>
+        <Setter Property="BorderThickness" Value="0"/>
+        <Setter Property="Template">
+            <Setter.Value>
+                <ControlTemplate TargetType="TabControl">
+                    <Border Background="{DynamicResource AppBgBrush}">
+                        <!--
+                            ⚠️ 关键点（实测出来的三条）：
+                            1. ItemsPresenter 必须存在，否则 TabItem 不被实例化。
+                            2. **不能**再放 `ContentPresenter ContentSource="SelectedContent"`：
+                               内容由 TabItem 自己的模板呈现。多放一个会让每个页面
+                               被渲染两遍（UIA 里能看到重复的文本节点）。
+                            3. ItemsPanel 换掉默认的 TabPanel：TabPanel 是给
+                               "横排页签条"用的，它会把 TabItem 排到内容区之外
+                               （实测报出 y=-20，即窗口上方不可见区）。
+                               用 Grid 让唯一的可见 TabItem 铺满整个内容区。
+                        -->
+                        <ItemsPresenter/>
+                    </Border>
+                </ControlTemplate>
+            </Setter.Value>
+        </Setter>
+        <Setter Property="ItemsPanel">
+            <Setter.Value>
+                <ItemsPanelTemplate>
+                    <Grid/>
+                </ItemsPanelTemplate>
+            </Setter.Value>
+        </Setter>
+    </Style>
+
+    <!-- ============================================================
+         内容区页签（TabItem）—— 导航已搬到侧栏 ListBox，页签头完全不画
+         ============================================================
+         为什么不能直接把 TabItem 删掉换成 ContentControl：
+         code-behind 里有 6 处 `Tabs.SelectedIndex = n`，以及 SelectedItem /
+         SelectionChanged 语义。保留 TabControl + 4 个 TabItem 最省事。
+
+         ⚠️ 三个必须点（都是实测踩出来的）：
+         1. 模板里要放 `<ContentPresenter ContentSource="Content"/>` ——
+            WPF 的 TabControl 不负责呈现内容，内容由**每个 TabItem 自己的模板**
+            呈现。不放心会内容区整棵消失。
+         2. **不能**画 Header 的 ContentPresenter —— 页签头要完全不可见。
+         3. **必须**自己写 `IsSelected=False → Visibility=Collapsed`：
+            通常这件事是 TabPanel 干的（它只显示选中项），但我们在
+            NavTabControl 里为了"内容铺满"把 ItemsPanel 换成了 Grid，
+            于是没人再做隐藏 —— 4 个页面会叠在同一坐标全部渲染
+            （实测：UIA 里 4 个页面都在 (221,37)、都报 off=0）。
+         ============================================================ -->
+    <Style x:Key="HeadlessTabItem" TargetType="TabItem">
+        <Setter Property="Padding" Value="0"/>
+        <Setter Property="Margin" Value="0"/>
+        <Setter Property="HorizontalContentAlignment" Value="Stretch"/>
+        <Setter Property="VerticalContentAlignment" Value="Stretch"/>
+        <Setter Property="Template">
+            <Setter.Value>
+                <ControlTemplate TargetType="TabItem">
+                    <Border x:Name="Bd" Background="Transparent">
+                        <ContentPresenter ContentSource="Content"/>
+                    </Border>
+                    <ControlTemplate.Triggers>
+                        <Trigger Property="IsSelected" Value="False">
+                            <Setter TargetName="Bd" Property="Visibility" Value="Collapsed"/>
+                        </Trigger>
+                    </ControlTemplate.Triggers>
+                </ControlTemplate>
+            </Setter.Value>
+        </Setter>
+    </Style>
+
+    <!--
+        侧栏导航项（ListBoxItem）—— 与旧的 NavTabItem 视觉一致，
+        但换成 ListBox 承载，这样它就在真实可视树里，且不必再跟
+        TabControl 的 ItemsPanel/TabPanel 语义纠缠。
+
+        ⚠️ 关于"选中淡蓝底比按钮大一圈、圆角也不对"：
+        根因是**焦点环在鼠标点击时也亮起**。ListBoxItem 被鼠标点中后
+        IsKeyboardFocused 同样为 True，于是内层 Bd（选中底，圆角 8）
+        与外层 FocusRing（Margin=2、圆角 10）同时出现，两层叠在一起，
+        视觉上就是"蓝底外面又套了一圈，圆角还对不上"。
+        正解：焦点环是**键盘导航专用**的无障碍提示，鼠标操作不该出现。
+        做法：仅在 IsKeyboardFocused=True **且** IsMouseOver=False 时显示
+        （键盘 Tab 过去时鼠标不在该项上；鼠标点击时必然在）。
+    -->
+    <Style x:Key="NavListItem" TargetType="ListBoxItem">
+        <Setter Property="FontFamily" Value="{StaticResource AppFontFamily}"/>
+        <Setter Property="FontSize" Value="13.5"/>
+        <Setter Property="Foreground" Value="{DynamicResource TextSecondaryBrush}"/>
+        <Setter Property="Padding" Value="0"/>
+        <Setter Property="Margin" Value="0,1,0,1"/>
+        <Setter Property="Cursor" Value="Hand"/>
+        <Setter Property="HorizontalContentAlignment" Value="Stretch"/>
+        <Setter Property="SnapsToDevicePixels" Value="True"/>
+        <!-- 关掉系统默认焦点虚线框，用我们自己的 FocusRing -->
+        <Setter Property="FocusVisualStyle" Value="{x:Null}"/>
+        <Setter Property="Template">
+            <Setter.Value>
+                <ControlTemplate TargetType="ListBoxItem">
+                    <Grid>
+                        <Border x:Name="Bd" CornerRadius="8" Background="Transparent"
+                                BorderThickness="1" BorderBrush="Transparent">
+                            <Grid>
+                                <!--
+                                     三层叠加替代原来的"整块换底色"：
+                                     ① SelBg   选中底色（SurfaceSunken 浅灰）
+                                     ② HoverBg 悬停底色（SurfaceAlt，叠在选中层之上，
+                                                所以选中项悬停时显示的是悬停色）
+                                     ③ RippleHost 波纹画布（RippleEffect.cs 动态加椭圆，
+                                                裁到圆角；必须位于底色之上、内容之下）
+                                     两层底色平时 Opacity=0，由触发器做透明度过渡 ——
+                                     硬切底色是"生硬感"的根源，150ms 淡入淡出即可消掉。 -->
+                                <Border x:Name="SelBg" CornerRadius="8" Opacity="0"
+                                        Background="{DynamicResource SurfaceSunkenBrush}"
+                                        IsHitTestVisible="False"/>
+                                <Border x:Name="HoverBg" CornerRadius="8" Opacity="0"
+                                        Background="{DynamicResource SurfaceAltBrush}"
+                                        IsHitTestVisible="False"/>
+                                <Canvas x:Name="RippleHost" ClipToBounds="True"
+                                        IsHitTestVisible="False"/>
+                                <!-- 选中：左侧 3px 指示竖条（淡入淡出，不再硬弹）。
+                                     从主色蓝改成 TextPrimary（深灰/黑）——
+                                     蓝色只留给 Logo。指示性靠这条深色竖线 + 底色 + 粗体共同表达。 -->
+                                <Border x:Name="SelBar" Width="3" CornerRadius="2"
+                                        HorizontalAlignment="Left" Margin="2,7"
+                                        Opacity="0"
+                                        Background="{DynamicResource TextPrimaryBrush}"
+                                        Visibility="Collapsed"/>
+                                <ContentPresenter Margin="14,10" VerticalAlignment="Center"/>
+                            </Grid>
+                        </Border>
+                        <!-- 焦点环：与 Bd 同几何（不设 Margin），只用描边区分，
+                             避免出现"外面套一圈更大的框" -->
+                        <Border x:Name="FocusRing" CornerRadius="8"
+                                BorderBrush="{DynamicResource TextPrimaryBrush}"
+                                BorderThickness="1.5" Visibility="Collapsed"
+                                IsHitTestVisible="False"/>
+                    </Grid>
+                    <ControlTemplate.Triggers>
+                        <!-- 悬停：底色淡入 150ms（先快后慢）/ 淡出 120ms。
+                             文字色与字重不参与过渡 —— 纯文字的瞬间切换反而利落，
+                             且 Foreground 在触发器和内容绑定上同时生效，动画它容易打架。 -->
+                        <Trigger Property="IsMouseOver" Value="True">
+                            <Trigger.EnterActions>
+                                <BeginStoryboard>
+                                    <Storyboard>
+                                        <DoubleAnimation Storyboard.TargetName="HoverBg"
+                                                         Storyboard.TargetProperty="Opacity"
+                                                         To="1" Duration="0:0:0.15">
+                                            <DoubleAnimation.EasingFunction>
+                                                <CubicEase EasingMode="EaseOut"/>
+                                            </DoubleAnimation.EasingFunction>
+                                        </DoubleAnimation>
+                                    </Storyboard>
+                                </BeginStoryboard>
+                            </Trigger.EnterActions>
+                            <Trigger.ExitActions>
+                                <BeginStoryboard>
+                                    <Storyboard>
+                                        <DoubleAnimation Storyboard.TargetName="HoverBg"
+                                                         Storyboard.TargetProperty="Opacity"
+                                                         To="0" Duration="0:0:0.12"/>
+                                    </Storyboard>
+                                </BeginStoryboard>
+                            </Trigger.ExitActions>
+                        </Trigger>
+                        <!-- 选中：底色平滑过渡 180ms + 竖条淡入；文字加粗瞬间（见上）。
+                             选中底色从 PrimaryLightBrush（淡蓝块）
+                             改成 SurfaceSunkenBrush（中性浅灰）。
+                             为什么：白底 + 淡蓝选中块 + 蓝色图标是"模板化 UI"的典型配方，
+                             用户一眼就认出"模板感"。改成中性灰后，蓝色只出现在左侧那条
+                             3px 竖线上 —— 克制、有指示性、不抢戏（VSCode / Linear 的做法）。
+                             文字用 TextPrimary + SemiBold 表达"被选中"，不再靠变蓝。 -->
+                        <Trigger Property="IsSelected" Value="True">
+                            <Trigger.EnterActions>
+                                <BeginStoryboard>
+                                    <Storyboard>
+                                        <DoubleAnimation Storyboard.TargetName="SelBg"
+                                                         Storyboard.TargetProperty="Opacity"
+                                                         To="1" Duration="0:0:0.18">
+                                            <DoubleAnimation.EasingFunction>
+                                                <CubicEase EasingMode="EaseOut"/>
+                                            </DoubleAnimation.EasingFunction>
+                                        </DoubleAnimation>
+                                        <ObjectAnimationUsingKeyFrames Storyboard.TargetName="SelBar"
+                                                                       Storyboard.TargetProperty="Visibility">
+                                            <DiscreteObjectKeyFrame KeyTime="0:0:0"
+                                                Value="{x:Static Visibility.Visible}"/>
+                                        </ObjectAnimationUsingKeyFrames>
+                                        <DoubleAnimation Storyboard.TargetName="SelBar"
+                                                         Storyboard.TargetProperty="Opacity"
+                                                         To="1" Duration="0:0:0.15">
+                                            <DoubleAnimation.EasingFunction>
+                                                <CubicEase EasingMode="EaseOut"/>
+                                            </DoubleAnimation.EasingFunction>
+                                        </DoubleAnimation>
+                                    </Storyboard>
+                                </BeginStoryboard>
+                            </Trigger.EnterActions>
+                            <Trigger.ExitActions>
+                                <BeginStoryboard>
+                                    <Storyboard>
+                                        <DoubleAnimation Storyboard.TargetName="SelBg"
+                                                         Storyboard.TargetProperty="Opacity"
+                                                         To="0" Duration="0:0:0.15"/>
+                                        <ObjectAnimationUsingKeyFrames Storyboard.TargetName="SelBar"
+                                                                       Storyboard.TargetProperty="Visibility">
+                                            <DiscreteObjectKeyFrame KeyTime="0:0:0"
+                                                Value="{x:Static Visibility.Collapsed}"/>
+                                        </ObjectAnimationUsingKeyFrames>
+                                        <DoubleAnimation Storyboard.TargetName="SelBar"
+                                                         Storyboard.TargetProperty="Opacity"
+                                                         To="0" Duration="0:0:0.12"/>
+                                    </Storyboard>
+                                </BeginStoryboard>
+                            </Trigger.ExitActions>
+                            <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}"/>
+                            <Setter Property="FontWeight" Value="SemiBold"/>
+                        </Trigger>
+                        <!--
+                            键盘焦点环：多加一个 IsMouseOver=False 条件。
+                            单靠 IsKeyboardFocused 会在鼠标点击后也亮起（就是那个 bug）。
+                        -->
+                        <MultiTrigger>
+                            <MultiTrigger.Conditions>
+                                <Condition Property="IsKeyboardFocused" Value="True"/>
+                                <Condition Property="IsMouseOver" Value="False"/>
+                            </MultiTrigger.Conditions>
+                            <Setter TargetName="FocusRing" Property="Visibility" Value="Visible"/>
+                        </MultiTrigger>
+                    </ControlTemplate.Triggers>
+                </ControlTemplate>
+            </Setter.Value>
+        </Setter>
+    </Style>
+
+    <!-- 导航项内部：图标 + 文字 -->
+    <Style x:Key="NavItemIcon" TargetType="Path">
+        <Setter Property="Width" Value="18"/>
+        <Setter Property="Height" Value="18"/>
+        <Setter Property="Stretch" Value="Uniform"/>
+        <Setter Property="VerticalAlignment" Value="Center"/>
+        <Setter Property="Stroke" Value="{Binding Foreground,
+                    RelativeSource={RelativeSource AncestorType=ListBoxItem}}"/>
+        <Setter Property="StrokeThickness" Value="1.9"/>
+        <Setter Property="StrokeStartLineCap" Value="Round"/>
+        <Setter Property="StrokeEndLineCap" Value="Round"/>
+        <Setter Property="StrokeLineJoin" Value="Round"/>
+    </Style>
+
+    <Style x:Key="NavItemText" TargetType="TextBlock">
+        <Setter Property="FontFamily" Value="{StaticResource AppFontFamily}"/>
+        <Setter Property="FontSize" Value="13.5"/>
+        <Setter Property="VerticalAlignment" Value="Center"/>
+        <Setter Property="Margin" Value="11,0,0,0"/>
+        <Setter Property="Foreground" Value="{Binding Foreground,
+                    RelativeSource={RelativeSource AncestorType=ListBoxItem}}"/>
+    </Style>
+
+    <!-- 侧栏导航容器：无边框、无滚动条、不虚拟化（只有 4 项） -->
+    <Style x:Key="NavListBox" TargetType="ListBox">
+        <Setter Property="Background" Value="Transparent"/>
+        <Setter Property="BorderThickness" Value="0"/>
+        <Setter Property="Padding" Value="0"/>
+        <Setter Property="HorizontalContentAlignment" Value="Stretch"/>
+        <Setter Property="ScrollViewer.HorizontalScrollBarVisibility" Value="Disabled"/>
+        <Setter Property="ScrollViewer.VerticalScrollBarVisibility" Value="Disabled"/>
+        <Setter Property="Focusable" Value="True"/>
+        <Setter Property="Template">
+            <Setter.Value>
+                <ControlTemplate TargetType="ListBox">
+                    <ItemsPresenter/>
+                </ControlTemplate>
+            </Setter.Value>
+        </Setter>
+    </Style>
+
+    <!-- ============================================================
+         账号卡（侧栏左下角）
+         ============================================================
+         取代原来挤在标题栏右侧的「已登录: 已登录用户 | 容量: 3.99 GB / 10.04 GB」。
+         参考 Motrix / qBittorrent：账号与状态属于"全局身份信息"，
+         固定放在侧栏底部；容量用进度条而不是一串数字 —— 数字要读，
+         进度条一眼就知道。占用率越高颜色越警示（状态色编码）。
+         ============================================================ -->
+    <!-- 头像底色从 PrimaryBrush（实心蓝圆）改成
+         SurfaceSunkenBrush（中性浅灰圆）+ 文字 TextPrimary。
+         为什么：左下角一个实心蓝圆是整页最抢眼的色块，但账号卡的重要性排不上号
+         （"AI味"诊断里指出"控件比例失调"）。改成中性后蓝色彻底从侧栏区域消失，
+         只留在该用的地方（主按钮、聚焦态、选中竖线）。 -->
+    <Style x:Key="AvatarBorder" TargetType="Border">
+        <Setter Property="Width" Value="28"/>
+        <Setter Property="Height" Value="28"/>
+        <Setter Property="CornerRadius" Value="14"/>
+        <Setter Property="Background" Value="{DynamicResource SurfaceSunkenBrush}"/>
+        <Setter Property="SnapsToDevicePixels" Value="True"/>
+    </Style>
+
+    <!-- 容量条：极细（2px），底色凹陷，填充色由 code-behind 按占用率给
+         4px → 2px：账号卡是全页最不该抢戏的元素，进度条做成一条细线。
+         ⚠️ **填充色保留三色语义编码**（CapacityLow/Mid/High = 绿/黄/红，越满越警示），
+         这里 Foreground 只是默认值，实际由 code-behind 覆盖 —— 别改成固定绿。 -->
+    <Style x:Key="CapacityBar" TargetType="ProgressBar">
+        <Setter Property="Height" Value="2"/>
+        <Setter Property="Minimum" Value="0"/>
+        <Setter Property="Maximum" Value="100"/>
+        <Setter Property="Background" Value="{DynamicResource SurfaceSunkenBrush}"/>
+        <Setter Property="Foreground" Value="{DynamicResource SuccessBrush}"/>
+        <Setter Property="Template">
+            <Setter.Value>
+                <ControlTemplate TargetType="ProgressBar">
+                    <Grid>
+                        <Border Background="{TemplateBinding Background}" CornerRadius="1"/>
+                        <Border x:Name="PART_Track" Background="Transparent"/>
+                        <Border x:Name="PART_Indicator"
+                                Background="{TemplateBinding Foreground}"
+                                CornerRadius="2" HorizontalAlignment="Left"/>
+                    </Grid>
+                </ControlTemplate>
+            </Setter.Value>
+        </Setter>
+    </Style>
+
+</ResourceDictionary>

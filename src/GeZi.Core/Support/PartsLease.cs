@@ -1,4 +1,4 @@
-﻿// GeZi —— 多网盘下载器 (Multi-cloud downloader)
+// GeZi —— 多网盘下载器 (Multi-cloud downloader)
 // Copyright (C) 2026  Yi Yuan
 //
 // This program is free software: you can redistribute it and/or modify
@@ -19,6 +19,9 @@ using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using System.Text;
+using GeZi.Core.Api;
+using GeZi.Core.Models;
+using GeZi.Core.Support;
 
 namespace GeZi.Core.Support
 {

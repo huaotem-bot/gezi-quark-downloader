@@ -28,5 +28,19 @@ namespace GeZi.Core.Models
         public string Md5 { get; set; }
         public string Sha1 { get; set; }
         public string Sha256 { get; set; }
+
+        /// <summary>
+        /// 「为了取这条直链而转存到自己网盘」产生的文件（或临时目录）id。
+        /// <para>
+        /// 只有走「分享 → 转存 → 取链」这条路的网盘才会填（阿里、迅雷）。
+        /// 夸克/UC 是免转存取链，这里恒为 null。
+        /// </para>
+        /// <para>
+        /// 🚨 这个 id 的生命周期必须跟着**下载任务**走，不能取完链就删：
+        /// 直链是 CDN 回源模式，源文件一删，正在下的分片全部回源失败 → 503 洪泛 + 速度崩。
+        /// 清理由上层在任务进入终态（完成/失败/取消）时统一触发。
+        /// </para>
+        /// </summary>
+        public string StoredId { get; set; }
     }
 }

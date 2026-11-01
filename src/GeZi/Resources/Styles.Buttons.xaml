@@ -1,0 +1,343 @@
+<!--
+    主按钮与操作按钮
+    ============================================================
+    本文件是原 Styles.xaml（1930 行）按职责拆出的资源字典之一（2026-10-24 代码规范化）。
+    拆分原则：只按行区间搬运，成员文本一字未改；App.xaml 的合并顺序与拆分前一致。
+
+    规格要求（全项目通用，详见 Styles.Typography.xaml 头部）：
+      · 字体 Microsoft YaHei UI
+      · 数字/速度用 Consolas + TextFormattingMode="Display"（防跳动）
+      · 8px 栅格间距：4 / 8 / 12 / 16 / 24 / 32
+      · 圆角：卡片 12 / 按钮 8 / 输入框 10 / 徽章 6 / 导航项 8
+      · Style 用 StaticResource 引，颜色在 Style 内用 DynamicResource
+-->
+
+<ResourceDictionary xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+                    xmlns:sys="clr-namespace:System;assembly=mscorlib">
+
+
+    <!-- 徽章（提取码、状态标签等） -->
+
+    <!-- ============================================================
+         按钮：主色实心
+         ============================================================ -->
+    <!-- 主按钮从实心靛蓝改成**深灰底白字**。
+         参考 Motrix：全站几乎零彩色，主操作用深色而非品牌蓝。
+         保留"唯一实心"的层级（与描边/幽灵按钮区分），只是把颜色从蓝换成中性深灰。
+         🚨
+            旧话是「TextOnPrimaryBrush 在深色主题下仍是白字，正好复用，不用新增画笔」，
+            这句在去蓝改造后**不再成立**：
+              · 亮色主题：SolidBtnBg=#1F2430（深底） + SolidBtnFg=#FFFFFF（白字）
+              · 深色主题：SolidBtnBg=#E8EAF0（浅底） + SolidBtnFg=#1A1D23（深字）  ← 反过来
+            ⇒ 按钮内的图标/文字**一律用 SolidBtnFgBrush**（它就是 Foreground 用的画笔）；
+            ⛔ 绝不能写 TextOnPrimaryBrush —— 那个两个主题恒为纯白，画在深色主题的浅灰底上会直接消失
+              （用户反馈「下载选中」「获取二维码」的图标看不见，就是这个原因）。 -->
+    <Style x:Key="PrimaryButton" TargetType="Button">
+        <Setter Property="FontFamily" Value="{StaticResource AppFontFamily}"/>
+        <Setter Property="FontSize" Value="13"/>
+        <Setter Property="Foreground" Value="{DynamicResource SolidBtnFgBrush}"/>
+        <Setter Property="Background" Value="{DynamicResource SolidBtnBgBrush}"/>
+        <Setter Property="Padding" Value="16,7"/>
+        <Setter Property="Cursor" Value="Hand"/>
+        <Setter Property="SnapsToDevicePixels" Value="True"/>
+        <Setter Property="Template">
+            <Setter.Value>
+                <ControlTemplate TargetType="Button">
+                    <Grid>
+                        <!-- 焦点环：默认隐藏，键盘聚焦时才出现（不改变按钮本体几何） -->
+                        <Border x:Name="FocusRing" Margin="-3" CornerRadius="12"
+                                BorderBrush="{DynamicResource BorderBrushStrong}"
+                                BorderThickness="2" Visibility="Collapsed"/>
+                        <Border x:Name="Bd"
+                                Background="{TemplateBinding Background}"
+                                CornerRadius="8"
+                                Padding="{TemplateBinding Padding}">
+                            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"
+                                              RecognizesAccessKey="True"/>
+                        </Border>
+                    </Grid>
+                    <ControlTemplate.Triggers>
+                        <!-- 悬停/按下用中性灰的明暗变化（不再用蓝色系）。
+                             BorderStrong 比 TextPrimary 略亮 = 悬停提亮；
+                             TextSecondary 更深 = 按下压暗。深浅主题下都是灰阶，不引入彩色。 -->
+                        <Trigger Property="IsMouseOver" Value="True">
+                            <Setter TargetName="Bd" Property="Background"
+                                    Value="{DynamicResource SolidBtnBgBrush}"/>
+                                    <Setter TargetName="Bd" Property="Opacity" Value="0.85"/>
+                        </Trigger>
+                        <Trigger Property="IsPressed" Value="True">
+                            <Setter TargetName="Bd" Property="Background"
+                                    Value="{DynamicResource SolidBtnBgBrush}"/>
+                                    <Setter TargetName="Bd" Property="Opacity" Value="0.72"/>
+                        </Trigger>
+                        <!--
+                            Focus 态：此前完全缺失 —— 用键盘 Tab 走一遍，界面上
+                            没有任何位置提示，这是无障碍硬伤（WCAG 2.4.7）。
+                            做法：用一层 Margin=-3 的外圈 Border 画出"焦点环"。
+                            为什么不改内部 Bd 的 BorderThickness：那会让按钮内容
+                            整体位移 1~2px（出现肉眼可见的抖动）。外圈独立绘制，
+                            按钮本体的几何完全不变。
+                        -->
+                        <Trigger Property="IsKeyboardFocused" Value="True">
+                            <Setter TargetName="FocusRing" Property="Visibility" Value="Visible"/>
+                        </Trigger>
+                        <Trigger Property="IsEnabled" Value="False">
+                            <Setter TargetName="Bd" Property="Opacity" Value="0.45"/>
+                            <Setter Property="Cursor" Value="Arrow"/>
+                        </Trigger>
+                    </ControlTemplate.Triggers>
+                </ControlTemplate>
+            </Setter.Value>
+        </Setter>
+    </Style>
+
+    <!-- ============================================================
+         按钮：次要（白底描边）
+         ============================================================ -->
+    <Style x:Key="SecondaryButton" TargetType="Button">
+        <Setter Property="FontFamily" Value="{StaticResource AppFontFamily}"/>
+        <Setter Property="FontSize" Value="13"/>
+        <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}"/>
+        <Setter Property="Background" Value="{DynamicResource SurfaceBrush}"/>
+        <!--
+            ⚠️ 水平 padding 比 PrimaryButton 少 1px：本样式有 BorderThickness=1，
+            左右各多 1px 边框，合计正好补回 16+16 = 15+15+1+1。
+            不这样补偿的话，主按钮与次按钮并排时宽度会差 4px（用户截图反馈过）。
+        -->
+        <Setter Property="Padding" Value="15,7"/>
+        <Setter Property="Cursor" Value="Hand"/>
+        <Setter Property="SnapsToDevicePixels" Value="True"/>
+        <Setter Property="Template">
+            <Setter.Value>
+                <ControlTemplate TargetType="Button">
+                    <Grid>
+                        <Border x:Name="FocusRing" Margin="-3" CornerRadius="12"
+                                BorderBrush="{DynamicResource BorderBrushStrong}"
+                                BorderThickness="2" Visibility="Collapsed"/>
+                        <Border x:Name="Bd"
+                                Background="{TemplateBinding Background}"
+                                BorderBrush="{DynamicResource BorderBrushStrong}"
+                                BorderThickness="1"
+                                CornerRadius="8"
+                                Padding="{TemplateBinding Padding}">
+                            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"
+                                              RecognizesAccessKey="True"/>
+                        </Border>
+                    </Grid>
+                    <ControlTemplate.Triggers>
+                        <Trigger Property="IsMouseOver" Value="True">
+                            <Setter TargetName="Bd" Property="Background"
+                                    Value="{DynamicResource SurfaceAltBrush}"/>
+                            <Setter TargetName="Bd" Property="BorderBrush"
+                                    Value="{DynamicResource TextPrimaryBrush}"/>
+                        </Trigger>
+                        <Trigger Property="IsPressed" Value="True">
+                            <Setter TargetName="Bd" Property="Background"
+                                    Value="{DynamicResource SurfaceSunkenBrush}"/>
+                        </Trigger>
+                        <Trigger Property="IsKeyboardFocused" Value="True">
+                            <Setter TargetName="FocusRing" Property="Visibility" Value="Visible"/>
+                        </Trigger>
+                        <Trigger Property="IsEnabled" Value="False">
+                            <Setter TargetName="Bd" Property="Opacity" Value="0.45"/>
+                            <Setter Property="Cursor" Value="Arrow"/>
+                        </Trigger>
+                    </ControlTemplate.Triggers>
+                </ControlTemplate>
+            </Setter.Value>
+        </Setter>
+    </Style>
+
+    <!-- ============================================================
+         按钮：幽灵（无边框，悬停才显浅底）—— 用于行内操作
+         ============================================================ -->
+    <!-- ============================================================
+         按钮：危险操作（红底实心）—— 删除、清空、不可撤销的动作
+         ============================================================ -->
+    <Style x:Key="DangerButton" TargetType="Button">
+        <Setter Property="FontFamily" Value="{StaticResource AppFontFamily}"/>
+        <Setter Property="FontSize" Value="13"/>
+        <Setter Property="Foreground" Value="{DynamicResource TextOnPrimaryBrush}"/>
+        <Setter Property="Background" Value="{DynamicResource DangerBrush}"/>
+        <Setter Property="Padding" Value="16,7"/>
+        <Setter Property="Cursor" Value="Hand"/>
+        <Setter Property="SnapsToDevicePixels" Value="True"/>
+        <Setter Property="Template">
+            <Setter.Value>
+                <ControlTemplate TargetType="Button">
+                    <Grid>
+                        <Border x:Name="FocusRing" Margin="-3" CornerRadius="12"
+                                BorderBrush="{DynamicResource DangerLightBrush}"
+                                BorderThickness="2" Visibility="Collapsed"/>
+                        <Border x:Name="Bd"
+                                Background="{TemplateBinding Background}"
+                                CornerRadius="8"
+                                Padding="{TemplateBinding Padding}">
+                            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"
+                                              RecognizesAccessKey="True"/>
+                        </Border>
+                    </Grid>
+                    <ControlTemplate.Triggers>
+                        <!-- 悬停/按下：整体降一点不透明度，比再挑一个红色更稳妥 -->
+                        <Trigger Property="IsMouseOver" Value="True">
+                            <Setter TargetName="Bd" Property="Opacity" Value="0.88"/>
+                        </Trigger>
+                        <Trigger Property="IsPressed" Value="True">
+                            <Setter TargetName="Bd" Property="Opacity" Value="0.75"/>
+                        </Trigger>
+                        <Trigger Property="IsKeyboardFocused" Value="True">
+                            <Setter TargetName="FocusRing" Property="Visibility" Value="Visible"/>
+                        </Trigger>
+                        <Trigger Property="IsEnabled" Value="False">
+                            <Setter TargetName="Bd" Property="Opacity" Value="0.45"/>
+                            <Setter Property="Cursor" Value="Arrow"/>
+                        </Trigger>
+                    </ControlTemplate.Triggers>
+                </ControlTemplate>
+            </Setter.Value>
+        </Setter>
+    </Style>
+
+    <Style x:Key="GhostButton" TargetType="Button">
+        <Setter Property="FontFamily" Value="{StaticResource AppFontFamily}"/>
+        <Setter Property="FontSize" Value="12"/>
+        <Setter Property="Foreground" Value="{DynamicResource TextSecondaryBrush}"/>
+        <Setter Property="Background" Value="Transparent"/>
+        <Setter Property="Padding" Value="10,5"/>
+        <Setter Property="Cursor" Value="Hand"/>
+        <Setter Property="SnapsToDevicePixels" Value="True"/>
+        <Setter Property="Template">
+            <Setter.Value>
+                <ControlTemplate TargetType="Button">
+                    <Grid>
+                        <Border x:Name="FocusRing" Margin="-3" CornerRadius="12"
+                                BorderBrush="{DynamicResource BorderBrushStrong}"
+                                BorderThickness="2" Visibility="Collapsed"/>
+                        <Border x:Name="Bd"
+                                Background="{TemplateBinding Background}"
+                                CornerRadius="8"
+                                Padding="{TemplateBinding Padding}">
+                            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"
+                                              RecognizesAccessKey="True"/>
+                        </Border>
+                    </Grid>
+                    <ControlTemplate.Triggers>
+                        <Trigger Property="IsMouseOver" Value="True">
+                            <Setter TargetName="Bd" Property="Background"
+                                    Value="{DynamicResource SurfaceAltBrush}"/>
+                            <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}"/>
+                        </Trigger>
+                        <Trigger Property="IsPressed" Value="True">
+                            <Setter TargetName="Bd" Property="Background"
+                                    Value="{DynamicResource SurfaceSunkenBrush}"/>
+                        </Trigger>
+                        <Trigger Property="IsKeyboardFocused" Value="True">
+                            <Setter TargetName="FocusRing" Property="Visibility" Value="Visible"/>
+                        </Trigger>
+                        <Trigger Property="IsEnabled" Value="False">
+                            <Setter TargetName="Bd" Property="Opacity" Value="0.4"/>
+                            <Setter Property="Cursor" Value="Arrow"/>
+                        </Trigger>
+                    </ControlTemplate.Triggers>
+                </ControlTemplate>
+            </Setter.Value>
+        </Setter>
+    </Style>
+
+    <!-- 网盘切换页签专用（2026-10-29）
+         不能复用 GhostButton：它的 hover 会把 Bd 铺成 SurfaceAltBrush（近白），
+         而页签下方压着 2px 滑块 DrivePanThumb，按钮底块比文字高 → 白底正好盖住滑块。
+         用户反馈「鼠标悬浮时出现的选中状态挡住了下方的滑块」。
+         这里 hover / 按下都**只改字色、不铺任何底色**。 -->
+    <Style x:Key="DrivePanTabButton" TargetType="Button">
+        <Setter Property="FontFamily" Value="{StaticResource AppFontFamily}"/>
+        <Setter Property="FontSize" Value="12"/>
+        <Setter Property="Foreground" Value="{DynamicResource TextSecondaryBrush}"/>
+        <Setter Property="Background" Value="Transparent"/>
+        <Setter Property="Padding" Value="10,5"/>
+        <Setter Property="Cursor" Value="Hand"/>
+        <Setter Property="SnapsToDevicePixels" Value="True"/>
+        <Setter Property="Template">
+            <Setter.Value>
+                <!-- 2026-11-01（用户要求）删掉 FocusRing 描边框：
+                     原来模板里有个 Border x:Name="FocusRing"，IsKeyboardFocused=True 时显示。
+                     用户点一下网盘页签，焦点落到按钮上 → 立刻画出一圈 2px 描边，
+                     肉眼就是「点的一瞬间冒出一个选中框」，用户反馈不美观。
+                     这与项目里其他按钮的做法一致（一律 FocusVisualStyle={x:Null}，
+                     不靠描边表达键盘焦点）。 -->
+                <ControlTemplate TargetType="Button">
+                    <Border x:Name="Bd"
+                            Background="{TemplateBinding Background}"
+                            CornerRadius="8"
+                            Padding="{TemplateBinding Padding}">
+                        <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"
+                                          RecognizesAccessKey="True"/>
+                    </Border>
+                    <ControlTemplate.Triggers>
+                        <!-- 只提亮字色，绝不设 Background（否则盖住下方滑块） -->
+                        <Trigger Property="IsMouseOver" Value="True">
+                            <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}"/>
+                        </Trigger>
+                        <Trigger Property="IsPressed" Value="True">
+                            <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}"/>
+                        </Trigger>
+                        <Trigger Property="IsEnabled" Value="False">
+                            <Setter TargetName="Bd" Property="Opacity" Value="0.4"/>
+                            <Setter Property="Cursor" Value="Arrow"/>
+                        </Trigger>
+                    </ControlTemplate.Triggers>
+                </ControlTemplate>
+            </Setter.Value>
+        </Setter>
+    </Style>
+
+    <!-- ============================================================
+         按钮：工具条小按钮（暂停/恢复/取消等一排）
+         ============================================================ -->
+    <!-- 工具栏按钮：从"白底描边胶囊"改为**无边框幽灵按钮**。
+         改前问题（用户反馈「这几个按钮感觉突兀」）：5 个白底描边按钮排一排，
+         **视觉重量完全一样** —— 像 5 个同等重要的操作堆在一起；而实际上
+         「暂停全部」是主操作、「打开下载目录」是次要，不该同等对待。
+         改后：透明底无边框，**悬停才浮出淡灰圆角块** —— 与面包屑按钮
+         （BreadcrumbButton）同一套语言。这也是 Linear / Motrix 的做法：
+         工具类操作靠"图标+文字+悬停反馈"表达，不靠常驻边框。 -->
+    <Style x:Key="ToolButton" TargetType="Button">
+        <Setter Property="Background" Value="Transparent"/>
+        <Setter Property="Foreground" Value="{DynamicResource TextSecondaryBrush}"/>
+        <Setter Property="FontFamily" Value="{StaticResource AppFontFamily}"/>
+        <Setter Property="FontSize" Value="12"/>
+        <Setter Property="Padding" Value="10,6"/>
+        <Setter Property="Margin" Value="0,0,4,0"/>
+        <Setter Property="Cursor" Value="Hand"/>
+        <Setter Property="FocusVisualStyle" Value="{x:Null}"/>
+        <Setter Property="Template">
+            <Setter.Value>
+                <ControlTemplate TargetType="Button">
+                    <Border x:Name="Bd" CornerRadius="6"
+                            Background="{TemplateBinding Background}"
+                            Padding="{TemplateBinding Padding}"
+                            SnapsToDevicePixels="True">
+                        <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"
+                                          RecognizesAccessKey="True"/>
+                    </Border>
+                    <ControlTemplate.Triggers>
+                        <Trigger Property="IsMouseOver" Value="True">
+                            <Setter TargetName="Bd" Property="Background"
+                                    Value="{DynamicResource SurfaceAltBrush}"/>
+                            <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}"/>
+                        </Trigger>
+                        <Trigger Property="IsPressed" Value="True">
+                            <Setter TargetName="Bd" Property="Background"
+                                    Value="{DynamicResource SurfaceSunkenBrush}"/>
+                        </Trigger>
+                        <Trigger Property="IsEnabled" Value="False">
+                            <Setter Property="Opacity" Value="0.45"/>
+                        </Trigger>
+                    </ControlTemplate.Triggers>
+                </ControlTemplate>
+            </Setter.Value>
+        </Setter>
+    </Style>
+
+</ResourceDictionary>

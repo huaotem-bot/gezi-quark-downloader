@@ -1,0 +1,30 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net48</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>disable</Nullable>
+    <AssemblyName>GeZi.Application</AssemblyName>
+    <RootNamespace>GeZi.Services</RootNamespace>
+    <Product>鸽子下载</Product>
+    <AssemblyTitle>鸽子下载</AssemblyTitle>
+    <Version>2.4.0</Version>
+    <PlatformTarget>x64</PlatformTarget>
+    <Prefer32Bit>false</Prefer32Bit>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <PathMap>$(MSBuildProjectDirectory)=/_/</PathMap>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\GeZi.Core\GeZi.Core.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Reference Include="System.Net.Http" />
+    <!-- 诊断包 zip -->
+    <Reference Include="System.IO.Compression" />
+    <!-- 更新检查的 DataContractJsonSerializer -->
+    <Reference Include="System.Runtime.Serialization" />
+  </ItemGroup>
+
+</Project>

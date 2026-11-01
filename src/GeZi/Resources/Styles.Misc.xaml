@@ -1,0 +1,161 @@
+<!--
+    分段控件 / 过滤页签 / 提示条 / 加载 / 说明文字
+    ============================================================
+    本文件是原 Styles.xaml（1930 行）按职责拆出的资源字典之一（2026-10-24 代码规范化）。
+    拆分原则：只按行区间搬运，成员文本一字未改；App.xaml 的合并顺序与拆分前一致。
+
+    规格要求（全项目通用，详见 Styles.Typography.xaml 头部）：
+      · 字体 Microsoft YaHei UI
+      · 数字/速度用 Consolas + TextFormattingMode="Display"（防跳动）
+      · 8px 栅格间距：4 / 8 / 12 / 16 / 24 / 32
+      · 圆角：卡片 12 / 按钮 8 / 输入框 10 / 徽章 6 / 导航项 8
+      · Style 用 StaticResource 引，颜色在 Style 内用 DynamicResource
+-->
+
+<ResourceDictionary xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+                    xmlns:sys="clr-namespace:System;assembly=mscorlib">
+
+
+    <!-- ============================================================
+         分段单选（RadioButton 重写为胶囊式分段控件）
+         ============================================================
+         用于「分享链接 / 我的网盘」模式切换：外框浅底，选中项白底漂浮。
+         ============================================================ -->
+    <Style x:Key="SegmentedRadio" TargetType="RadioButton">
+        <Setter Property="FontFamily" Value="{StaticResource AppFontFamily}"/>
+        <Setter Property="FontSize" Value="13"/>
+        <Setter Property="Foreground" Value="{DynamicResource TextSecondaryBrush}"/>
+        <Setter Property="Padding" Value="18,7"/>
+        <Setter Property="Cursor" Value="Hand"/>
+        <Setter Property="Template">
+            <Setter.Value>
+                <ControlTemplate TargetType="RadioButton">
+                    <Border x:Name="Bd" CornerRadius="8" Background="Transparent"
+                            Padding="{TemplateBinding Padding}"
+                            SnapsToDevicePixels="True">
+                        <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                    </Border>
+                    <ControlTemplate.Triggers>
+                        <Trigger Property="IsMouseOver" Value="True">
+                            <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}"/>
+                        </Trigger>
+                        <Trigger Property="IsChecked" Value="True">
+                            <!-- 选中 = 深色粗体字。**底色不再由 RadioButton 自绘**——
+                                 2026-10-17 改走 SegmentedSlider 滑块（整段面板共用一个滑块滑到选中项），
+                                 这里只负责文字态，避免滑块滑到后选中态"双重背景"。 -->
+                            <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}"/>
+                            <Setter Property="FontWeight" Value="SemiBold"/>
+                        </Trigger>
+                    </ControlTemplate.Triggers>
+                </ControlTemplate>
+            </Setter.Value>
+        </Setter>
+    </Style>
+
+    <!-- ============================================================
+         任务页顶部筛选（全部 / 进行中 / 已完成）
+         ============================================================
+
+         ⚠️ 用 RadioButton 而不是 TabItem：4 个分类**共用同一个任务列表**
+            （只切换过滤器），用 TabItem 就得放 4 份列表副本 —— 状态会不同步。
+         视觉与设置页的 Tab 保持一致（下划线式、深灰而非蓝）。 -->
+    <Style x:Key="FilterTabRadio" TargetType="RadioButton">
+        <Setter Property="FontFamily" Value="{StaticResource AppFontFamily}"/>
+        <Setter Property="FontSize" Value="13"/>
+        <Setter Property="Foreground" Value="{DynamicResource TextSecondaryBrush}"/>
+        <Setter Property="Cursor" Value="Hand"/>
+        <Setter Property="Padding" Value="0,0,0,7"/>
+        <Setter Property="Margin" Value="0,0,24,0"/>
+        <Setter Property="FocusVisualStyle" Value="{x:Null}"/>
+        <Setter Property="Template">
+            <Setter.Value>
+                <ControlTemplate TargetType="RadioButton">
+                    <Border x:Name="Bd" Background="Transparent"
+                            BorderThickness="0,0,0,2" BorderBrush="Transparent"
+                            Padding="{TemplateBinding Padding}"
+                            SnapsToDevicePixels="True">
+                        <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                    </Border>
+                    <ControlTemplate.Triggers>
+                        <Trigger Property="IsMouseOver" Value="True">
+                            <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}"/>
+                        </Trigger>
+                        <Trigger Property="IsChecked" Value="True">
+                            <!-- 选中 = 深色粗体字。**下划线不再由 RadioButton 自绘**——
+                                 2026-10-17 改走 SegmentedSlider 滑块（Height=2 的指示条在筛选项间滑动），
+                                 模板上保留透明底边框占位保证布局高度不跳。 -->
+                            <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}"/>
+                            <Setter Property="FontWeight" Value="SemiBold"/>
+                        </Trigger>
+                    </ControlTemplate.Triggers>
+                </ControlTemplate>
+            </Setter.Value>
+        </Setter>
+    </Style>
+
+    <!-- ============================================================
+         提示条
+         ============================================================ -->
+
+    <Style x:Key="InfoBanner" TargetType="Border">
+        <Setter Property="Background" Value="{DynamicResource SurfaceSunkenBrush}"/>
+        <Setter Property="CornerRadius" Value="10"/>
+        <Setter Property="Padding" Value="12,10"/>
+        <Setter Property="SnapsToDevicePixels" Value="True"/>
+    </Style>
+
+    <!-- ============================================================
+         加载态（2026-10-02 新增）
+         ============================================================
+         为什么要这个：原来文件列表只有"空状态"一种非内容状态。
+         加载目录的几百毫秒里列表是空的 → 空状态插画就跳出来喊"还没有内容"，
+         用户以为没数据，其实正在加载。这是**误导**，不是审美问题。
+         现在拆成三种互斥状态：加载中 / 空 / 有内容。
+         ============================================================ -->
+    <Style x:Key="LoadingSpinner" TargetType="Path">
+        <Setter Property="Width" Value="22"/>
+        <Setter Property="Height" Value="22"/>
+        <Setter Property="Stretch" Value="Uniform"/>
+        <Setter Property="Stroke" Value="{DynamicResource TextPrimaryBrush}"/>
+        <Setter Property="StrokeThickness" Value="2"/>
+        <Setter Property="StrokeStartLineCap" Value="Round"/>
+        <Setter Property="StrokeEndLineCap" Value="Round"/>
+        <Setter Property="RenderTransformOrigin" Value="0.5,0.5"/>
+        <Setter Property="RenderTransform">
+            <Setter.Value>
+                <RotateTransform Angle="0"/>
+            </Setter.Value>
+        </Setter>
+    </Style>
+
+    <!-- 稀疏说明文字：收窄行宽到 ≤75 字符等效宽度，长段落不再横贯整屏 -->
+    <Style x:Key="ProseText" TargetType="TextBlock">
+        <Setter Property="FontFamily" Value="{StaticResource AppFontFamily}"/>
+        <Setter Property="FontSize" Value="12"/>
+        <Setter Property="LineHeight" Value="19"/>
+        <Setter Property="MaxWidth" Value="520"/>
+        <Setter Property="TextWrapping" Value="Wrap"/>
+        <Setter Property="HorizontalAlignment" Value="Left"/>
+        <Setter Property="Foreground" Value="{DynamicResource TextSecondaryBrush}"/>
+    </Style>
+
+    <!-- 设置页字段标签（统一列宽，避免各行文字基线不齐） -->
+    <Style x:Key="FieldLabel" TargetType="TextBlock">
+        <Setter Property="FontFamily" Value="{StaticResource AppFontFamily}"/>
+        <Setter Property="FontSize" Value="13"/>
+        <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}"/>
+        <Setter Property="VerticalAlignment" Value="Center"/>
+        <Setter Property="Margin" Value="0,0,16,0"/>
+    </Style>
+
+    <!-- 设置页分组小标题（卡片内的一级小节，弱于 CardTitleText） -->
+    <Style x:Key="SectionLabel" TargetType="TextBlock">
+        <Setter Property="FontFamily" Value="{StaticResource AppFontFamily}"/>
+        <Setter Property="FontSize" Value="11"/>
+        <Setter Property="FontWeight" Value="SemiBold"/>
+        <Setter Property="Foreground" Value="{DynamicResource TextTertiaryBrush}"/>
+        <Setter Property="Margin" Value="0,0,0,10"/>
+    </Style>
+
+</ResourceDictionary>

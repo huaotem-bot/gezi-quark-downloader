@@ -1,0 +1,155 @@
+<!--
+    菜单与托盘菜单
+    ============================================================
+    本文件是原 Styles.xaml（1930 行）按职责拆出的资源字典之一（2026-10-24 代码规范化）。
+    拆分原则：只按行区间搬运，成员文本一字未改；App.xaml 的合并顺序与拆分前一致。
+
+    规格要求（全项目通用，详见 Styles.Typography.xaml 头部）：
+      · 字体 Microsoft YaHei UI
+      · 数字/速度用 Consolas + TextFormattingMode="Display"（防跳动）
+      · 8px 栅格间距：4 / 8 / 12 / 16 / 24 / 32
+      · 圆角：卡片 12 / 按钮 8 / 输入框 10 / 徽章 6 / 导航项 8
+      · Style 用 StaticResource 引，颜色在 Style 内用 DynamicResource
+-->
+
+<ResourceDictionary xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+                    xmlns:sys="clr-namespace:System;assembly=mscorlib">
+
+
+    <!-- ============================================================
+         右键菜单。
+        🚫 **这里刻意不加 DropShadowEffect。**
+        曾经在模板的最外层 Border 上加过 BlurRadius=16 / Opacity=0.16 的阴影，
+        结果：Popup 的尺寸 == 这个 Border 的尺寸（没留白）→ **阴影被 Popup 窗口裁掉**，
+        直线边一个像素都渲染不出来（实测菜单左侧 x=14..29 是纯 AppBgColor (245,246,250)），
+        只有**四个圆角**处、Popup 矩形内又没被圆角白底覆盖的那一小块三角区把阴影残留下来
+        → 用户看到的就是「四个角有灰色的印子」。
+        也就是说那个阴影根本没在当阴影用，只贡献了四个灰印。
+        要真正显示阴影，必须给 Popup 留白并允许透明，而 ContextMenu 的 Popup 由框架托管、
+        不好控制，性价比太低 —— 所以直接用 1px 描边表达层次，不加 Effect。
+    -->
+    <Style TargetType="ContextMenu">
+        <Setter Property="Background" Value="{DynamicResource SurfaceBrush}"/>
+        <Setter Property="BorderBrush" Value="{DynamicResource BorderBrushSoft}"/>
+        <Setter Property="BorderThickness" Value="1"/>
+        <Setter Property="Padding" Value="4"/>
+        <Setter Property="Template">
+            <Setter.Value>
+                <ControlTemplate TargetType="ContextMenu">
+                    <Border Background="{TemplateBinding Background}"
+                            BorderBrush="{TemplateBinding BorderBrush}"
+                            BorderThickness="{TemplateBinding BorderThickness}"
+                            CornerRadius="10" Padding="{TemplateBinding Padding}">
+                        <ItemsPresenter/>
+                    </Border>
+                </ControlTemplate>
+            </Setter.Value>
+        </Setter>
+    </Style>
+
+    <!-- ============================================================
+         托盘右键菜单专用：紧凑版 MenuItem
+         ============================================================
+
+         ⚠️ 不能复用下面那个隐式 MenuItem 样式：它带一个**固定 22px 的图标列**
+            （右键任务行 / 文件列表时用来对齐图标），而托盘菜单四项**都没有图标** ——
+            那 22px 图标列 + 8px Margin 就变成左侧一大块空白；
+            再加上 Header 列是 `*`（填满），右侧又留一截，菜单看起来"左右都空"。
+         托盘菜单只有纯文字，用这个不带图标列的紧凑模板。 -->
+    <Style x:Key="TrayMenuItem" TargetType="MenuItem">
+        <Setter Property="FontFamily" Value="{StaticResource AppFontFamily}"/>
+        <Setter Property="FontSize" Value="13"/>
+        <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}"/>
+        <Setter Property="Padding" Value="14,7"/>
+        <Setter Property="Template">
+            <Setter.Value>
+                <ControlTemplate TargetType="MenuItem">
+                    <Border x:Name="Bd" Background="Transparent" CornerRadius="6"
+                            Padding="{TemplateBinding Padding}">
+                        <ContentPresenter ContentSource="Header" VerticalAlignment="Center"/>
+                    </Border>
+                    <ControlTemplate.Triggers>
+                        <Trigger Property="IsHighlighted" Value="True">
+                            <Setter TargetName="Bd" Property="Background"
+                                    Value="{DynamicResource SurfaceSunkenBrush}"/>
+                        </Trigger>
+                        <Trigger Property="IsEnabled" Value="False">
+                            <Setter Property="Opacity" Value="0.45"/>
+                        </Trigger>
+                    </ControlTemplate.Triggers>
+                </ControlTemplate>
+            </Setter.Value>
+        </Setter>
+    </Style>
+
+    <Style TargetType="MenuItem">
+        <Setter Property="FontFamily" Value="{StaticResource AppFontFamily}"/>
+        <Setter Property="FontSize" Value="13"/>
+        <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}"/>
+        <Setter Property="Padding" Value="10,7"/>
+        <Setter Property="Template">
+            <Setter.Value>
+                <ControlTemplate TargetType="MenuItem">
+                    <Border x:Name="Bd" Background="Transparent" CornerRadius="6"
+                            Padding="{TemplateBinding Padding}">
+                        <Grid>
+                            <Grid.ColumnDefinitions>
+                                <!-- 新增图标列（固定 22px，保证各菜单项文字左对齐） -->
+                                <ColumnDefinition Width="22"/>
+                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="Auto"/>
+                            </Grid.ColumnDefinitions>
+                            <!-- 图标：14px 线性图标；未设 Icon 的项该列留空，文字仍对齐 -->
+                            <ContentPresenter Grid.Column="0" ContentSource="Icon"
+                                              VerticalAlignment="Center" HorizontalAlignment="Center"/>
+                            <ContentPresenter Grid.Column="1" ContentSource="Header"
+                                              VerticalAlignment="Center" Margin="8,0,0,0"/>
+                            <TextBlock Grid.Column="2" Text="{TemplateBinding InputGestureText}"
+                                       Foreground="{DynamicResource TextTertiaryBrush}"
+                                       Margin="20,0,0,0" VerticalAlignment="Center" FontSize="12"/>
+                        </Grid>
+                    </Border>
+                    <ControlTemplate.Triggers>
+                        <Trigger Property="IsHighlighted" Value="True">
+                            <Setter TargetName="Bd" Property="Background"
+                                    Value="{DynamicResource SurfaceSunkenBrush}"/>
+                        </Trigger>
+                        <Trigger Property="IsEnabled" Value="False">
+                            <Setter Property="Opacity" Value="0.45"/>
+                        </Trigger>
+                    </ControlTemplate.Triggers>
+                </ControlTemplate>
+            </Setter.Value>
+        </Setter>
+    </Style>
+
+    <Style TargetType="Separator">
+        <Setter Property="Height" Value="1"/>
+        <Setter Property="Margin" Value="6,4"/>
+        <Setter Property="Background" Value="{DynamicResource BorderBrushSoft}"/>
+        <Setter Property="Template">
+            <Setter.Value>
+                <ControlTemplate TargetType="Separator">
+                    <Border Height="1" Background="{TemplateBinding Background}"/>
+                </ControlTemplate>
+            </Setter.Value>
+        </Setter>
+    </Style>
+
+    <!--
+        🚨🚨 **菜单里的分隔条必须用这个带 key 的样式**（2026-10-04 实测踩坑）
+
+        WPF 的 ContextMenu 对**菜单内**的分隔条不用隐式样式，而是用挂在
+        `MenuItem.SeparatorStyleKey` 上的内部样式 —— 默认是 `#FFD7D7D7` 系统浅灰，
+        深色模式下就是**一条刺眼的白横线**（用户截图反馈）。
+        实测（`tmp-links` 的 `traymenu-probe` 真弹菜单后读 Separator 实例）：
+          · 不显式设 Style → Background=#FFD7D7D7  ❌
+          · 显式设 Style   → Background=#FF333844  ✅
+        并且**试过**在 Application.Resources 里覆盖 `MenuItem.SeparatorStyleKey`，**无效**。
+        → 所以凡是写在 `<ContextMenu>` / 菜单里的 `<Separator/>`，都要挂这个 Style。
+        （托盘菜单是代码建的，TrayIcon.BuildMenu 里也显式套了同一个样式对象。）
+    -->
+    <Style x:Key="MenuSeparator" TargetType="Separator" BasedOn="{StaticResource {x:Type Separator}}"/>
+
+</ResourceDictionary>

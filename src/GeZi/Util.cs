@@ -1,4 +1,4 @@
-﻿// GeZi —— 多网盘下载器 (Multi-cloud downloader)
+// GeZi —— 多网盘下载器 (Multi-cloud downloader)
 // Copyright (C) 2026  Yi Yuan
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU Affero General Public License as published by
@@ -14,7 +14,15 @@
 using System;
 using System.IO;
 using System.Runtime.InteropServices;
+using GeZi.Providers;
+using GeZi.Providers.Quark;
+using GeZi.Providers.Uc;
+using GeZi.Providers.Aliyun;
+using GeZi.Providers.Xunlei;
+using GeZi.Providers.Shared;
+using GeZi.Providers.Qr;
 
+using GeZi.Services;
 namespace GeZi
 {
     public static class Util
@@ -23,13 +31,13 @@ namespace GeZi
         {
             // 🚨 原来除以 1024 却标 "KB/MB/GB"（那是 KiB/MiB/GiB）。
             // 后果：同一个文件「夸克分享页写 9.54 GB、本程序写 8.89 GB」，用户以为少下了。
-            // 改成 **1000 进制** —— 单位名副其实，也顺带让速度显示符合网络速率的惯例（1 MB/s = 10^6 B/s）。
+            // 改成 **1024 进制**（2026-10-24 又改回来：实测夸克容量接口 total=10737418240 正好 10x1024^3，夸克自己就是 1024 进制） —— 单位名副其实，也顺带让速度显示符合网络速率的惯例（1 MB/s = 10^6 B/s）。
             double v = n;
             string[] units = { "B", "KB", "MB", "GB", "TB" };
             int i = 0;
-            while (v >= 1000 && i < units.Length - 1)
+            while (v >= 1024 && i < units.Length - 1)
             {
-                v /= 1000.0;
+                v /= 1024.0;
                 i++;
             }
             return i == 0 ? n + " B" : v.ToString("F2") + " " + units[i];

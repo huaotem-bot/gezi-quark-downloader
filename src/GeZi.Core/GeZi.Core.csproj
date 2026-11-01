@@ -57,11 +57,7 @@
          源码这边跟着写小写，最终产物名才在各平台/打包工具下**完全一致**，
          不会出现"源码是大写、输出是小写"这种大小写不敏感文件系统上才看不出来的坑。
     -->
-    <Reference Include="ZXing">
-      <HintPath>lib\ZXing\zxing.dll</HintPath>
-      <Private>true</Private>
-    </Reference>
-  </ItemGroup>
+</ItemGroup>
 
   <ItemGroup>
     <!-- （2026-10-11）原「换 Cookie 辅助脚本 + 内置 CPython」已整体移除 ——

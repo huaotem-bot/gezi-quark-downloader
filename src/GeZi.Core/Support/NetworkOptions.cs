@@ -1,4 +1,4 @@
-﻿// GeZi —— 多网盘下载器 (Multi-cloud downloader)
+// GeZi —— 多网盘下载器 (Multi-cloud downloader)
 // Copyright (C) 2026  Yi Yuan
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU Affero General Public License as published by
@@ -42,6 +42,89 @@ namespace GeZi.Core.Support
         {
             get { return _useSystemProxy; }
             set { _useSystemProxy = value; }
+        }
+
+        /// <summary>
+        /// 显式直连用的代理对象：<see cref="IWebProxy.IsBypassed"/> 恒 <c>true</c>，等价于"不走代理"。
+        ///
+        /// <para>
+        /// 为什么不直接给 <see cref="System.Net.HttpWebRequest.Proxy"/> 赋 <c>null</c>：
+        /// 该属性的文档明确写着赋 <c>null</c> 会抛 <see cref="ArgumentNullException"/>；
+        /// 官方推荐的直连写法是 <c>GlobalProxySelection.GetEmptyWebProxy()</c>，
+        /// 但那个 API 已被标记过时（会产生编译警告，项目要求 0 警告）。
+        /// 这里用一个等价的最小实现。
+        /// </para>
+        /// </summary>
+        private sealed class DirectProxy : IWebProxy
+        {
+            public static readonly DirectProxy Instance = new DirectProxy();
+
+            public ICredentials Credentials { get; set; }
+
+            public Uri GetProxy(Uri destination)
+            {
+                return destination;
+            }
+
+            public bool IsBypassed(Uri host)
+            {
+                return true;
+            }
+        }
+
+        /// <summary>
+        /// 按当前开关解析出应使用的代理对象（直连时返回 <see cref="DirectProxy"/>）。
+        /// </summary>
+        private static IWebProxy ResolveProxy()
+        {
+            if (!_useSystemProxy)
+                return DirectProxy.Instance;
+
+            try
+            {
+                var proxy = WebRequest.GetSystemWebProxy();
+                if (proxy == null)
+                    return DirectProxy.Instance;
+
+                // 系统代理可能要身份验证（企业环境常见）。DefaultCredentials 会在
+                // 需要时带上当前 Windows 凭据，不需要时也不会有副作用。
+                try { proxy.Credentials = CredentialCache.DefaultCredentials; }
+                catch { /* 某些代理实现不允许设置，忽略即可 */ }
+
+                return proxy;
+            }
+            catch
+            {
+                // 取系统代理失败 → 退回直连，绝不让设置项把程序变成不可用。
+                return DirectProxy.Instance;
+            }
+        }
+
+        /// <summary>
+        /// 按当前开关给 <see cref="System.Net.HttpWebRequest"/> 配置代理。
+        /// 语义与 <see cref="ApplyTo(System.Net.Http.HttpClientHandler)"/> 完全一致。
+        ///
+        /// <para>
+        /// 🚨 为什么必须调：<c>HttpWebRequest</c> 在 <c>Proxy</c> 属性未设置时，
+        /// 会**继承 Windows「Internet 选项」里的系统代理**（微软官方文档原文）。
+        /// 本机的代理软件常把 CDN 请求劫持/限速，还会改变 TLS ClientHello 指纹
+        /// 触发夸克/UC 的 WAF —— 表现就是"域名能解析但下不动"。
+        /// </para>
+        /// </summary>
+        public static void ApplyTo(HttpWebRequest request)
+        {
+            if (request == null)
+                return;
+
+            try
+            {
+                request.Proxy = ResolveProxy();
+            }
+            catch
+            {
+                // 绝不让代理配置把下载变成不可用。
+                try { request.Proxy = DirectProxy.Instance; } catch { }
+            }
         }
 
         /// <summary>

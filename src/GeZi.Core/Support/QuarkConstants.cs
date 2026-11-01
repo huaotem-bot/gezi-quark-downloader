@@ -13,7 +13,18 @@
 
 namespace GeZi.Core.Support
 {
-    /// <summary>夸克网页端公开接口的常量，全部来自原 Python 核心里已验证的取值。</summary>
+    /// <summary>
+    /// 夸克网页端公开接口的常量，全部来自原 Python 核心里已验证的取值。
+    /// <para>
+    /// ⚠️ <b>它为什么留在 GeZi.Core 而不是 GeZi.Providers：</b>
+    /// 除了夸克 API 常量，<c>DlUa</c> / <c>Referer</c> / <c>Origin</c> 这三个值
+    /// 还被下载引擎（<c>SegmentedDownloader</c>、<c>DownloadScheduler</c>）当作
+    /// **中性的默认请求头**使用 —— 引擎在调用方没指定 UA/Referer 时就退回这三个值。
+    /// 若把它挪进 Providers，Core 就必须反向引用 Providers（循环依赖）。
+    /// 将来若要让引擎彻底不认识"夸克"，应把这几个默认值抽成
+    /// <c>DownloadDefaults</c> 之类的独立类，届时本文件才可整体移走。
+    /// </para>
+    /// </summary>
     public static class QuarkConstants
     {
         public const string ApiBase = "https://drive-pc.quark.cn";

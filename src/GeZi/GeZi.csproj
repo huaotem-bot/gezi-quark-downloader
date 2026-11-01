@@ -56,6 +56,9 @@
 
   <ItemGroup>
     <ProjectReference Include="..\GeZi.Core\GeZi.Core.csproj" />
+    <ProjectReference Include="..\GeZi.Providers\GeZi.Providers.csproj" />
+    <ProjectReference Include="..\GeZi.DownloadEngine\GeZi.DownloadEngine.csproj" />
+    <ProjectReference Include="..\GeZi.Application\GeZi.Application.csproj" />
   </ItemGroup>
 
   <ItemGroup>

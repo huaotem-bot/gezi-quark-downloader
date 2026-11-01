@@ -1,4 +1,4 @@
-﻿// GeZi —— 多网盘下载器 (Multi-cloud downloader)
+// GeZi —— 多网盘下载器 (Multi-cloud downloader)
 // Copyright (C) 2026  Yi Yuan
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU Affero General Public License as published by
@@ -18,7 +18,15 @@ using System.Windows.Controls;
 using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
+using GeZi.Providers;
+using GeZi.Providers.Quark;
+using GeZi.Providers.Uc;
+using GeZi.Providers.Aliyun;
+using GeZi.Providers.Xunlei;
+using GeZi.Providers.Shared;
+using GeZi.Providers.Qr;
 
+using GeZi.Services;
 namespace GeZi
 {
     /// <summary>
@@ -53,8 +61,9 @@ namespace GeZi
         /// </remarks>
         private static readonly string[,] Features =
         {
+            { "四网盘支持", "夸克 / UC / 阿里云盘 / 迅雷云盘，自动识别链接归属" },
             { "解析分享", "链接、提取码、整段分享文案都能直接粘" },
-            { "免转存下载", "不往自己网盘写中转文件，省空间、不留垃圾" },
+            { "免转存下载", "夸克 / UC 分享不写中转文件，省空间、不留垃圾" },
             { "高速下载", "单文件最多 512 个连接，支持断点续传" },
             { "扫码登录", "浏览「我的网盘」，支持转存与删除" },
             { "边下边播", "目标文件从 0 连续增长，下载中即可播放" },
@@ -170,8 +179,8 @@ namespace GeZi
             catch (Exception ex)
             {
                 AppDialog.Show(this,
-                    "检查更新失败：" + ex.Message
-                    + "\n\n你也可以手动打开 Releases 页查看：\n" + UpdateService.ReleasesPageUrl,
+                    "检查更新失败：" + ErrorText.Describe(ex)
+                    + "。\n\n你也可以手动打开发布页查看：\n" + UpdateService.ReleasesPageUrl,
                     "检查更新", MessageBoxButton.OK, MessageBoxImage.Warning);
             }
             finally
@@ -189,7 +198,7 @@ namespace GeZi
         /// 打开「更新详情」窗口。
         /// 抽出来是因为有两个入口：「检查更新」按钮，以及启动气泡跳过来的场景。
         /// </summary>
-        private void OpenUpdatePrompt(GeZi.Core.Update.GitHubRelease m)
+        private void OpenUpdatePrompt(GeZi.Services.GitHubRelease m)
         {
             if (m == null) return;
 

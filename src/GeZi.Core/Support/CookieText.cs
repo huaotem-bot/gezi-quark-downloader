@@ -1,4 +1,4 @@
-﻿// GeZi —— 多网盘下载器 (Multi-cloud downloader)
+// GeZi —— 多网盘下载器 (Multi-cloud downloader)
 // Copyright (C) 2026  Yi Yuan
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU Affero General Public License as published by
@@ -90,6 +90,44 @@ namespace GeZi.Core.Support
             return d;
         }
 
+        /// <summary>
+        /// 已知网盘域名的关键字白名单。
+        /// <para>
+        /// 🚨 2026-10-28 修：原来这里只写了 <c>"quark"</c>，注释却说「必须按域过滤」。
+        /// 结果是**只有夸克的 JSON 导出能用**：UC / 阿里 / 迅雷的导出会被逐条丢弃，
+        /// <c>dict</c> 空 → <see cref="Join"/> 返回空串 → <see cref="Parse"/> 判定
+        /// 「JSON 解析失败」→ 回落到 <see cref="NormalizeRaw"/> 把**整段 JSON 原文**
+        /// 当 Cookie 串塞进请求头（服务端必然 400，而且日志里看不出原因）。
+        /// </para>
+        /// <para>
+        /// 这里只做「认不认识这个域」的判断，不需要知道用户这次登录的是哪一家 ——
+        /// 四家的域互不重叠，全收下来也不会互相污染（各客户端只读自己那几个键）。
+        /// </para>
+        /// </summary>
+        private static readonly string[] KnownPanDomains =
+        {
+            "quark",        // 夸克：pan.quark.cn / drive-pc.quark.cn
+            "uc.cn",        // UC：pc-api.uc.cn / drive.uc.cn
+            "ucweb",        // UC：老的 ucweb.com
+            "alipan",       // 阿里（新主体）：www.alipan.com / passport.alipan.com
+            "aliyundrive",  // 阿里（旧主体）：www.aliyundrive.com
+            "aliyun",       // 阿里：*.aliyun.com
+            "xunlei",       // 迅雷：pan.xunlei.com / xluser-ssl.xunlei.com
+        };
+
+        /// <summary>域名是否属于已知网盘（大小写不敏感，子串匹配）。</summary>
+        private static bool IsKnownPanDomain(string domain)
+        {
+            if (string.IsNullOrEmpty(domain))
+                return false;
+            foreach (var d in KnownPanDomains)
+            {
+                if (domain.IndexOf(d, StringComparison.OrdinalIgnoreCase) >= 0)
+                    return true;
+            }
+            return false;
+        }
+
         private static string TryParseJson(string json)
         {
             object parsed;
@@ -109,6 +147,10 @@ namespace GeZi.Core.Support
             var arr = parsed as List<object>;
             if (arr != null)
             {
+                // ⚠️ 必须按域过滤：用户可能导出**整个浏览器**的 Cookie，
+                //    几百条无关 Cookie 塞进请求头会撑爆 Header 长度限制（服务端 400）。
+                //    但过滤要分两步走 —— 先按白名单收，一条都没收到就全收。
+                var all = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
                 foreach (var it in arr)
                 {
                     var o = it as Dictionary<string, object>;
@@ -117,15 +159,19 @@ namespace GeZi.Core.Support
                     string value = Str(o, "value", "Value");
                     if (name.Length == 0 || value.Length == 0) continue;
 
-                    // ⚠️ 必须按域过滤：用户可能导出**整个浏览器**的 Cookie，
-                    //    几百条无关 Cookie 塞进请求头会撑爆 Header 长度限制（服务端 400）。
-                    string domain = Str(o, "domain", "Domain");
-                    if (domain.Length > 0 &&
-                        domain.IndexOf("quark", StringComparison.OrdinalIgnoreCase) < 0)
-                        continue;
+                    all[name] = value;
 
-                    dict[name] = value;
+                    string domain = Str(o, "domain", "Domain");
+                    // 没有 domain 字段（手搓的 JSON）→ 当作可信，直接收
+                    if (domain.Length == 0 || IsKnownPanDomain(domain))
+                        dict[name] = value;
                 }
+
+                // 🚨 兜底：白名单一条都没命中时**不要**返回空串。
+                //    返回空串会让 Parse 回落到 NormalizeRaw，把整段 JSON 原文当 Cookie ——
+                //    比不过滤更糟。宁可多收几条无关 Cookie，也不能把 JSON 当 Cookie。
+                if (dict.Count == 0)
+                    return Join(all);
                 return Join(dict);
             }
 

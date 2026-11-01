@@ -99,7 +99,7 @@
                                                    Foreground="{DynamicResource PrimaryBrush}"/>
                                     </Border>
                                 </StackPanel>
-                                <TextBlock x:Name="VersionText" Text="夸克网盘 · 直链助手"
+                                <TextBlock x:Name="VersionText" Text="多网盘 · 下载器"
                                            FontSize="11" Margin="0,5,0,0"
                                            Foreground="{DynamicResource TextTertiaryBrush}"/>
                             </StackPanel>
@@ -156,7 +156,7 @@
                                        Foreground="{DynamicResource TextSecondaryBrush}"/>
                             <TextBlock Style="{StaticResource ProseText}" FontSize="11" Margin="0,5,0,0"
                                        TextWrapping="Wrap"
-                                       Text="一款夸克网盘分享链接解析与高速下载工具。粘贴分享链接即可下载，也可扫码登录后浏览、下载自己的网盘文件。"/>
+                                       Text="一款多网盘分享链接解析与高速下载工具，支持夸克 / UC / 阿里云盘 / 迅雷云盘。粘贴分享链接即可下载，登录后可浏览、转存并下载自己的网盘文件。"/>
                             <TextBlock Style="{StaticResource ProseText}" FontSize="11" Margin="0,6,0,0"
                                        TextWrapping="Wrap"><Run Text="本项目" /><Run
                                         Text="完全开源" FontWeight="SemiBold" /><Run

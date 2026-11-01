@@ -16,7 +16,15 @@
 
 namespace GeZi.Core.Models
 {
-    /// <summary>夸克目录/文件条目，经过 _norm 归一化后的形态。</summary>
+    /// <summary>
+    /// 目录/文件条目，经过 _norm 归一化后的形态。
+    /// <para>
+    /// 名字里的 "Quark" 是历史遗留：它最初只服务夸克，但后来成了
+    /// <see cref="GeZi.Core.Api.IPanProvider.ListOwnDirAsync"/> 的返回类型，
+    /// 是全应用统一的条目模型（界面与下载引擎都只认它）。
+    /// 因此它必须留在 GeZi.Core，不能被挪进任何具体网盘项目。
+    /// </para>
+    /// </summary>
     public class QuarkFileEntry
     {
         public string Fid { get; set; }
