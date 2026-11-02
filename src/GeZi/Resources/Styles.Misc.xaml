@@ -348,4 +348,44 @@
         <Setter Property="VerticalAlignment" Value="Center"/>
     </Style>
 
+    <!-- ==============================================================
+         设置行三栏布局（2026-11-02 第三次重做）
+         ==============================================================
+         前两次失败的原因：
+           1) 第一次：两列 Grid 行对齐 -> 同行两卡被拉成等高，矮卡下方留整行空洞；
+           2) 第二次：还是 Grid 行对齐，只是改了间距 -> 空洞照旧。
+         这次换成**单列 + 每行三栏**（Windows 11 设置页的真实结构）：
+           [标签 200px 固定] [控件 * 吃满] [说明 Auto 右对齐]
+         为什么是固定 200px 标签列：标签列若用 Auto，每一行宽度都不同，
+         控件左边缘就会参差不齐（用户截图里正是这个问题）。
+         !! 说明列必须放**同一行**，不能再像原来那样用 Margin="120,0,0,0" 硬缩进 ——
+            那个 120 是照 160 宽标签算的，标签一改就全歪。
+    -->
+    <Style x:Key="SettingsRow3" TargetType="Grid">
+        <Setter Property="Margin" Value="0,0,0,14"/>
+    </Style>
+
+    <!-- 标签：三栏布局专用（与 FieldLabel 的区别是垂直居中 + 不加底边距） -->
+    <Style x:Key="SettingsRowLabel" TargetType="TextBlock" BasedOn="{StaticResource FieldLabel}">
+        <Setter Property="VerticalAlignment" Value="Center"/>
+        <Setter Property="Margin" Value="0"/>
+        <Setter Property="TextWrapping" Value="Wrap"/>
+    </Style>
+
+    <!-- 说明文字：跟在控件右侧同一行，不再用 Margin 硬缩进 -->
+    <Style x:Key="SettingsRowHint" TargetType="TextBlock">
+        <Setter Property="FontFamily" Value="{StaticResource AppFontFamily}"/>
+        <Setter Property="FontSize" Value="11.5"/>
+        <Setter Property="Foreground" Value="{DynamicResource TextTertiaryBrush}"/>
+        <Setter Property="VerticalAlignment" Value="Center"/>
+        <Setter Property="TextWrapping" Value="Wrap"/>
+        <Setter Property="Margin" Value="16,0,0,0"/>
+        <Setter Property="MaxWidth" Value="260"/>
+    </Style>
+
+    <!-- 分区卡片的标题行（图标 + 标题 + 右上角附加内容） -->
+    <Style x:Key="SettingsCardHeader" TargetType="Grid">
+        <Setter Property="Margin" Value="0,0,0,16"/>
+    </Style>
+
 </ResourceDictionary>

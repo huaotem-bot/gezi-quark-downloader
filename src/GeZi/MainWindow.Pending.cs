@@ -822,6 +822,20 @@ namespace GeZi
                 return cachedLive;
             }
 
+            // 🚨 2026-11-02：兜底也走**探活版**，别直接拿配置快照。
+            //   快照里的 __puus 可能已过期（约 3 小时轮换），
+            //   直接用会签出无效直链 → CDN 403。
+            if (_activeKind == PanKind.Quark || _activeKind == PanKind.Uc)
+            {
+                var fresh = await EnsureLiveQuarkClientAsync(_activeKind, CancellationToken.None)
+                    .ConfigureAwait(true);
+                if (fresh != null)
+                {
+                    LogDetail("自动登录尚未完成，已按保存的登录态探活后开始续传。");
+                    return fresh;
+                }
+            }
+
             // 兜底：保存的 Cookie 足够取直链了（账号校验只影响昵称/头像的显示）。
             // ⚠️ 只在**当前账号是夸克系**时才用夸克 Cookie 建客户端；
             //    登录着阿里/迅雷时 _settings.Cookie 可能是空的或别的账号的，
@@ -917,6 +931,68 @@ namespace GeZi
             }
             return null;
         }
+
+
+        /// <summary>
+        /// 续传前确保「这一家」有一个**能用的活客户端**；没有就现场建一个并塞进缓存。
+        /// <para>
+        /// 🚨🚨🚨 2026-11-02 修「UC 续传必 403」的**真正收口点**。
+        /// </para>
+        /// <para>
+        /// 上一轮我只加了 TryGetLiveQuarkClient「去找活客户端」，
+        /// 但用户机器上启动时自动登录的是**夸克**（日志：正在自动登录（夸克网盘）→ 登录成功: 雨过晴），
+        /// 于是 _client.Kind == Quark、缓存里也没有 UC 实例 → 找不到 →
+        /// 又退回 new QuarkClient(_settings.UcCookie, Uc) 这个**配置快照**，
+        /// 而快照里的 __puus 早过期了 → CDN 403 照旧。
+        /// **「找得到就用」不等于「没有就建一个能用的」**，这是上一轮没想透的地方。
+        /// </para>
+        /// <para>
+        /// 现在的做法：按 kind 从设置里取**该家自己的** Cookie 建客户端，
+        /// 先 ValidateAsync 探活（它会走 RefreshPuusAsync 把 __puus 换成新的），
+        /// 建好后放进 _quarkCache 供后续复用。探活失败也照样返回 ——
+        /// 取直链只需要 Cookie，校验失败不代表取链一定失败，不能因为探活失败就整条放弃。
+        /// </para>
+        /// </summary>
+        private async Task<QuarkClient> EnsureLiveQuarkClientAsync(PanKind kind, CancellationToken ct)
+        {
+            var live = TryGetLiveQuarkClient(kind);
+            if (live != null) return live;
+
+            string cookie = kind == PanKind.Uc ? _settings.UcCookie : _settings.Cookie;
+            if (string.IsNullOrWhiteSpace(cookie))
+                return null;
+
+            QuarkClient made = null;
+            try
+            {
+                made = new QuarkClient(cookie, kind);
+                // 探活：ValidateAsync 内部会在 401/412 时先 RefreshPuusAsync，
+                // 这一趟正好把快照里过期的 __puus 换成服务端新签发的。
+                try
+                {
+                    var r = await made.ValidateAsync().ConfigureAwait(false);
+                    LogDetail("续传前探活 " + PanUrlParser.DisplayNameOf(kind)
+                        + "：" + (r.Item1 ? "登录态有效" : "校验未通过（仍继续尝试取链）"));
+                }
+                catch (Exception ex)
+                {
+                    LogDetail("续传前探活 " + PanUrlParser.DisplayNameOf(kind)
+                        + " 出错（仍继续尝试取链）：" + ex.Message);
+                }
+                // 放进缓存，同一批续传里的其它任务直接复用，不必每条都新建。
+                if (!_quarkCache.ContainsKey(kind))
+                    _quarkCache[kind] = made;
+                return made;
+            }
+            catch (Exception ex)
+            {
+                LogDetail("按网盘建客户端失败(" + kind + "): " + ex.Message);
+                if (made != null) { try { made.Dispose(); } catch { } }
+                return null;
+            }
+        }
+
+
 
 
         /// <summary>
@@ -1060,26 +1136,44 @@ namespace GeZi
                                 needReparse.Add(p.Name ?? "?");
                                 continue;
                             }
-                            url = await RefreshOtherPanLinkForPendingAsync(p, linkCts.Token)
+                            var shr = await FetchShareLinkForPendingAsync((PanKind)p.PanKindValue,
+                                p.PwdId, p.Passcode, p.StartFid, p.Fid, p.Token, linkCts.Token)
                                 .ConfigureAwait(false);
+                            url = shr == null ? null : shr.Url;
+                            // 同 RefreshedLink 注释：把真实大小带回来，否则这条永远只有 4 路。
+                            if (shr != null && shr.Size > 0)
+                            {
+                                if (p.Size <= 0) p.Size = shr.Size;
+                                knownSizes[p] = shr.Size;
+                            }
                         }
-                        else if (p.PanKindValue != 0)
+                        else if (p.PanKindValue == 2 || p.PanKindValue == 3)
                         {
+                            // 阿里 / 迅雷的**自有网盘**任务：走 provider 的 GetOwnDownloadLinksAsync。
+                            //
                             // 🚨🚨 2026-11-01 修复「续传总提示无法获取链接」（用户实测日志）：
-                            //   阿里 / 迅雷 / UC 的**自有网盘**任务原来被错误地送进了
-                            //   RefreshOtherPanLinkForPendingAsync —— 那是**分享专用**的实现，
-                            //   内部走 provider.GetShareDownloadLinksAsync(shareRef, ...)，
-                            //   需要一个 share_id。而自有网盘任务根本没有 share_id
-                            //   （记录里 PwdId/Stoken 全是 null）→ 必然失败：
-                            //     · UC  ：HTTP 404 code 41006「分享不存在」
-                            //     · 迅雷：HTTP 400 error_code 3「share_id can not be empty」
-                            //   用户看到的就是「总是提示无法获取链接」，而且**主动取链却正常**
-                            //   —— 因为主动下载走的是 OwnLinksAsync（自有网盘接口），
-                            //   只有续传这条错路走到了分享接口上。
-                            //   正解：自有网盘用 RefreshOwnLinkForPendingAsync（GetOwnDownloadLinksAsync）。
-                            url = await RefreshOwnLinkForPendingAsync(
+                            //   这几家原来被错误地送进了 RefreshOtherPanLinkForPendingAsync ——
+                            //   那是**分享专用**的实现，内部要 share_id，而自有网盘任务没有
+                            //   → 必然失败（UC 41006「分享不存在」/ 迅雷 share_id can not be empty）。
+                            //
+                            // 🚨🚨🚨 2026-11-02 修「UC 续传必 403」——**这里原来还是老判据**：
+                            //   条件写的是 p.PanKindValue != 0，把 **UC（=1）也卷进来了**，
+                            //   于是 UC 任务被送去 UcDriveClient 取链。
+                            //   但 UC 在数据层**与夸克同源**：正常下载走 OwnLinksAsync →
+                            //   _client.GetDownloadAsync（QuarkClient 链路），
+                            //   UcDriveClient 取到的直链与那套不是一回事 → CDN 必然 403。
+                            //   ⚠️ 我在**下载中换链**那条路（RefreshLinkAsyncForPending）已经改对了，
+                            //      但**重启后续传这条路漏了** —— 同一个 bug 只修了一半。
+                            //   ⇒ 判据必须是 == 2 || == 3（阿里/迅雷），UC 落到下面的夸克系分支。
+                            var own = await FetchOwnLinkForPendingAsync(
                                 (PanKind)p.PanKindValue, p.Fid, p.Token, linkCts.Token)
                                 .ConfigureAwait(false);
+                            url = own == null ? null : own.Url;
+                            if (own != null && own.Size > 0)
+                            {
+                                if (p.Size <= 0) p.Size = own.Size;
+                                knownSizes[p] = own.Size;
+                            }
                         }
                         else if (p.FromShare)
                         {
@@ -1120,7 +1214,13 @@ namespace GeZi
                             //   拿错客户端请求会 401/403，症状同样是"取链失败"。
                             if (client == null || client.Kind != kind)
                             {
-                                var byKind = TryBuildQuarkClientFor(kind);
+                                // 🚨 2026-11-02：这里必须用**异步探活版**。
+                                //   原来用同步的 TryBuildQuarkClientFor → 找不到活客户端时
+                                //   直接拿配置快照 new 一个，__puus 过期 → CDN 403。
+                                //   EnsureLiveQuarkClientAsync 会先 ValidateAsync 触发
+                                //   RefreshPuusAsync，把过期令牌换成服务端新签发的再取链。
+                                var byKind = await EnsureLiveQuarkClientAsync(kind, linkCts.Token)
+                                    .ConfigureAwait(false);
                                 if (byKind != null)
                                 {
                                     // ⚠️ 只在「client 是我们自己建的临时实例」时才 Dispose，
@@ -1533,12 +1633,20 @@ namespace GeZi
                         }
                     }
 
-                    // ② 全局客户端网盘对不上（或取链失败）→ 退而新建一个**临时**客户端。
-                    //    ⚠️ 这是下策：临时客户端没有 keepalive，Cookie 是快照，可能已过期。
-                    //    只在确实没有别的选择时用。
-                    var byKind = TryBuildQuarkClientFor(kind2);
+                    // ② 全局客户端网盘对不上（或取链失败）→ 用**按网盘探活后**的客户端。
+                    //    🚨🚨🚨 2026-11-02 修两个叠加的严重问题：
+                    //    ① 原来这里用同步的 TryBuildQuarkClientFor —— 找不到活客户端时
+                    //       直接拿配置快照 new 一个，__puus 过期 → CDN 403。
+                    //       改用 EnsureLiveQuarkClientAsync（会先 ValidateAsync 触发
+                    //       RefreshPuusAsync 换新令牌）。
+                    //    ② 原来 finally 里**无条件 Dispose(byKind)** —— 而 TryBuildQuarkClientFor
+                    //       现在会优先返回**借来的**活实例（_client / _shareClient / _quarkCache），
+                    //       无条件 Dispose 等于把全局会话弄死，用户必须重新登录。
+                    //       这是上一轮我引入的回归，必须用 IsBorrowedQuarkClient 判据挡住。
+                    var byKind = await EnsureLiveQuarkClientAsync(kind2, ct).ConfigureAwait(false);
                     if (byKind != null)
                     {
+                        bool borrowed = IsBorrowedQuarkClient(byKind);
                         try
                         {
                             var one = await byKind.GetDownloadAsync(new List<string> { p.Fid })
@@ -1547,7 +1655,11 @@ namespace GeZi
                         }
                         finally
                         {
-                            try { byKind.Dispose(); } catch { }
+                            // 借来的（全局/缓存里的）**绝不能** Dispose。
+                            if (!borrowed)
+                            {
+                                try { byKind.Dispose(); } catch { }
+                            }
                         }
                     }
                 }
@@ -1566,7 +1678,36 @@ namespace GeZi
         /// 任务只记 <see cref="PendingTask.PanKindValue"/>，这里按当前设置重建客户端。
         /// </para>
         /// </summary>
+        /// <summary>
+        /// 续传取链的统一结果：**直链 + 文件真实大小**。
+        /// <para>
+        /// 🚨🚨 2026-11-02 修「UC / 阿里 / 迅雷续传只有 4 条线程」：
+        /// 原来这几个方法只返回 <c>string</c>（直链），把 <c>DownloadLink.Size</c> **丢掉了**。
+        /// 而 <c>PendingTask.Size</c> 在「刚入队就重启」时是 0 ——
+        /// <c>ThreadAllocator</c> 对 <c>size&lt;=0</c> 只能给下限 4 路，水位填充又明确跳过
+        /// <c>size&lt;=0</c> 的项，于是这几条任务**永远钉死在 4 路**。
+        /// 夸克那一支上一轮已经补了 Size，但 provider 这一支漏了 —— 这就是
+        /// 用户日志里「按实际成功续传的 3 个任务重新分配连接数：4 / 256 / 4」中
+        /// 那两个 4 的来源（两条 UC 任务的 Size 都是 0）。
+        /// </para>
+        /// </summary>
+        private sealed class RefreshedLink
+        {
+            public string Url;
+            public long Size;
+        }
+
+
         private async Task<string> RefreshOtherPanLinkForPendingAsync(PanKind kind, string shareId,
+            string passcode, string startFid, string fid, string token, CancellationToken ct)
+        {
+            var r = await FetchShareLinkForPendingAsync(kind, shareId, passcode, startFid, fid, token, ct)
+                .ConfigureAwait(false);
+            return r == null ? null : r.Url;
+        }
+
+
+        private async Task<RefreshedLink> FetchShareLinkForPendingAsync(PanKind kind, string shareId,
             string passcode, string startFid, string fid, string token, CancellationToken ct)
         {
             IPanProvider provider = null;
@@ -1599,7 +1740,9 @@ namespace GeZi
                 var hit = links == null
                     ? null
                     : links.FirstOrDefault(l => !string.IsNullOrEmpty(l.DownloadUrl));
-                return hit == null ? null : hit.DownloadUrl;
+                if (hit == null) return null;
+                // 🚨 把 Size 一起带回去 —— 见 RefreshedLink 的注释。
+                return new RefreshedLink { Url = hit.DownloadUrl, Size = hit.Size };
             }
             catch (Exception ex)
             {
@@ -1645,6 +1788,18 @@ namespace GeZi
         private async Task<string> RefreshOwnLinkForPendingAsync(PanKind kind, string fid,
             string token, CancellationToken ct)
         {
+            var r = await FetchOwnLinkForPendingAsync(kind, fid, token, ct).ConfigureAwait(false);
+            return r == null ? null : r.Url;
+        }
+
+
+        /// <summary>
+        /// 自有网盘取链的**带大小版本**（续传入队用）。
+        /// <para>见 <see cref="RefreshedLink"/> 注释：不带 Size 会让续传线程永远停在 4 路。</para>
+        /// </summary>
+        private async Task<RefreshedLink> FetchOwnLinkForPendingAsync(PanKind kind, string fid,
+            string token, CancellationToken ct)
+        {
             IPanProvider provider = null;
             try
             {
@@ -1665,7 +1820,8 @@ namespace GeZi
                 var hit = links == null
                     ? null
                     : links.FirstOrDefault(l => !string.IsNullOrEmpty(l.DownloadUrl));
-                return hit == null ? null : hit.DownloadUrl;
+                if (hit == null) return null;
+                return new RefreshedLink { Url = hit.DownloadUrl, Size = hit.Size };
             }
             catch (Exception ex)
             {

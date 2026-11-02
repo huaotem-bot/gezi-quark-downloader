@@ -1684,194 +1684,198 @@
                                          大厂那样做是因为它们的设置页有**两栏内容**或**预览区**，
                                          我们只有单列表单，限宽纯属浪费。
                                          现在改成 Stretch 吃满可用宽度，控件宽度自适应。 -->
-                                <Grid HorizontalAlignment="Stretch">
-                                    <!-- 🚨 2026-11-01 用户反馈「设置页不好看」的根因就是这里。
-                                         原来是 **3 行 × 2 列的行对齐**：同一行两张卡被强行拉到等高，
-                                         而左右两列卡片数量不同（左 3 张、右 2 张）→ 右列 Row=1
-                                         整行空着，Row=2 的「播放器」被推到最下面，中间一大片空白。
-                                         即使卡片数量相同，行对齐也会让「矮卡」底部留出整行高度差
-                                         （存储卡 ~100 vs 窗口卡 ~210）。
-                                         现在改成**两列各自独立堆叠**：每列是一个 StackPanel，
-                                         高度差在列内消化，不会互相牵连，也不会出现跨行空洞。
-                                         两张卡之间的间距用 Margin 下边距表达（最后一张不留下边距）。 -->
+                                <!-- ============================================================
+                                     设置页（2026-11-02 第三次重做）
+                                     ============================================================
+                                     前两次都失败了，原因写在下面，别再犯：
+                                       ① 第一次：两列 Grid **行对齐** -> 同行两卡被拉等高，
+                                          矮卡（窗口与后台）下方留 140px 空洞；
+                                       ② 第二次：还是行对齐，只是调了间距 -> 空洞照旧。
+                                     这次的结构（Windows 11 设置页的真实做法）：
+                                       · **单列**：彻底消灭"哪列短"的问题；
+                                       · 每张卡内部是**三栏行**：[标签 200 固定][控件 *][说明 Auto]；
+                                       · 控件统一 280px 宽（原来有的拉满、有的很窄，视觉很乱）；
+                                       · 说明文字放**同一行右侧**，不再用 Margin="120,0,0,0" 硬缩进
+                                         （那个 120 是照 160 宽标签算的，标签一改就全歪）。
+                                     ============================================================ -->
+                                <StackPanel HorizontalAlignment="Stretch">
 
-                                    <!-- 左列：下载与网络 → 窗口与后台 → 存储
-                                         列堆叠（非行对齐）：行对齐时「矮卡」会浪费整行高度
-                                         （存储卡 ~100 vs 窗口卡 ~210），列堆叠把高度差留在
-                                         列内消化，两列总高 592 / 575，一屏放平不滚动。 -->
+                                    <!-- ① 网络与下载 -->
+                                    <Border Style="{StaticResource SettingsCard}" Margin="0,0,0,14" HorizontalAlignment="Stretch">
+                                        <StackPanel>
+                                            <Grid Style="{StaticResource SettingsCardHeader}">
+                                                <StackPanel Orientation="Horizontal">
+                                                    <Path Data="{StaticResource IconActivity}" Stretch="Uniform"
+                                                          Width="16" Height="16" VerticalAlignment="Center"
+                                                          Stroke="{DynamicResource TextTertiaryBrush}" StrokeThickness="1.7"/>
+                                                    <TextBlock Text="网络与下载" Style="{StaticResource SettingsCardTitle}"
+                                                               Margin="10,0,0,0"/>
+                                                </StackPanel>
+                                            </Grid>
 
-                                    <!-- 2026-11-02：必须显式 Stretch。
-                                         StackPanel 的宽度由**子元素撑开**，默认不会填满父容器；
-                                         而子元素（分区 Border）的宽度又由内容（标签+控件）决定，
-                                         于是整块只有 ~600px，右边空一大片。
-                                         加 Stretch 后 StackPanel 吃满 Grid 宽度，分区随之撑开。 -->
-                                    <Grid HorizontalAlignment="Stretch">
-                                        <Grid.ColumnDefinitions>
-                                            <ColumnDefinition Width="*"/>
-                                            <ColumnDefinition Width="*"/>
-                                        </Grid.ColumnDefinitions>
-                                        <!-- 2026-11-02：双列卡片必须有行定义，
-                                             否则所有 Grid.Row 都叠在 Row=0
-                                             （我第一版漏了这个，截图里只剩一张卡）。 -->
-                                        <Grid.RowDefinitions>
-                                            <RowDefinition Height="Auto"/>
-                                            <RowDefinition Height="Auto"/>
-                                            <RowDefinition Height="Auto"/>
-                                        </Grid.RowDefinitions>
-                                        <Border Style="{StaticResource SettingsCard}" Grid.Row="0" Grid.Column="0" Margin="0,0,0,14">
-                                            <StackPanel HorizontalAlignment="Stretch">
-                                                <TextBlock Text="网络与下载" Style="{StaticResource SettingsSectionTitle}"/>
+                                            <Grid Style="{StaticResource SettingsRow3}">
+                                                <Grid.ColumnDefinitions>
+                                                    <ColumnDefinition Width="200"/>
+                                                    <ColumnDefinition Width="*"/>
+                                                    <ColumnDefinition Width="Auto"/>
+                                                </Grid.ColumnDefinitions>
+                                                <TextBlock Grid.Column="0" Text="单文件并发连接数" Style="{StaticResource SettingsRowLabel}"/>
+                                                <ComboBox x:Name="ThreadsBox" Grid.Column="1" Width="280" Height="34"
+                                                          HorizontalAlignment="Left"
+                                                          Style="{StaticResource AppComboBox}"
+                                                          ItemContainerStyle="{StaticResource AppComboBoxItem}"
+                                                          SelectionChanged="OnSettingChanged">
+                                                    <ComboBoxItem Content="16  — 省网保守"/>
+                                                    <ComboBoxItem Content="32  — 保守，够用"/>
+                                                    <ComboBoxItem Content="64  — 省网，速度一般"/>
+                                                    <ComboBoxItem Content="128 — 较快"/>
+                                                    <ComboBoxItem Content="256 — 默认，实测最快"/>
+                                                    <ComboBoxItem Content="512 — 上限，可能会更快"/>
+                                                </ComboBox>
+                                                <TextBlock Grid.Column="2" Text="越大越快，超过 256 收益递减"
+                                                           Style="{StaticResource SettingsRowHint}"/>
+                                            </Grid>
 
-                                                <Grid Style="{StaticResource SettingsRow}">
-                                                    <Grid.ColumnDefinitions>
-                                                        <ColumnDefinition Width="160"/>
-                                                        <ColumnDefinition Width="*"/>
-                                                    </Grid.ColumnDefinitions>
-                                                    <TextBlock Text="单文件并发连接数" Style="{StaticResource FieldLabel}"/>
-                                                    <ComboBox x:Name="ThreadsBox" Grid.Column="1" Height="34" HorizontalAlignment="Stretch"
-                                                              Style="{StaticResource AppComboBox}"
-                                                              ItemContainerStyle="{StaticResource AppComboBoxItem}"
-                                                              SelectionChanged="OnSettingChanged">
-                                                        <ComboBoxItem Content="16  — 省网保守"/>
-                                                        <ComboBoxItem Content="32  — 保守，够用"/>
-                                                        <!-- 标注必须与 Settings.Threads 的默认值一致。
-                                                        默认值已按**实测拐点**从 64 改成 256
-                                                        （docs/CDN并发阈值-实测.md：64 路 4.00 MB/s、128 路 7.98、
-                                                        **256 路 13.94 ← 拐点**、512 路 13.31）。
-                                                        ⚠️ 之前这里一直写着"64 — 默认"，与代码默认值不符，会直接误导用户。
-                                                        ⚠️ 512 档：实测略慢于 256（13.31 vs 13.94），但那只是**当时那个时段**的
-                                                        数据（CDN 配额会浮动），所以文案写"可能会更快"而不写死结论。 -->
-                                                        <ComboBoxItem Content="64  — 省网，速度一般"/>
-                                                        <ComboBoxItem Content="128 — 较快"/>
-                                                        <ComboBoxItem Content="256 — 默认，实测最快"/>
-                                                        <ComboBoxItem Content="512 — 上限，可能会更快"/>
-                                                    </ComboBox>
-                                                </Grid>
+                                            <Grid Style="{StaticResource SettingsRow3}">
+                                                <Grid.ColumnDefinitions>
+                                                    <ColumnDefinition Width="200"/>
+                                                    <ColumnDefinition Width="*"/>
+                                                    <ColumnDefinition Width="Auto"/>
+                                                </Grid.ColumnDefinitions>
+                                                <TextBlock Grid.Column="0" Text="机械盘连接上限" Style="{StaticResource SettingsRowHint}"
+                                                           FontSize="13" Foreground="{DynamicResource TextPrimaryBrush}"
+                                                           VerticalAlignment="Center"/>
+                                                <ComboBox x:Name="HddThreadsBox" Grid.Column="1" Width="280" Height="34"
+                                                          HorizontalAlignment="Left"
+                                                          Style="{StaticResource AppComboBox}"
+                                                          ItemContainerStyle="{StaticResource AppComboBoxItem}"
+                                                          SelectionChanged="OnSettingChanged">
+                                                    <ComboBoxItem Content="32  — 最护盘，速度较慢"/>
+                                                    <ComboBoxItem Content="64  — 保守"/>
+                                                    <ComboBoxItem Content="96  — 折中"/>
+                                                    <ComboBoxItem Content="128 — 默认，推荐"/>
+                                                    <ComboBoxItem Content="192 — 较快"/>
+                                                    <ComboBoxItem Content="256 — 最快，寻道压力大"/>
+                                                </ComboBox>
+                                                <TextBlock Grid.Column="2" Text="机械盘连接越多，磁头寻道越频繁"
+                                                           Style="{StaticResource SettingsRowHint}"/>
+                                            </Grid>
 
-                                                <Grid Style="{StaticResource SettingsRow}">
-                                                    <Grid.ColumnDefinitions>
-                                                        <ColumnDefinition Width="160"/>
-                                                        <ColumnDefinition Width="*"/>
-                                                    </Grid.ColumnDefinitions>
-                                                    <TextBlock Text="机械盘连接上限" Style="{StaticResource FieldLabel}"
-                                                               VerticalAlignment="Center"/>
-                                                    <ComboBox x:Name="HddThreadsBox" Grid.Column="1" Height="34" HorizontalAlignment="Stretch"
-                                                              Style="{StaticResource AppComboBox}"
-                                                              ItemContainerStyle="{StaticResource AppComboBoxItem}"
-                                                              SelectionChanged="OnSettingChanged">
-                                                        <ComboBoxItem Content="32  — 最护盘，速度较慢"/>
-                                                        <ComboBoxItem Content="64  — 保守"/>
-                                                        <ComboBoxItem Content="96  — 折中"/>
-                                                        <ComboBoxItem Content="128 — 默认，推荐"/>
-                                                        <ComboBoxItem Content="192 — 较快"/>
-                                                        <ComboBoxItem Content="256 — 最快，寻道压力大"/>
-                                                    </ComboBox>
-                                                </Grid>
+                                            <Grid Style="{StaticResource SettingsRow3}">
+                                                <Grid.ColumnDefinitions>
+                                                    <ColumnDefinition Width="200"/>
+                                                    <ColumnDefinition Width="*"/>
+                                                    <ColumnDefinition Width="Auto"/>
+                                                </Grid.ColumnDefinitions>
+                                                <TextBlock Grid.Column="0" Text="同时下载任务数" Style="{StaticResource SettingsRowLabel}"/>
+                                                <ComboBox x:Name="ConcurrentBox" Grid.Column="1" Width="280" Height="34"
+                                                          HorizontalAlignment="Left"
+                                                          Style="{StaticResource AppComboBox}"
+                                                          ItemContainerStyle="{StaticResource AppComboBoxItem}"
+                                                          SelectionChanged="OnSettingChanged">
+                                                    <ComboBoxItem Content="1  — 只跑一个，最稳"/>
+                                                    <ComboBoxItem Content="2  — 两个并行"/>
+                                                    <ComboBoxItem Content="3  — 默认，均衡"/>
+                                                    <ComboBoxItem Content="4  — 较快"/>
+                                                    <ComboBoxItem Content="5  — 很快"/>
+                                                    <ComboBoxItem Content="6  — 上限，带宽吃满"/>
+                                                </ComboBox>
+                                                <TextBlock Grid.Column="2" Text="按文件大小分配连接数，小的少分但有下限"
+                                                           Style="{StaticResource SettingsRowHint}"/>
+                                            </Grid>
 
-                                                <Grid Style="{StaticResource SettingsRow}">
-                                                    <Grid.ColumnDefinitions>
-                                                        <ColumnDefinition Width="160"/>
-                                                        <ColumnDefinition Width="*"/>
-                                                    </Grid.ColumnDefinitions>
-                                                    <TextBlock Text="同时下载任务数" Style="{StaticResource FieldLabel}"/>
-                                                    <!-- 2026-11-02（用户要求）：改成**下拉选择**，上限 6，不能再手动输入。
-                                                         理由：手动输入可以填 999，而调度器要按这个数摊连接预算，
-                                                         填太大等于把每个任务的份额压到下限，反而更慢。
-                                                         固定档位 1~6 既能满足「同时下几个」的真实需求，
-                                                         又不会让预算被摊薄。 -->
-                                                    <ComboBox x:Name="ConcurrentBox" Grid.Column="1" Height="34" HorizontalAlignment="Stretch"
-                                                              Style="{StaticResource AppComboBox}"
-                                                              ItemContainerStyle="{StaticResource AppComboBoxItem}"
-                                                              SelectionChanged="OnSettingChanged">
-                                                        <ComboBoxItem Content="1  — 只跑一个，最稳"/>
-                                                        <ComboBoxItem Content="2  — 两个并行"/>
-                                                        <ComboBoxItem Content="3  — 默认，均衡"/>
-                                                        <ComboBoxItem Content="4  — 较快"/>
-                                                        <ComboBoxItem Content="5  — 很快"/>
-                                                        <ComboBoxItem Content="6  — 上限，带宽吃满"/>
-                                                    </ComboBox>
-                                                </Grid>
+                                            <Grid Style="{StaticResource SettingsRow3}" Margin="0">
+                                                <Grid.ColumnDefinitions>
+                                                    <ColumnDefinition Width="200"/>
+                                                    <ColumnDefinition Width="*"/>
+                                                    <ColumnDefinition Width="Auto"/>
+                                                </Grid.ColumnDefinitions>
+                                                <TextBlock Grid.Column="0" Text="代理" Style="{StaticResource SettingsRowLabel}"/>
+                                                <CheckBox x:Name="UseSystemProxyCheck" Grid.Column="1"
+                                                          Content="跟随 Windows 系统代理"
+                                                          Style="{StaticResource AppCheckBox}"
+                                                          VerticalAlignment="Center"
+                                                          Click="OnUseSystemProxyChanged"
+                                                          AutomationProperties.Name="跟随系统代理"
+                                                          ToolTip="默认关闭（直连）。公司网络 / 必须经代理才能上网时打开。本机装有代理软件（VPN、抓包、加速器）时建议保持关闭。"/>
+                                                <TextBlock Grid.Column="2" Text="默认直连，仅必须走代理时打开"
+                                                           Style="{StaticResource SettingsRowHint}"/>
+                                            </Grid>
+                                        </StackPanel>
+                                    </Border>
 
-                                                <!-- 跟随系统代理。
-                                                背景：程序历来**强制直连**（显式关闭代理，理由是
-                                                本机代理软件会劫持夸克接口、代理会改变 TLS 指纹被 WAF 拒）。
-                                                但"必须经代理才能上网"的环境（公司网络）里直连 = 程序
-                                                完全不可用；而 QuarkSession 里那句 "可设 UseSystemProxy = true"
-                                                此前**没有任何实现**（幽灵开关）。这里把它做成真设置项。
-                                                ⚠️ 默认关闭 = 与旧版行为完全一致（零回归）。
-                                                走独立 Click 处理器：不重建调度器（见 OnUseSystemProxyChanged）。 -->
-                                                <Grid Style="{StaticResource SettingsRow}">
-                                                    <Grid.ColumnDefinitions>
-                                                        <ColumnDefinition Width="160"/>
-                                                        <ColumnDefinition Width="*"/>
-                                                    </Grid.ColumnDefinitions>
-                                                    <TextBlock Text="代理" Style="{StaticResource FieldLabel}"/>
-                                                    <CheckBox x:Name="UseSystemProxyCheck" Grid.Column="1"
-                                                              Content="跟随 Windows 系统代理"
-                                                              Style="{StaticResource AppCheckBox}"
-                                                              Click="OnUseSystemProxyChanged"
-                                                              AutomationProperties.Name="跟随系统代理"
-                                                              ToolTip="默认关闭（直连）。公司网络 / 必须经代理才能上网时打开。本机装有代理软件（VPN、抓包、加速器）时建议保持关闭。"/>
-                                                </Grid>
-                                                <TextBlock Style="{StaticResource TertiaryText}" FontSize="11"
-                                                           Margin="120,0,0,0" TextWrapping="Wrap"
-                                                           Text="默认关闭（直连）。仅在必须经代理才能上网时打开；打开后重新开始下载或重新登录才会生效。"/>
-                                            </StackPanel>
-                                        </Border>
+                                    <!-- ② 窗口与后台 -->
+                                    <Border Style="{StaticResource SettingsCard}" Margin="0,0,0,14" HorizontalAlignment="Stretch">
+                                        <StackPanel>
+                                            <Grid Style="{StaticResource SettingsCardHeader}">
+                                                <StackPanel Orientation="Horizontal">
+                                                    <Path Data="{StaticResource IconSettings}" Stretch="Uniform"
+                                                          Width="16" Height="16" VerticalAlignment="Center"
+                                                          Stroke="{DynamicResource TextTertiaryBrush}" StrokeThickness="1.7"/>
+                                                    <TextBlock Text="窗口与后台" Style="{StaticResource SettingsCardTitle}"
+                                                               Margin="10,0,0,0"/>
+                                                </StackPanel>
+                                            </Grid>
 
-                                        <Border Style="{StaticResource SettingsCard}" Grid.Row="0" Grid.Column="1" HorizontalAlignment="Stretch" Margin="0,0,0,14">
-                                            <StackPanel>
-                                                <TextBlock Text="窗口与后台" Style="{StaticResource SettingsSectionTitle}"/>
+                                            <Grid Style="{StaticResource SettingsRow3}">
+                                                <Grid.ColumnDefinitions>
+                                                    <ColumnDefinition Width="200"/>
+                                                    <ColumnDefinition Width="*"/>
+                                                    <ColumnDefinition Width="Auto"/>
+                                                </Grid.ColumnDefinitions>
+                                                <TextBlock Grid.Column="0" Text="关闭按钮行为" Style="{StaticResource SettingsRowLabel}"/>
+                                                <ComboBox x:Name="CloseActionBox" Grid.Column="1" Width="280" Height="34"
+                                                          HorizontalAlignment="Left"
+                                                          Style="{StaticResource AppComboBox}"
+                                                          ItemContainerStyle="{StaticResource AppComboBoxItem}"
+                                                          SelectionChanged="OnSettingChanged">
+                                                    <ComboBoxItem Content="每次询问"/>
+                                                    <ComboBoxItem Content="最小化到托盘（后台继续下载）"/>
+                                                    <ComboBoxItem Content="直接退出程序"/>
+                                                </ComboBox>
+                                                <TextBlock Grid.Column="2" Text="选「最小化到托盘」后下载不会中断"
+                                                           Style="{StaticResource SettingsRowHint}"/>
+                                            </Grid>
 
-                                                <!-- 关闭按钮行为 + 悬浮小窗入口。
-                                                用户要求：第一次点 × 时询问「最小化到托盘 / 直接退出」，
-                                                弹窗里可勾「此后不再提示」，之后在**这里**还能改。 -->
-                                                <Grid Style="{StaticResource SettingsRow}">
-                                                    <Grid.ColumnDefinitions>
-                                                        <ColumnDefinition Width="160"/>
-                                                        <ColumnDefinition Width="*"/>
-                                                    </Grid.ColumnDefinitions>
-                                                    <TextBlock Text="关闭按钮行为" Style="{StaticResource FieldLabel}"/>
-                                                    <ComboBox x:Name="CloseActionBox" Grid.Column="1" Height="34" HorizontalAlignment="Stretch"
-                                                              Style="{StaticResource AppComboBox}"
-                                                              ItemContainerStyle="{StaticResource AppComboBoxItem}"
-                                                              SelectionChanged="OnSettingChanged">
-                                                        <ComboBoxItem Content="每次询问"/>
-                                                        <ComboBoxItem Content="最小化到托盘（后台继续下载）"/>
-                                                        <ComboBoxItem Content="直接退出程序"/>
-                                                    </ComboBox>
-                                                </Grid>
+                                            <Grid Style="{StaticResource SettingsRow3}" Margin="0">
+                                                <Grid.ColumnDefinitions>
+                                                    <ColumnDefinition Width="200"/>
+                                                    <ColumnDefinition Width="*"/>
+                                                    <ColumnDefinition Width="Auto"/>
+                                                </Grid.ColumnDefinitions>
+                                                <TextBlock Grid.Column="0" Text="剪贴板" Style="{StaticResource SettingsRowLabel}"/>
+                                                <CheckBox x:Name="ClipboardAutoParseCheck" Grid.Column="1"
+                                                          Content="复制分享链接时自动解析"
+                                                          Style="{StaticResource AppCheckBox}"
+                                                          VerticalAlignment="Center"
+                                                          Click="OnClipboardAutoParseChanged"/>
+                                                <TextBlock Grid.Column="2" Text="托盘时静默解析，不抢焦点"
+                                                           Style="{StaticResource SettingsRowHint}"/>
+                                            </Grid>
+                                        </StackPanel>
+                                    </Border>
 
-                                                <!-- 剪贴板监听：复制网盘分享链接即自动解析（四家都认）。
-                                                默认开；不想被打扰的用户在这里关掉。
-                                                走独立的 Click 处理器（不是 OnSettingChanged）——
-                                                这个开关不需要重建下载调度器，见 OnClipboardAutoParseChanged。 -->
-                                                <Grid Style="{StaticResource SettingsRow}">
-                                                    <Grid.ColumnDefinitions>
-                                                        <ColumnDefinition Width="160"/>
-                                                        <ColumnDefinition Width="*"/>
-                                                    </Grid.ColumnDefinitions>
-                                                    <TextBlock Text="剪贴板" Style="{StaticResource FieldLabel}"/>
-                                                    <CheckBox x:Name="ClipboardAutoParseCheck" Grid.Column="1"
-                                                              Content="复制分享链接时自动解析"
-                                                              Style="{StaticResource AppCheckBox}"
-                                                              Click="OnClipboardAutoParseChanged"
-                                                              />
-                                                </Grid>
-                                                <TextBlock Style="{StaticResource TertiaryText}" FontSize="11"
-                                                           Margin="120,0,0,0" TextWrapping="Wrap"
-                                                           Text="窗口在托盘时静默解析，不抢焦点，解析完用托盘气泡提示结果。"/>
-                                            </StackPanel>
-                                        </Border>
+                                    <!-- ③ 外观 -->
+                                    <Border Style="{StaticResource SettingsCard}" Margin="0,0,0,14" HorizontalAlignment="Stretch">
+                                        <StackPanel>
+                                            <Grid Style="{StaticResource SettingsCardHeader}">
+                                                <StackPanel Orientation="Horizontal">
+                                                    <Path Data="{StaticResource IconSparkle}" Stretch="Uniform"
+                                                          Width="16" Height="16" VerticalAlignment="Center"
+                                                          Stroke="{DynamicResource TextTertiaryBrush}" StrokeThickness="1.2"/>
+                                                    <TextBlock Text="外观" Style="{StaticResource SettingsCardTitle}"
+                                                               Margin="10,0,0,0"/>
+                                                </StackPanel>
+                                            </Grid>
 
-
-                                    <!-- 分区之间用极淡分隔线，而不是另起一张卡片 -->
-
-                                        <Border Style="{StaticResource SettingsCard}" Grid.Row="1" Grid.Column="0" HorizontalAlignment="Stretch" Margin="0,0,0,14">
-                                            <StackPanel>
-                                                <TextBlock Text="外观" Style="{StaticResource SettingsSectionTitle}"/>
-
-                                                <Border HorizontalAlignment="Left" CornerRadius="8"
+                                            <Grid Style="{StaticResource SettingsRow3}">
+                                                <Grid.ColumnDefinitions>
+                                                    <ColumnDefinition Width="200"/>
+                                                    <ColumnDefinition Width="*"/>
+                                                    <ColumnDefinition Width="Auto"/>
+                                                </Grid.ColumnDefinitions>
+                                                <TextBlock Grid.Column="0" Text="主题" Style="{StaticResource SettingsRowLabel}"/>
+                                                <Border Grid.Column="1" HorizontalAlignment="Left" CornerRadius="8"
                                                         Background="{DynamicResource SurfaceSunkenBrush}"
                                                         Padding="3">
                                                     <Grid local:SegmentedSlider.IsEnabled="True"
@@ -1903,74 +1907,86 @@
                                                         </StackPanel>
                                                     </Grid>
                                                 </Border>
+                                                <TextBlock x:Name="ThemeHintText" Grid.Column="2"
+                                                           Text="跟随系统时，Windows 切换深浅色会自动跟着变"
+                                                           Style="{StaticResource SettingsRowHint}"/>
+                                            </Grid>
 
-                                                <!-- 说明行：跟随系统时要让用户看懂"为什么我没选它却变了" -->
-                                                <TextBlock x:Name="ThemeHintText"
-                                                           Style="{StaticResource TertiaryText}"
-                                                           TextWrapping="Wrap"
-                                                           Margin="0,10,0,0"
-                                                           Text="跟随系统时，Windows 切换深色/浅色，本程序会自动跟着变。"/>
-
-                                                <!-- 主题版预览：让用户不用切来切去也能看到效果
-                                                色块 34×22 → 40×40、圆角 5 → 8，
-                                                并且**每个色块下方带自己的标签**（页面底 / 卡片 / 主色 / 正文）。
-                                                改前只有末尾一行笼统的「当前配色的底色、卡片色、主色」——
-                                                用户得数着猜哪个是哪个（"AI味"诊断里准确的一条：色块展示原始）。
-                                                每个色块包成「色块 + 标签」的竖排小单元，间距 12px。 -->
-                                                <StackPanel Orientation="Horizontal" Margin="0,14,0,0">
-                                                    <StackPanel Margin="0,0,12,0">
+                                            <Grid Style="{StaticResource SettingsRow3}" Margin="0">
+                                                <Grid.ColumnDefinitions>
+                                                    <ColumnDefinition Width="200"/>
+                                                    <ColumnDefinition Width="*"/>
+                                                    <ColumnDefinition Width="Auto"/>
+                                                </Grid.ColumnDefinitions>
+                                                <TextBlock Grid.Column="0" Text="配色预览" Style="{StaticResource SettingsRowLabel}"/>
+                                                <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+                                                    <StackPanel Margin="0,0,14,0">
                                                         <Border Width="40" Height="40" CornerRadius="8"
                                                                 Background="{DynamicResource AppBgBrush}"
                                                                 BorderBrush="{DynamicResource BorderBrushSoft}"
                                                                 BorderThickness="1"/>
-                                                        <TextBlock Text="页面底" Style="{StaticResource TertiaryText}"
+                                                        <TextBlock Text="页面底" Style="{StaticResource SettingsRowHint}"
                                                                    FontSize="11" HorizontalAlignment="Center"
                                                                    Margin="0,6,0,0"/>
                                                     </StackPanel>
-                                                    <StackPanel Margin="0,0,12,0">
+                                                    <StackPanel Margin="0,0,14,0">
                                                         <Border Width="40" Height="40" CornerRadius="8"
                                                                 Background="{DynamicResource SurfaceBrush}"
                                                                 BorderBrush="{DynamicResource BorderBrushSoft}"
                                                                 BorderThickness="1"/>
-                                                        <TextBlock Text="卡片" Style="{StaticResource TertiaryText}"
+                                                        <TextBlock Text="卡片" Style="{StaticResource SettingsRowHint}"
                                                                    FontSize="11" HorizontalAlignment="Center"
                                                                    Margin="0,6,0,0"/>
                                                     </StackPanel>
-                                                    <StackPanel Margin="0,0,12,0">
+                                                    <StackPanel Margin="0,0,14,0">
                                                         <Border Width="40" Height="40" CornerRadius="8"
                                                                 Background="{DynamicResource TextPrimaryBrush}"/>
-                                                        <TextBlock Text="主色" Style="{StaticResource TertiaryText}"
+                                                        <TextBlock Text="主色" Style="{StaticResource SettingsRowHint}"
                                                                    FontSize="11" HorizontalAlignment="Center"
                                                                    Margin="0,6,0,0"/>
                                                     </StackPanel>
                                                     <StackPanel>
                                                         <Border Width="40" Height="40" CornerRadius="8"
-                                                                Background="{DynamicResource TextPrimaryBrush}"/>
-                                                        <TextBlock Text="正文" Style="{StaticResource TertiaryText}"
+                                                                Background="{DynamicResource TextSecondaryBrush}"/>
+                                                        <TextBlock Text="正文" Style="{StaticResource SettingsRowHint}"
                                                                    FontSize="11" HorizontalAlignment="Center"
                                                                    Margin="0,6,0,0"/>
                                                     </StackPanel>
                                                 </StackPanel>
-                                            </StackPanel>
-                                        </Border>
-                                        <Border Style="{StaticResource SettingsCard}" Grid.Row="1" Grid.Column="1" HorizontalAlignment="Stretch" Margin="0,0,0,14">
-                                            <StackPanel>
-                                                <TextBlock Text="存储" Style="{StaticResource SettingsSectionTitle}"/>
+                                                <TextBlock Grid.Column="2" Text="切换主题后这里会立即更新"
+                                                           Style="{StaticResource SettingsRowHint}"/>
+                                            </Grid>
+                                        </StackPanel>
+                                    </Border>
 
-                                                <!-- 原来是 [120][*][Auto][Auto] 单行：
-                                                     输入框被「浏览…」+「打开下载目录」两个按钮挤到只剩 ~60px，
-                                                     只显示得出 "C://Users" 就被截断。
-                                                     改成与右列「分片与缓存」完全同构的**竖排**：
-                                                     标签在上、输入框吃满整行、两个按钮并排在右侧。 -->
-                                                <TextBlock Text="下载目录" Style="{StaticResource FieldLabel}"
-                                                           Margin="0,0,0,6"/>
-                                                <Grid Style="{StaticResource SettingsRow}">
+                                    <!-- ④ 存储 -->
+                                    <Border Style="{StaticResource SettingsCard}" Margin="0,0,0,14" HorizontalAlignment="Stretch">
+                                        <StackPanel>
+                                            <Grid Style="{StaticResource SettingsCardHeader}">
+                                                <StackPanel Orientation="Horizontal">
+                                                    <Path Data="{StaticResource IconFolder}" Stretch="Uniform"
+                                                          Width="16" Height="16" VerticalAlignment="Center"
+                                                          Stroke="{DynamicResource TextTertiaryBrush}" StrokeThickness="1.7"/>
+                                                    <TextBlock Text="存储" Style="{StaticResource SettingsCardTitle}"
+                                                               Margin="10,0,0,0"/>
+                                                </StackPanel>
+                                            </Grid>
+
+                                            <Grid Style="{StaticResource SettingsRow3}">
+                                                <Grid.ColumnDefinitions>
+                                                    <ColumnDefinition Width="200"/>
+                                                    <ColumnDefinition Width="*"/>
+                                                    <ColumnDefinition Width="Auto"/>
+                                                </Grid.ColumnDefinitions>
+                                                <TextBlock Grid.Column="0" Text="下载目录" Style="{StaticResource SettingsRowLabel}"/>
+                                                <Grid Grid.Column="1">
                                                     <Grid.ColumnDefinitions>
-                                                        <ColumnDefinition Width="*"/>
+                                                        <ColumnDefinition Width="*" MaxWidth="420"/>
                                                         <ColumnDefinition Width="Auto"/>
                                                         <ColumnDefinition Width="Auto"/>
                                                     </Grid.ColumnDefinitions>
                                                     <TextBox x:Name="OutDirBox" Grid.Column="0"
+                                                             Height="34"
                                                              Style="{StaticResource AppTextBox}"
                                                              LostFocus="OnSettingChanged"
                                                              KeyDown="OnSettingKeyDown"/>
@@ -1995,56 +2011,75 @@
                                                         </StackPanel>
                                                     </Button>
                                                 </Grid>
-                                                <CheckBox x:Name="AutoCleanCheck"
+                                                <TextBlock Grid.Column="2" Text="改目录后新任务才会用新路径"
+                                                           Style="{StaticResource SettingsRowHint}"/>
+                                            </Grid>
+
+                                            <Grid Style="{StaticResource SettingsRow3}" Margin="0">
+                                                <Grid.ColumnDefinitions>
+                                                    <ColumnDefinition Width="200"/>
+                                                    <ColumnDefinition Width="*"/>
+                                                    <ColumnDefinition Width="Auto"/>
+                                                </Grid.ColumnDefinitions>
+                                                <TextBlock Grid.Column="0" Text="转存清理" Style="{StaticResource SettingsRowLabel}"/>
+                                                <CheckBox x:Name="AutoCleanCheck" Grid.Column="1"
                                                           Content="下载完成后自动清理云盘转存文件"
                                                           Style="{StaticResource AppCheckBox}"
+                                                          VerticalAlignment="Center"
                                                           Click="OnSettingChanged"/>
-                                            </StackPanel>
-                                        </Border>
+                                                <TextBlock Grid.Column="2" Text="阿里/迅雷分享必须先转存才能取直链"
+                                                           Style="{StaticResource SettingsRowHint}"/>
+                                            </Grid>
+                                        </StackPanel>
+                                    </Border>
 
-                                        <!-- 🚨 2026-11-01（用户拍板方案 B）：整块删掉「分片与缓存」卡。
-                                             依据（五层架构全量 grep）：
-                                               · DownloadJob.PartsRoot 只被赋值、从没被读取；
-                                               · 融合引擎顺序写目标文件 + {目标}.geziresume，全程不建 .qparts；
-                                               · PartsPaths.ResolvePaths 的唯一调用者是它自己（枚举历史残留用）。
-                                             ⇒ 对当前下载行为零影响，留着只会让用户以为改它能提速/换盘。
-                                             老用户旧目录残留仍可清 —— AllPartsRoots() 依然读
-                                             Settings.PartsDirsKnown 这份历史清单。 -->
-
-                                        <Border Style="{StaticResource SettingsCard}" Grid.Row="2" Grid.Column="0" Grid.ColumnSpan="2" HorizontalAlignment="Stretch" Margin="0,0,0,14">
-                                            <StackPanel>
-                                                <TextBlock Text="播放器（边下边播用）"
-                                                           Style="{StaticResource CardTitleText}"
-                                                           FontSize="14" Margin="0,0,0,10"/>
-                                                <TextBlock x:Name="PlayerStatusText" TextWrapping="Wrap"
-                                                           Style="{StaticResource ProseText}" Margin="0,0,0,10"/>
+                                    <!-- ⑤ 播放器（边下边播用） -->
+                                    <Border Style="{StaticResource SettingsCard}" HorizontalAlignment="Stretch">
+                                        <StackPanel>
+                                            <Grid Style="{StaticResource SettingsCardHeader}">
                                                 <StackPanel Orientation="Horizontal">
+                                                    <Path Data="{StaticResource IconFileVideo}" Stretch="Uniform"
+                                                          Width="16" Height="16" VerticalAlignment="Center"
+                                                          Stroke="{DynamicResource TextTertiaryBrush}" StrokeThickness="1.7"/>
+                                                    <TextBlock Text="播放器（边下边播用）" Style="{StaticResource SettingsCardTitle}"
+                                                               Margin="10,0,0,0"/>
+                                                </StackPanel>
+                                            </Grid>
+
+                                            <Grid Style="{StaticResource SettingsRow3}">
+                                                <Grid.ColumnDefinitions>
+                                                    <ColumnDefinition Width="200"/>
+                                                    <ColumnDefinition Width="*"/>
+                                                    <ColumnDefinition Width="Auto"/>
+                                                </Grid.ColumnDefinitions>
+                                                <TextBlock Grid.Column="0" Text="检测结果" Style="{StaticResource SettingsRowLabel}"/>
+                                                <TextBlock x:Name="PlayerStatusText" Grid.Column="1"
+                                                           TextWrapping="Wrap" VerticalAlignment="Center"
+                                                           Style="{StaticResource BodyText}"/>
+                                                <TextBlock Grid.Column="2" Text="边下边播时以共享模式读取文件"
+                                                           Style="{StaticResource SettingsRowHint}"/>
+                                            </Grid>
+
+                                            <Grid Style="{StaticResource SettingsRow3}" Margin="0">
+                                                <Grid.ColumnDefinitions>
+                                                    <ColumnDefinition Width="200"/>
+                                                    <ColumnDefinition Width="*"/>
+                                                    <ColumnDefinition Width="Auto"/>
+                                                </Grid.ColumnDefinitions>
+                                                <TextBlock Grid.Column="0" Text="操作" Style="{StaticResource SettingsRowLabel}"/>
+                                                <StackPanel Grid.Column="1" Orientation="Horizontal">
                                                     <Button x:Name="GetVlcBtn" Content="打开 VLC 下载页" Click="OnGetVlc"
                                                             Style="{StaticResource SecondaryButton}" Margin="0,0,8,0"/>
                                                     <Button x:Name="RecheckPlayerBtn" Content="重新检测"
                                                             Click="OnRecheckPlayer" Style="{StaticResource SecondaryButton}"/>
                                                 </StackPanel>
+                                                <TextBlock Grid.Column="2" Text="VLC 开源全格式播放器，免费无广告"
+                                                           Style="{StaticResource SettingsRowHint}"/>
+                                            </Grid>
+                                        </StackPanel>
+                                    </Border>
 
-                                                <!-- 这里介绍的是 **VLC**（本卡主题是播放器），不是鸽子下载自己。
-                                                     2026-11-02（设置页方案 A）：原来这里是「标题 + 三行说明」，
-                                                     把播放器卡撑到 ~180px，导致右列比左列矮一大截、右下角大片空白。
-                                                     现在压成**一行**：一句话说明 + 悬停看完整介绍。 -->
-                                                <Border Margin="0,12,0,0" Padding="0,10,0,0"
-                                                        BorderBrush="{DynamicResource BorderBrushSoft}"
-                                                        BorderThickness="0,1,0,0">
-                                                    <TextBlock FontSize="11" TextWrapping="Wrap"
-                                                               Foreground="{DynamicResource TextTertiaryBrush}"
-                                                               ToolTip="VLC media player · 免费、开源（GPL-2.0+）、无广告、不联网也能用。几乎支持所有音视频格式与字幕；边下边播时以共享模式读取文件，不会干扰继续写盘。">
-                                                        <Run Text="VLC media player" FontWeight="SemiBold"
-                                                             Foreground="{DynamicResource TextSecondaryBrush}"/>
-                                                        <Run Text=" · 开源全格式播放器，边下边播时以共享模式读取文件"/>
-                                                    </TextBlock>
-                                                </Border>
-                                            </StackPanel>
-                                        </Border>
-
-                                    </Grid>
-                                </Grid>
+                                </StackPanel>
 
                         </StackPanel>
                     </ScrollViewer>
@@ -2434,163 +2469,197 @@
                     </ScrollViewer>
                 </TabItem>
 
-                <!-- ============ 关于（2026-11-02 新增） ============
-                     用户要求：
-                       · 放在界面最下方（已在侧栏最后一项）；
-                       · 点开后**在右侧内容区显示**，不弹新窗口 —— 与设置/登录完全一致；
-                       · 内容包含：软件信息 / 使用教程 / 注意事项 / GitHub 与 B 站链接。
+                <!-- ============ 关于（2026-11-02 新增，2026-11-02 第二次重做） ============
+                     用户要求：放在侧栏最后一项；点开在**右侧内容区**显示，不弹新窗口。
                      ⚠️ 它必须是**第 5 个 TabItem**（索引 4），与侧栏第 5 项严格对应，
-                        否则 OnNavSelectionChanged 的索引同步会串页。 -->
+                        否则 OnNavSelectionChanged 的索引同步会串页。
+
+                     ============================================================
+                     第二次重做（用户说「这两个 UI 做的纯垃圾玩意」）
+                     ============================================================
+                     上一版的问题（截图里一眼可见）：
+                       · 硬做两列，但内容量根本不对称 —— 左「使用教程」5 段 420px，
+                         右「注意事项」4 段 300px，右边下方空 120px；
+                       · 「关注与反馈」只占左半，右边全空，像做漏了一半；
+                       · 卡片被 Grid 行对齐拉到等高，内容少的卡底部留大片空白；
+                       · 三张卡占满上方 620px，下面 300px 全死白。
+                     这一版：**单列窄阅读流**（文档站的做法）。
+                       关于页是「读」的页面，不是「操作」页面，
+                       阅读型页面本来就该窄（每行 60~75 字符最舒服），
+                       硬拉满 1300px 宽反而难读。
+                       MaxWidth=760 居中，四张卡上下排，内容有多少占多少，
+                       不再有"被拉齐的等高卡"和"半边空白"。
+                     ============================================================ -->
                 <TabItem Style="{StaticResource HeadlessTabItem}">
                     <ScrollViewer VerticalScrollBarVisibility="Auto" Padding="0,0,10,0"
                                   HorizontalContentAlignment="Stretch">
-                        <StackPanel Margin="24,24,24,24" HorizontalAlignment="Stretch">
+                        <StackPanel Margin="24,24,24,40" HorizontalAlignment="Stretch">
+
                             <TextBlock Text="关于" Style="{StaticResource PageTitleText}" Margin="0,0,0,4"/>
                             <TextBlock Text="鸽子下载 —— 多网盘下载器"
                                        Style="{StaticResource TertiaryText}" Margin="0,0,0,20"/>
 
-                            <Grid>
-                                <Grid.ColumnDefinitions>
-                                    <ColumnDefinition Width="*"/>
-                                    <ColumnDefinition Width="*"/>
-                                </Grid.ColumnDefinitions>
-                                <Grid.RowDefinitions>
-                                    <RowDefinition Height="Auto"/>
-                                    <RowDefinition Height="Auto"/>
-                                    <RowDefinition Height="Auto"/>
-                                </Grid.RowDefinitions>
+                            <!-- 单列窄阅读流：MaxWidth 760 且**左对齐**（居中会让左边空一截，
+                                 看着像没对齐；文档站的正文都是从固定左起点开始的）。 -->
+                            <StackPanel HorizontalAlignment="Left" MaxWidth="760">
 
-                            <!-- ① 软件信息 -->
-                            <Border Style="{StaticResource SettingsCard}" Grid.Row="0" Grid.Column="0" Grid.ColumnSpan="2" HorizontalAlignment="Stretch" Margin="0,0,0,14">
-                                <StackPanel>
-                                    <TextBlock Text="软件信息" Style="{StaticResource SettingsSectionTitle}"/>
+                                <!-- ① 软件信息 -->
+                                <Border Style="{StaticResource SettingsCard}" Margin="0,0,0,14">
+                                    <StackPanel>
+                                        <Grid Style="{StaticResource SettingsCardHeader}">
+                                            <StackPanel Orientation="Horizontal">
+                                                <Path Data="{StaticResource IconInfo}" Stretch="Uniform"
+                                                      Width="16" Height="16" VerticalAlignment="Center"
+                                                      Stroke="{DynamicResource TextTertiaryBrush}" StrokeThickness="1.7"/>
+                                                <TextBlock Text="软件信息" Style="{StaticResource SettingsCardTitle}"
+                                                           Margin="10,0,0,0"/>
+                                            </StackPanel>
+                                        </Grid>
 
-                                    <Grid Style="{StaticResource SettingsRow}">
-                                        <Grid.ColumnDefinitions>
-                                            <ColumnDefinition Width="Auto" MinWidth="88"/>
-                                            <ColumnDefinition Width="*"/>
-                                        </Grid.ColumnDefinitions>
-                                        <TextBlock Text="名称" Style="{StaticResource FieldLabel}"/>
-                                        <TextBlock Grid.Column="1" Text="鸽子下载（GeZi）"
-                                                   Style="{StaticResource BodyText}" VerticalAlignment="Center"/>
-                                    </Grid>
+                                        <Grid Style="{StaticResource SettingsRow3}" Margin="0,0,0,10">
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="90"/>
+                                                <ColumnDefinition Width="*"/>
+                                            </Grid.ColumnDefinitions>
+                                            <TextBlock Grid.Column="0" Text="名称" Style="{StaticResource SettingsRowLabel}"/>
+                                            <TextBlock Grid.Column="1" Text="鸽子下载（GeZi）"
+                                                       Style="{StaticResource BodyText}" VerticalAlignment="Center"/>
+                                        </Grid>
+                                        <Grid Style="{StaticResource SettingsRow3}" Margin="0,0,0,10">
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="90"/>
+                                                <ColumnDefinition Width="*"/>
+                                            </Grid.ColumnDefinitions>
+                                            <TextBlock Grid.Column="0" Text="版本" Style="{StaticResource SettingsRowLabel}"/>
+                                            <TextBlock x:Name="AboutVersionText" Grid.Column="1" Text="v?"
+                                                       Style="{StaticResource BodyText}" VerticalAlignment="Center"/>
+                                        </Grid>
+                                        <Grid Style="{StaticResource SettingsRow3}" Margin="0,0,0,10">
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="90"/>
+                                                <ColumnDefinition Width="*"/>
+                                            </Grid.ColumnDefinitions>
+                                            <TextBlock Grid.Column="0" Text="作者" Style="{StaticResource SettingsRowLabel}"/>
+                                            <TextBlock Grid.Column="1" Text="Yi Yuan"
+                                                       Style="{StaticResource BodyText}" VerticalAlignment="Center"/>
+                                        </Grid>
+                                        <Grid Style="{StaticResource SettingsRow3}" Margin="0,0,0,14">
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="90"/>
+                                                <ColumnDefinition Width="*"/>
+                                            </Grid.ColumnDefinitions>
+                                            <TextBlock Grid.Column="0" Text="开源协议" Style="{StaticResource SettingsRowLabel}"/>
+                                            <TextBlock Grid.Column="1" Text="AGPL-3.0（完全开源，无广告、无遥测）"
+                                                       Style="{StaticResource BodyText}" VerticalAlignment="Center"
+                                                       TextWrapping="Wrap"/>
+                                        </Grid>
 
-                                    <Grid Style="{StaticResource SettingsRow}">
-                                        <Grid.ColumnDefinitions>
-                                            <ColumnDefinition Width="Auto" MinWidth="88"/>
-                                            <ColumnDefinition Width="*"/>
-                                        </Grid.ColumnDefinitions>
-                                        <TextBlock Text="版本" Style="{StaticResource FieldLabel}"/>
-                                        <TextBlock x:Name="AboutVersionText" Grid.Column="1" Text="v?"
-                                                   Style="{StaticResource BodyText}" VerticalAlignment="Center"/>
-                                    </Grid>
-
-                                    <Grid Style="{StaticResource SettingsRow}">
-                                        <Grid.ColumnDefinitions>
-                                            <ColumnDefinition Width="Auto" MinWidth="88"/>
-                                            <ColumnDefinition Width="*"/>
-                                        </Grid.ColumnDefinitions>
-                                        <TextBlock Text="作者" Style="{StaticResource FieldLabel}"/>
-                                        <TextBlock Grid.Column="1" Text="Yi Yuan"
-                                                   Style="{StaticResource BodyText}" VerticalAlignment="Center"/>
-                                    </Grid>
-
-                                    <Grid Style="{StaticResource SettingsRow}">
-                                        <Grid.ColumnDefinitions>
-                                            <ColumnDefinition Width="Auto" MinWidth="88"/>
-                                            <ColumnDefinition Width="*"/>
-                                        </Grid.ColumnDefinitions>
-                                        <TextBlock Text="开源协议" Style="{StaticResource FieldLabel}"/>
-                                        <TextBlock Grid.Column="1" Text="AGPL-3.0（完全开源，无广告、无遥测）"
-                                                   Style="{StaticResource BodyText}" VerticalAlignment="Center"
-                                                   TextWrapping="Wrap"/>
-                                    </Grid>
-
-                                    <StackPanel Orientation="Horizontal" Margin="0,6,0,0">
-                                        <Button Content="检查更新" Click="OnAboutCheckUpdate"
-                                                Style="{StaticResource SecondaryButton}" Margin="0,0,8,0"/>
-                                        <Button Content="赞赏支持" Click="OnAboutReward"
-                                                Style="{StaticResource SecondaryButton}"/>
+                                        <StackPanel Orientation="Horizontal">
+                                            <Button Content="检查更新" Click="OnAboutCheckUpdate"
+                                                    Style="{StaticResource SecondaryButton}" Margin="0,0,8,0"/>
+                                            <Button Content="赞赏支持" Click="OnAboutReward"
+                                                    Style="{StaticResource SecondaryButton}"/>
+                                        </StackPanel>
+                                        <!-- 检查更新的**可见反馈**：原来结果只写进日志区（在「任务」页），
+                                             用户在这页点按钮屏幕上毫无变化 → 以为没反应。 -->
+                                        <TextBlock x:Name="AboutUpdateStatusText"
+                                                   FontSize="11.5" Margin="0,10,0,0"
+                                                   TextWrapping="Wrap" Visibility="Collapsed"
+                                                   Foreground="{DynamicResource TextTertiaryBrush}"/>
                                     </StackPanel>
-                                    <!-- 2026-11-02：检查更新的**可见反馈**。
-                                         原来结果只写进日志区（在「任务」页），
-                                         用户在关于页点按钮屏幕上毫无变化 → 以为没反应。 -->
-                                    <TextBlock x:Name="AboutUpdateStatusText"
-                                               FontSize="11" Margin="0,8,0,0"
-                                               TextWrapping="Wrap" Visibility="Collapsed"
-                                               Foreground="{DynamicResource TextTertiaryBrush}"/>
-                                </StackPanel>
-                            </Border>
+                                </Border>
 
+                                <!-- ② 使用教程 -->
+                                <Border Style="{StaticResource SettingsCard}" Margin="0,0,0,14">
+                                    <StackPanel>
+                                        <Grid Style="{StaticResource SettingsCardHeader}">
+                                            <StackPanel Orientation="Horizontal">
+                                                <Path Data="{StaticResource IconFileText}" Stretch="Uniform"
+                                                      Width="16" Height="16" VerticalAlignment="Center"
+                                                      Stroke="{DynamicResource TextTertiaryBrush}" StrokeThickness="1.7"/>
+                                                <TextBlock Text="使用教程" Style="{StaticResource SettingsCardTitle}"
+                                                           Margin="10,0,0,0"/>
+                                            </StackPanel>
+                                        </Grid>
 
-                            <!-- ② 使用教程 -->
-                            <Border Style="{StaticResource SettingsCard}" Grid.Row="0" Grid.Column="0" HorizontalAlignment="Stretch" Margin="0,0,0,14">
-                                <StackPanel>
-                                    <TextBlock Text="使用教程" Style="{StaticResource SettingsSectionTitle}"/>
-
-                                    <TextBlock Style="{StaticResource ProseText}" TextWrapping="Wrap" Margin="0,0,0,8">
-                                        <Run Text="① 下载分享文件：把网盘分享链接粘到「下载」页的输入框，点「解析」，选中文件后点「下载」。"/>
-                                    </TextBlock>
-                                    <TextBlock Style="{StaticResource ProseText}" TextWrapping="Wrap" Margin="0,0,0,8">
-                                        <Run Text="② 多选文件：在文件列表里按住"/>
-                                        <Run Text="Shift" FontWeight="SemiBold"/>
-                                        <Run Text="再点另一项，即可连续多选；按住"/>
-                                        <Run Text="Ctrl" FontWeight="SemiBold"/>
-                                        <Run Text="可点选多个不连续的文件。"/>
-                                    </TextBlock>
-                                    <TextBlock Style="{StaticResource ProseText}" TextWrapping="Wrap" Margin="0,0,0,8">
-                                        <Run Text="③ 免转存下载：在文件上点"/>
-                                        <Run Text="右键" FontWeight="SemiBold"/>
-                                        <Run Text="，选「免转存下载」—— 不写入你的网盘，直接从分享取链（仅夸克 / UC 支持）。"/>
-                                    </TextBlock>
-                                    <TextBlock Style="{StaticResource ProseText}" TextWrapping="Wrap" Margin="0,0,0,8">
-                                        <Run Text="④ 浏览自己的网盘：登录后切到「我的网盘」，四家网盘可随时切换，不用重新登录。"/>
-                                    </TextBlock>
-                                    <TextBlock Style="{StaticResource ProseText}" TextWrapping="Wrap">
-                                        <Run Text="⑤ 断点续传：任务暂停或软件重启后，在「任务」页右上角的「未完成」入口可以接着下，已下载的部分不会重下。"/>
-                                    </TextBlock>
-                                </StackPanel>
-                            </Border>
-
-
-                            <!-- ③ 注意事项 -->
-                            <Border Style="{StaticResource SettingsCard}" Grid.Row="0" Grid.Column="1" HorizontalAlignment="Stretch" Margin="0,0,0,14">
-                                <StackPanel>
-                                    <TextBlock Text="注意事项" Style="{StaticResource SettingsSectionTitle}"/>
-
-                                    <TextBlock Style="{StaticResource ProseText}" TextWrapping="Wrap" Margin="0,0,0,8">
-                                        <Run Text="· 登录凭据仅以 Windows DPAPI 加密保存在本机，"/>
-                                        <Run Text="不会上传到任何服务器" FontWeight="SemiBold"/>
-                                        <Run Text="，也不含任何遥测。"/>
-                                    </TextBlock>
-                                    <TextBlock Style="{StaticResource ProseText}" TextWrapping="Wrap" Margin="0,0,0,8">
-                                        <Run Text="· 阿里云盘 / 迅雷云盘下载分享文件时，"/>
-                                        <Run Text="必须先转存到自己网盘" FontWeight="SemiBold"/>
-                                        <Run Text="才能取到直链；任务结束会自动清理这份临时转存。"/>
-                                    </TextBlock>
-                                    <TextBlock Style="{StaticResource ProseText}" TextWrapping="Wrap" Margin="0,0,0,8">
-                                        <Run Text="· 免转存（游客直链）只能下夸克原本就允许的 ≤10MB 小文件，大文件仍需登录。"/>
-                                    </TextBlock>
-                                    <TextBlock Style="{StaticResource ProseText}" TextWrapping="Wrap">
-                                        <Run Text="· 本软件仅供个人学习与备份使用，请遵守各网盘的服务条款与当地法律法规。"/>
-                                    </TextBlock>
-                                </StackPanel>
-                            </Border>
-
-
-                            <!-- ④ 链接 -->
-                            <Border Style="{StaticResource SettingsCard}" Grid.Row="1" Grid.Column="0" HorizontalAlignment="Stretch" Margin="0,0,0,14">
-                                <StackPanel>
-                                    <TextBlock Text="关注与反馈" Style="{StaticResource SettingsSectionTitle}"/>
-                                    <StackPanel Orientation="Horizontal">
-                                        <Button Content="GitHub 开源地址" Click="OnAboutGithub"
-                                                Style="{StaticResource SecondaryButton}" Margin="0,0,8,0"/>
-                                        <Button Content="作者 B 站" Click="OnAboutBilibili"
-                                                Style="{StaticResource SecondaryButton}"/>
+                                        <TextBlock Style="{StaticResource ProseText}" TextWrapping="Wrap" Margin="0,0,0,10">
+                                            <Run Text="① 下载分享文件：把网盘分享链接粘到「下载」页的输入框，点「解析」，选中文件后点「下载」。"/>
+                                        </TextBlock>
+                                        <TextBlock Style="{StaticResource ProseText}" TextWrapping="Wrap" Margin="0,0,0,10">
+                                            <Run Text="② 多选文件：在文件列表里按住"/>
+                                            <Run Text="Shift" FontWeight="SemiBold"/>
+                                            <Run Text="再点另一项，即可连续多选；按住"/>
+                                            <Run Text="Ctrl" FontWeight="SemiBold"/>
+                                            <Run Text="可点选多个不连续的文件。"/>
+                                        </TextBlock>
+                                        <TextBlock Style="{StaticResource ProseText}" TextWrapping="Wrap" Margin="0,0,0,10">
+                                            <Run Text="③ 免转存下载：在文件上点"/>
+                                            <Run Text="右键" FontWeight="SemiBold"/>
+                                            <Run Text="，选「免转存下载」—— 不写入你的网盘，直接从分享取链（仅夸克 / UC 支持）。"/>
+                                        </TextBlock>
+                                        <TextBlock Style="{StaticResource ProseText}" TextWrapping="Wrap" Margin="0,0,0,10">
+                                            <Run Text="④ 浏览自己的网盘：登录后切到「我的网盘」，四家网盘可随时切换，不用重新登录。"/>
+                                        </TextBlock>
+                                        <TextBlock Style="{StaticResource ProseText}" TextWrapping="Wrap">
+                                            <Run Text="⑤ 断点续传：任务暂停或软件重启后，在「任务」页右上角的「未完成」入口可以接着下，已下载的部分不会重下。"/>
+                                        </TextBlock>
                                     </StackPanel>
-                                </StackPanel>
-                            </Border>
-                            </Grid>
+                                </Border>
+
+                                <!-- ③ 注意事项 -->
+                                <Border Style="{StaticResource SettingsCard}" Margin="0,0,0,14">
+                                    <StackPanel>
+                                        <Grid Style="{StaticResource SettingsCardHeader}">
+                                            <StackPanel Orientation="Horizontal">
+                                                <Path Data="{StaticResource IconWarning}" Stretch="Uniform"
+                                                      Width="16" Height="16" VerticalAlignment="Center"
+                                                      Stroke="{DynamicResource TextTertiaryBrush}" StrokeThickness="1.7"/>
+                                                <TextBlock Text="注意事项" Style="{StaticResource SettingsCardTitle}"
+                                                           Margin="10,0,0,0"/>
+                                            </StackPanel>
+                                        </Grid>
+
+                                        <TextBlock Style="{StaticResource ProseText}" TextWrapping="Wrap" Margin="0,0,0,10">
+                                            <Run Text="· 登录凭据仅以 Windows DPAPI 加密保存在本机，"/>
+                                            <Run Text="不会上传到任何服务器" FontWeight="SemiBold"/>
+                                            <Run Text="，也不含任何遥测。"/>
+                                        </TextBlock>
+                                        <TextBlock Style="{StaticResource ProseText}" TextWrapping="Wrap" Margin="0,0,0,10">
+                                            <Run Text="· 阿里云盘 / 迅雷云盘下载分享文件时，"/>
+                                            <Run Text="必须先转存到自己网盘" FontWeight="SemiBold"/>
+                                            <Run Text="才能取到直链；任务结束会自动清理这份临时转存。"/>
+                                        </TextBlock>
+                                        <TextBlock Style="{StaticResource ProseText}" TextWrapping="Wrap" Margin="0,0,0,10">
+                                            <Run Text="· 免转存（游客直链）只能下夸克原本就允许的 ≤10MB 小文件，大文件仍需登录。"/>
+                                        </TextBlock>
+                                        <TextBlock Style="{StaticResource ProseText}" TextWrapping="Wrap">
+                                            <Run Text="· 本软件仅供个人学习与备份使用，请遵守各网盘的服务条款与当地法律法规。"/>
+                                        </TextBlock>
+                                    </StackPanel>
+                                </Border>
+
+                                <!-- ④ 关注与反馈 -->
+                                <Border Style="{StaticResource SettingsCard}">
+                                    <StackPanel>
+                                        <Grid Style="{StaticResource SettingsCardHeader}">
+                                            <StackPanel Orientation="Horizontal">
+                                                <Path Data="{StaticResource IconLink}" Stretch="Uniform"
+                                                      Width="16" Height="16" VerticalAlignment="Center"
+                                                      Stroke="{DynamicResource TextTertiaryBrush}" StrokeThickness="1.7"/>
+                                                <TextBlock Text="关注与反馈" Style="{StaticResource SettingsCardTitle}"
+                                                           Margin="10,0,0,0"/>
+                                            </StackPanel>
+                                        </Grid>
+                                        <StackPanel Orientation="Horizontal">
+                                            <Button Content="GitHub 开源地址" Click="OnAboutGithub"
+                                                    Style="{StaticResource SecondaryButton}" Margin="0,0,8,0"/>
+                                            <Button Content="作者 B 站" Click="OnAboutBilibili"
+                                                    Style="{StaticResource SecondaryButton}"/>
+                                        </StackPanel>
+                                    </StackPanel>
+                                </Border>
+
+                            </StackPanel>
 
                         </StackPanel>
                     </ScrollViewer>
