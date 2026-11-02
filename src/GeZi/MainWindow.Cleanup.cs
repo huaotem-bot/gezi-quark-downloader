@@ -162,12 +162,32 @@ namespace GeZi
         {
             if (item == null || item.StoredIds.Count == 0) return;
 
+            // 🚨🚨 2026-11-02 修「设置里的『下载完成后自动清理转存文件』对阿里/迅雷无效」。
+            //
+            //   根因：转存清理有**两条独立路径** ——
+            //     ① CleanupTransferredAsync（夸克/UC 那条，看 _settings.AutoClean）；
+            //     ② 本方法（阿里/迅雷那条，走 provider.CleanupStoredAsync）——
+            //        **完全没检查 AutoClean**，无条件删。
+            //   用户关掉这个开关后，阿里/迅雷的转存副本照样被删，设置形同虚设。
+            //
+            //   ⚠️ 但要注意：**关掉开关不等于不清理内存记账**。
+            //     上面那两行 Clear / 落盘必须照常执行 —— 否则 item.StoredIds 会一直挂着，
+            //     下次任务终态又会被重复处理，日志里刷一堆无意义的记录。
+            //     所以判据放在**取完 ids、清完记账之后**，只跳过真正的网络删除。
             var ids = item.StoredIds.ToList();
             item.StoredIds.Clear();
 
             LoadStoredJournal();
             foreach (string id in ids) _storedJournal.Remove(StoredRecord(item.StoredKind, id));
             SaveStoredJournal();
+
+            // 记账已清完（见方法开头），这里才决定要不要真的去网盘删。
+            if (_settings == null || !_settings.AutoClean)
+            {
+                LogDetail("已保留网盘转存文件 " + ids.Count + " 个（"
+                    + PanUrlParser.DisplayNameOf(item.StoredKind) + "，可在设置里关闭自动清理）");
+                return;
+            }
 
             IPanProvider provider = ResolveProviderForCleanup(item.StoredKind);
             if (provider == null)

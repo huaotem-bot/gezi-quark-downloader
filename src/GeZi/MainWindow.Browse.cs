@@ -1375,7 +1375,13 @@ namespace GeZi
             }
             if (_client == null)
                 return;
-            // 只有夸克系做过转存（阿里/迅雷没有），所以清理也只对它们有意义。
+            // ⚠️ 2026-11-02 更正这句注释 —— 原来写「阿里/迅雷没有转存」是**错的**：
+            //    阿里/迅雷分享**必须先转存到自己网盘**才能取直链（见 AGENTS.md 10.2 / 10.3）。
+            //    它们只是**不走这条路径**：
+            //      · 这条 = 「夸克/UC 的共享中转文件夹」那套（_pendingCleanupFids + _client.DeleteAsync）；
+            //      · 阿里/迅雷走 CleanupStoredForItemAsync → provider.CleanupStoredAsync。
+            //    两条路**都必须看 _settings.AutoClean** —— 缺一条就会让这个开关对那两家失效。
+            //    （2026-11-02 就是这么坏的：CleanupStoredForItemAsync 完全没判 AutoClean，已补。）
             if (!OwnIsQuarkLike)
                 return;
             try

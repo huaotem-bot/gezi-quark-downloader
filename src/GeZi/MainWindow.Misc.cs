@@ -669,11 +669,14 @@ namespace GeZi
         {
             try
             {
-                if (AboutVersionText != null)
-                {
-                    var ver = System.Reflection.Assembly.GetExecutingAssembly().GetName().Version;
-                    AboutVersionText.Text = "v" + (ver != null ? ver.ToString(3) : "?");
-                }
+                var ver = System.Reflection.Assembly.GetExecutingAssembly().GetName().Version;
+                string v = "v" + (ver != null ? ver.ToString(3) : "?");
+                // 2026-11-02（第三次重做）：关于页现在有两个版本号显示位 ——
+                // ① 品牌区的**徽章**（AboutVersionBadge，紧跟在「鸽子下载」右边）；
+                // ② 数据条里的**版本格子**（AboutVersionText）。
+                // 两处必须同时填，否则会有一处一直显示占位符 "v?"。
+                if (AboutVersionText != null) AboutVersionText.Text = v;
+                if (AboutVersionBadge != null) AboutVersionBadge.Text = v;
             }
             catch { }
         }
