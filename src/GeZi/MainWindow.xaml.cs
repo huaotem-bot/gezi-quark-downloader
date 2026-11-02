@@ -651,6 +651,16 @@ namespace GeZi
             // 免得把用户看着的任务顺序打乱。
             _taskView.GroupDescriptions.Add(
                 new System.Windows.Data.PropertyGroupDescription("PanGroup"));
+            // 第二级：同一个「任务」（一次点下载选中的那批文件）折叠在一起。
+            // ⚠️ 这里的个数必须与 MainWindow.xaml 里 ListBox.GroupStyle 的个数**相等**，
+            //    且顺序一一对应（① 网盘 ② 任务）。少一个 WPF 就静默回落默认模板，
+            //    多一个则最后一个分组头是空白 —— 两种都表现为"分组没生效"。
+            // ⚠️ 分组键直接用 **TaskGroupName** 而不是 ID：CollectionViewGroup.Name
+            //    就是分组头绑定的 {Binding Name}，用 ID 会显示成 "tg:638..."。
+            //    重名问题在 MakeTaskGroup 里解决（同名任务自动加序号），
+            //    比在这里挂 ValueConverter 简单，也不会踩绑定失败静默回落的坑。
+            _taskView.GroupDescriptions.Add(
+                new System.Windows.Data.PropertyGroupDescription("TaskGroupName"));
             TaskList.ItemsSource = _taskView;
             ShareModeRadio.IsChecked = true;
 
@@ -837,9 +847,26 @@ namespace GeZi
                 // 把续传询问推迟到 UI 完全渲染之后（Idle 优先级）再弹：
                 // 若直接在 Loaded 里 ShowDialog()，主窗还没画出来就先弹模态框，
                 // 用户会误以为"程序没打开"（尤其弹框被主窗或别的窗口挡住时）。
+                //
+                // 🚨🚨 2026-11-01 修复「重启后续传不动、账号一直显示未登录」：
+                //   原来这里与下面的自动登录是**同时**发起的，谁先跑完完全看运气。
+                //   续传框（模态 ShowDialog）一旦先弹出，就接管了消息泵，
+                //   而自动登录的续体排在 Normal 优先级上 —— 模态框不关就一直排队，
+                //   于是 _client 始终是 null：界面显示"未登录"、续传取链拿不到登录态、
+                //   点了「继续下载」什么都不会发生。用户关掉软件重开时不再弹续传框，
+                //   登录得以正常跑完，所以"重开一次反而显示已登录"——正是这个错位。
+                //   现在改成：**先等自动登录跑完（无论成败），再弹续传框**。
+                //   登录本身有超时兜底（ValidateAsync / 桥接通道都不会无限等），
+                //   万一卡住，下面的 WaitAsync 也会在 20 秒后放行，不会永远不弹。
+                // 🚨🚨 2026-11-01 又一个坑（本次实测抓到）：
+                //   `new Action(async () => {...})` 是 **async void** ——
+                //   await 之后的异常**不会**被外层 try/catch 捕获，也不会有任何日志，
+                //   表现就是「日志说正在等登录，然后再无下文，续传框永远不弹」。
+                //   现在把整个异步体包进一个真正的 async Task 方法，
+                //   并在最外层兜住所有异常 + 落日志，绝不静默。
                 Dispatcher.BeginInvoke(new Action(() =>
                 {
-                    try { ShowPendingOnStartup(); } catch { }
+                    _ = ShowPendingAfterLoginAsync();
                 }), System.Windows.Threading.DispatcherPriority.ApplicationIdle);
 
                 // 顺手把「未完成 N」入口点亮（不弹窗，只是让入口在页签行右侧可见）。
@@ -979,6 +1006,40 @@ namespace GeZi
             // 生成的（XAML 只留了一个空 Button）。不在这里刷一次的话，启动后它就是个
             // **空白方块**（用户截图反馈"这里怎么回事儿"）。
             UpdatePauseAllButton(force: true);
+
+            // 2026-11-02：关于页的版本号在启动时填一次（XAML 里是占位 "v?"）。
+            try { RefreshAboutPage(); } catch { }
+        }
+
+
+        /// <summary>
+        /// 等登录就绪后再弹续传框（真正异步，异常不会静默）。
+        /// <para>
+        /// 🚨 必须独立成 <c>async Task</c> 方法，不能写成 <c>new Action(async () => ...)</c>：
+        /// 后者是 async void，await 之后的异常无人接，连日志都没有 ——
+        /// 实测症状就是「日志停在『正在等登录态就绪』，续传框永远不出现」。
+        /// </para>
+        /// </summary>
+        private async Task ShowPendingAfterLoginAsync()
+        {
+            try
+            {
+                await WaitStartupLoginBeforePendingAsync().ConfigureAwait(true);
+            }
+            catch (Exception ex)
+            {
+                LogDetail("等待登录态时出错（不影响弹窗）：" + ex.Message);
+            }
+
+            try
+            {
+                ShowPendingOnStartup();
+            }
+            catch (Exception ex)
+            {
+                // 弹窗失败必须留下痕迹，否则用户只看到「没弹」而无从排查。
+                Log("未完成任务提示打开失败：" + ex.Message);
+            }
         }
 
 
@@ -1379,38 +1440,11 @@ namespace GeZi
             _diagLatest = new System.Collections.Concurrent.ConcurrentDictionary<string, DiagnosticsSnapshot>(
                 StringComparer.OrdinalIgnoreCase);
 
-        private Window _diagWindow;
+        // 2026-11-02：诊断面板 UI 已删除，_diagWindow 字段随之移除。
 
 
-        /// <summary>诊断面板的一行（把快照格式化成可读文本）。</summary>
-        private sealed class DiagRow : INotifyPropertyChanged
-        {
-            public string Name { get; private set; } = "";
-            public string Speed { get; private set; } = "";
-            public string Conns { get; private set; } = "";
-            public string Parts { get; private set; } = "";
-            public string Progress { get; private set; } = "";
-            public string Preempt { get; private set; } = "";
-            public string PeerIps { get; private set; } = "";
+        // 2026-11-02：DiagRow 随诊断面板一起删除。
 
-            public void Update(DiagnosticsSnapshot s)
-            {
-                Name = s.Name ?? "";
-                Speed = Util.FormatSize((long)s.Speed) + "/s";
-                Conns = s.ActiveConnections + "/" + s.WorkerCount;
-                Parts = s.PartsDone + "/" + s.PartsTotal;
-                string pct = s.TotalBytes > 0
-                    ? (s.DoneBytes * 100.0 / s.TotalBytes).ToString("F1") + "%"
-                    : "-";
-                Progress = pct + "  " + Util.FormatSize(s.DoneBytes);
-                Preempt = s.PreemptedCount.ToString();
-                PeerIps = s.PeerIps ?? "";
-
-                PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(null));
-            }
-
-            public event PropertyChangedEventHandler PropertyChanged;
-        }
 
 
         /// <summary>续传对话框里的一行（带勾选）。</summary>
@@ -1424,6 +1458,15 @@ namespace GeZi
                 set { _checked = value; PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(IsChecked))); }
             }
             public string Display { get; }
+
+            /// <summary>文件名（行模板的主文本）。</summary>
+            public string FileName { get; }
+
+            /// <summary>副文本：文件大小。</summary>
+            public string SubText { get; }
+
+            /// <summary>右侧状态标记：不可续传时显示「需重新解析」，否则空串。</summary>
+            public string BadgeText { get; }
             public bool CanResume => Task != null && Task.CanResume;
 
             public PendingRow(PendingTask t)
@@ -1438,6 +1481,26 @@ namespace GeZi
                 string size = (t != null && t.Size > 0) ? "   " + Util.FormatSize(t.Size) : "";
                 string why = CanResume ? "" : "   （信息不全，需重新下载）";
                 Display = (t?.Name ?? "(未知)") + size + why;
+
+                // 2026-11-01 重做续传界面：行模板改成三段式，需要拆开的字段。
+                FileName = t?.Name ?? "(未知)";
+                SubText = (t != null && t.Size > 0) ? Util.FormatSize(t.Size) : "大小未知";
+
+                // 🚨 2026-11-02：徽章只在**真正缺凭证**时才出现。
+                //   原来一律写「需重新解析」，但 Size=0（刚下载没写盘就重启）与「解析」
+                //   毫无关系 —— 那是下载记录没存下大小，引擎续传时自己会探测真实大小。
+                //   把这种情况也标成「需重新解析」会让用户跑去重新解析分享，白费力气。
+                //   现在：只有 FromShare 且缺 Token/PwdId/Stoken 才提示需要重新解析。
+                // 2026-11-02：判据必须与 ResumePolicy.CanResume **完全一致**，
+                //   否则会出现「徽章说需重新解析、复选框却是可勾的」这种自相矛盾的界面。
+                //   阿里/迅雷（PanKind 2/3）的分享任务不需要 stoken，
+                //   所以它们**不该**出现这个徽章。
+                bool providerShare = t != null && t.FromShare
+                    && (t.PanKindValue == 2 || t.PanKindValue == 3);
+                bool lackShareCred = t != null && t.FromShare && !providerShare
+                    && (string.IsNullOrEmpty(t.Token) || string.IsNullOrEmpty(t.PwdId)
+                        || string.IsNullOrEmpty(t.Stoken));
+                BadgeText = lackShareCred ? "需重新解析" : "";
             }
 
             public event PropertyChangedEventHandler PropertyChanged;

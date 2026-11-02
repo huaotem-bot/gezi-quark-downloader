@@ -559,8 +559,9 @@ namespace GeZi
 
             try
             {
-                if (key == "Quark" && CookieImportBox != null) CookieImportBox.Focus();
-                else if (key == "Uc" && UcCookieBox != null) UcCookieBox.Focus();
+                // 2026-11-01：夸克那块的 CookieImportBox 已随「导入 Cookie」卡片删除，
+                // 不再需要 Focus（夸克走扫码 / 内嵌登录）。
+                if (key == "Uc" && UcCookieBox != null) UcCookieBox.Focus();
                 else if (key == "Aliyun" && AliyunTokenBox != null) AliyunTokenBox.Focus();
                 else if (key == "Xunlei" && XunleiTokenBox != null) XunleiTokenBox.Focus();
             }
@@ -1264,30 +1265,6 @@ namespace GeZi
         }
 
 
-        private async void OnImportCookie(object sender, RoutedEventArgs e)
-        {
-            var cookie = CookieImportBox.Text.Trim();
-            if (string.IsNullOrEmpty(cookie))
-            {
-                Log("请先粘贴 Cookie");
-                return;
-            }
-            // 导入要联网校验（拉账号信息）→ 按钮就地变成"登录中…"
-            long t0 = BusyClock();
-            if (!BeginBusy(ImportCookieBtn, "登录中")) return;
-            try
-            {
-                // 登录页这个 Cookie 框是**夸克**专用的（UC/阿里/迅雷各有自己的
-                // 「内嵌登录」按钮），所以这里恒为 Quark。
-                await ApplyLoginAsync(cookie, PanKind.Quark);
-            }
-            finally
-            {
-                await EndBusyAsync(ImportCookieBtn, t0);
-            }
-        }
-
-
         /// <summary>
         /// 从**文件**导入 Cookie 并登录。
         /// </summary>
@@ -1297,58 +1274,6 @@ namespace GeZi
         /// 支持 .json（Cookie-Editor / EditThisCookie 的导出格式）与 .txt（原始 Cookie 串），
         /// 解析交给 <see cref="GeZi.Core.Support.CookieText"/>。
         /// </remarks>
-        private async void OnImportCookieFile(object sender, RoutedEventArgs e)
-        {
-            var dlg = new Microsoft.Win32.OpenFileDialog
-            {
-                Title = "选择 Cookie 文件",
-                Filter = "Cookie 文件|*.txt;*.json|文本文件 (*.txt)|*.txt|JSON 文件 (*.json)|*.json|所有文件 (*.*)|*.*",
-                CheckFileExists = true,
-            };
-            if (dlg.ShowDialog(this) != true) return;
-
-            string raw;
-            try
-            {
-                raw = File.ReadAllText(dlg.FileName);
-            }
-            catch (Exception ex)
-            {
-                Log("读取 Cookie 文件失败：" + ex.Message);
-                return;
-            }
-
-            string cookie = CookieText.Parse(raw);
-            if (string.IsNullOrEmpty(cookie))
-            {
-                Log("未能从文件中解析出 Cookie：" + dlg.FileName);
-                AppDialog.Show(this,
-                    "没能从这个文件里解析出 Cookie。\n\n"
-                    + "支持两种内容：\n"
-                    + "  · 浏览器扩展（如 Cookie-Editor）导出的 .json\n"
-                    + "  · 直接复制的 Cookie 文本（.txt，形如 a=1; b=2）",
-                    "解析失败", MessageBoxButton.OK, MessageBoxImage.Warning);
-                return;
-            }
-
-            // 回填到输入框，让用户看得见到底导入了什么
-            CookieImportBox.Text = cookie;
-            int n = cookie.Split(';').Length;
-            Log(string.Format("已从文件导入 Cookie（{0}），共 {1} 项。", dlg.FileName, n));
-
-            long t0 = BusyClock();
-            if (!BeginBusy(ImportCookieFileBtn, "登录中")) return;
-            try
-            {
-                await ApplyLoginAsync(cookie, PanKind.Quark);
-            }
-            finally
-            {
-                await EndBusyAsync(ImportCookieFileBtn, t0);
-            }
-        }
-
-
         /// <summary>
         /// 导出当前登录 Cookie 到桌面文件。
         /// ⚠️ 用户明确要求：**不要复制到剪贴板**（原话「无论是导出直链还是导出
@@ -1625,7 +1550,9 @@ namespace GeZi
             if (string.IsNullOrEmpty(nick))
                 nick = PanUrlParser.DisplayNameOf(kind);
 
-            UpdateAccountCard(nick, 0, 0);
+            // 显式传 kind：这个 nick 属于「刚切到的那家」，不能让它去猜 _activeKind
+            //（2026-11-02 昵称串台修复）。
+            UpdateAccountCard(nick, 0, 0, kind);
             LogDetail("已切换到 " + PanUrlParser.DisplayNameOf(kind) + "（复用已登录会话，未重新登录）");
 
             if (!ShareMode)
@@ -1816,7 +1743,8 @@ namespace GeZi
                         AccountStore.SetPrimary((int)kind, acctKey);
                     }
 
-                    UpdateAccountCard(nick, 0, 0);
+                    // 显式传 kind：登录动作的网盘是最权威的事实来源（2026-11-02）。
+                    UpdateAccountCard(nick, 0, 0, kind);
                     // 「切换账号」的可见性/文案统一由 SyncLoginPageState 控制
                     // （登录成功 → 显示「切换账号」），这里不再单独设。
                     Log("登录成功: " + nick);
@@ -2196,7 +2124,8 @@ namespace GeZi
                 // 校验那一步可能已经轮换过 refresh_token，这里再同步一次
                 PersistProviderToken();
 
-                UpdateAccountCard(_settings.Who, 0, 0);
+                // 显式传 kind：这里刚登录的是 kind 那家，不能用可变的 _activeKind。
+                UpdateAccountCard(_settings.Who, 0, 0, kind);
                 Log("登录成功: " + _settings.Who + "（" + ActivePanDisplayName + "）");
                 if (kind == PanKind.Aliyun && !string.IsNullOrEmpty(aliyunAt))
                     Log("提示：本次只拿到阿里的短期令牌（无 refresh_token），约两小时后失效，届时需重新登录。");
@@ -2325,9 +2254,16 @@ namespace GeZi
         /// <param name="nick">昵称；null 或空表示未登录</param>
         /// <param name="used">已用容量（字节）</param>
         /// <param name="total">总容量（字节）；≤0 表示未知</param>
-        private void UpdateAccountCard(string nick, long used, long total)
+        /// <param name="kind">
+        /// 这个昵称/容量属于哪家网盘。null = 当前账号那家。
+        /// <para>
+        /// 🚨 2026-11-02：必须支持显式指定，否则「登录阿里时顺手刷新夸克容量」
+        /// 这类调用会把阿里的昵称写进夸克的槽位（见 SyncLoginPageState 的注释）。
+        /// </para>
+        /// </param>
+        private void UpdateAccountCard(string nick, long used, long total, PanKind? kind = null)
         {
-            SyncLoginPageState(nick, used, total);
+            SyncLoginPageState(nick, used, total, kind);
         }
     }
 }

@@ -15,6 +15,8 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 using System;
+using System.Collections.Generic;
+using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -64,6 +66,171 @@ public sealed class ResumeState
     public ResumeChunk[] Chunks { get; set; } = new ResumeChunk[0];
 
     public DateTime SavedAtUtc { get; set; } = DateTime.UtcNow;
+
+    /// <summary>
+    /// 保存前**吃掉分片表里的空洞**（2026-11-01，续传可靠性方案 B）。
+    /// <para>
+    /// 🚨 为什么需要：<see cref="IsUsable"/> 要求分片表**严格连续**，一处空洞就让整份作废。
+    /// 而实测（用户日志）空洞几乎全是**恰好 512KiB**、起点落在 X.5 MiB ——
+    /// 那是动态抢占切分时「原片已改短、新片还没登记」的瞬间被快照撞上造成的。
+    /// 让 178MB 的续传因为一个 512KB 的空洞整份作废，等于「一页有错字就整本书重印」。
+    /// </para>
+    /// <para>
+    /// 做法：把每个 gap **并入前一片的 End**，并把该片 <c>Position</c> 回退到 gap 起点 ——
+    /// 那一段会在续传时重新下载，代价最多几百 KB，而不是整个文件。
+    /// </para>
+    /// <para>
+    /// ⚠️ 只在 gap ≤ <paramref name="maxGapBytes"/> 时才补。太大的 gap（比如中间缺了 50MB）
+    /// 说明状态真的坏了，继续补只会白下几十 MB，不如整份作废更诚实。
+    /// </para>
+    /// </summary>
+    /// <param name="maxGapBytes">可接受的最大补洞尺寸；0 表示用默认 16MB。</param>
+    /// <returns>补掉的空洞数量；0 表示本来就连续或没有可补的。</returns>
+    public int NormalizeGaps(long maxGapBytes = 0)
+    {
+        if (maxGapBytes <= 0) maxGapBytes = DefaultMaxGapBytes;
+        if (Chunks == null || Chunks.Length < 2) return 0;
+
+        var sorted = Chunks.Where(c => c != null).OrderBy(c => c.Start).ToArray();
+        if (sorted.Length < 2) return 0;
+
+        var merged = new List<ResumeChunk>(sorted.Length);
+        int filled = 0;
+        ResumeChunk prev = null;
+        foreach (var c in sorted)
+        {
+            if (prev == null) { prev = CloneChunk(c); merged.Add(prev); continue; }
+
+            long expect = prev.End + 1;
+            if (c.Start <= expect)
+            {
+                // 重叠或相邻：直接并进前一片（保留较大的 Position 相对值）
+                if (c.End > prev.End)
+                {
+                    // 扩展 prev 到 c.End，Position 取「到 expect 为止的已完成量 + c 的已完成量」
+                    long prevDone = prev.Position;
+                    long cDone = c.Position;
+                    prev.End = c.End;
+                    long newPos = prevDone + cDone;
+                    long newLen = prev.Length;
+                    prev.Position = newPos > newLen ? newLen : newPos;
+                }
+                continue;
+            }
+
+            long gap = c.Start - expect;
+            if (gap <= maxGapBytes)
+            {
+                // 吃掉这个 gap：把 prev 延伸到 **c.Start-1**（只跨过洞，不吞并 c 本身）。
+                //
+                // 🚨 2026-11-01 自检抓到过一个 bug：原来这里写的是 prev.End = c.End，
+                //    等于把洞**和它后面的整片**一起吞进 prev —— 但 c 自己的已完成数据
+                //    并没有搬进 prev，Position 只按 prev 原长度算，
+                //    结果 c 那一段被当成"已完成"却从没下过 → 长度对、内容坏。
+                //    正确做法：prev 只跨过洞，c 原样保留在后面；下一轮 expect 会接上 c。
+                long prevLenBefore = prev.Length;
+                prev.End = c.Start - 1;
+                prev.Position = prevLenBefore;   // 只保留 gap 之前已完成的部分
+                filled++;
+
+                // c 本身接着放进去（它没有被吞并）
+                prev = CloneChunk(c);
+                merged.Add(prev);
+                continue;
+            }
+            else
+            {
+                // gap 太大：不补，原样保留（后面 IsUsable 会判废，这是正确的）
+                prev = CloneChunk(c);
+                merged.Add(prev);
+            }
+        }
+
+        if (filled > 0)
+            Chunks = merged.ToArray();
+        return filled;
+    }
+
+    /// <summary>补洞的默认上限：16MB。超过说明状态真坏了，整份作废更诚实。</summary>
+    public const long DefaultMaxGapBytes = 16L * 1024 * 1024;
+
+    /// <summary>
+    /// 分片表是否**完整覆盖**整个文件（允许中间有洞，只要洞的两侧都有片）。
+    /// <para>
+    /// 🚨 2026-11-01（方案 C）：这是「想怎么续传就怎么续传」的关键。
+    /// <see cref="IsUsable"/> 要求严格连续 —— 一处 512KB 空洞就让 178MB 作废。
+    /// 但其实只要**每个字节都归属于某个分片**，恢复时把「未完成部分」重新下载就够了，
+    /// 根本不需要连续。
+    /// </para>
+    /// <para>
+    /// 与 <see cref="IsUsable"/> 的区别：
+    /// · IsUsable：Start 必须严格等于上一片 End+1（无洞）；
+    /// · CoversAll：只要求从 0 开始、到 TotalBytes-1 结束，中间允许洞，但**洞必须被填补**
+    ///   —— 调用方（ApplyResume）会把洞补成待下分片，所以这里只校验首尾。
+    /// </para>
+    /// </summary>
+    public bool CoversAll()
+    {
+        if (Version != CurrentVersion || TotalBytes <= 0) return false;
+        if (Chunks == null || Chunks.Length == 0) return false;
+
+        long maxEnd = -1;
+        foreach (var c in Chunks)
+        {
+            if (c == null || c.Length <= 0) return false;
+            if (c.Start < 0) return false;
+            if (c.Position < 0 || c.Position > c.Length) return false;
+            if (c.End > maxEnd) maxEnd = c.End;
+        }
+
+        // 首片必须从 0 开始（否则文件开头没人下），末片必须覆盖到 TotalBytes-1
+        long minStart = long.MaxValue;
+        foreach (var c in Chunks)
+            if (c.Start < minStart) minStart = c.Start;
+
+        return minStart == 0 && maxEnd == TotalBytes - 1;
+    }
+
+    /// <summary>
+    /// 把分片表**补齐成无洞的连续表**（方案 C）。
+    /// <para>
+    /// 对每一处 gap，插入一个 <c>Position = 0</c> 的分片 —— 它会被当作「待下载」处理，
+    /// 从而保证文件里每个字节都有人负责。这是「允许任意续传」的正确性基础：
+    /// 少了这一步，洞里的字节永远没人下，最终产出长度对、内容坏的文件。
+    /// </para>
+    /// </summary>
+    /// <returns>插入的补洞分片数量。</returns>
+    public int FillGapsWithPendingChunks()
+    {
+        if (Chunks == null || Chunks.Length == 0) return 0;
+
+        var sorted = Chunks.Where(c => c != null).OrderBy(c => c.Start).ToArray();
+        var result = new List<ResumeChunk>(sorted.Length + 8);
+        int inserted = 0;
+        long expect = 0;
+
+        foreach (var c in sorted)
+        {
+            if (c.Start > expect)
+            {
+                // 洞：插一个待下分片（Position=0 = 一个字节都没下）
+                result.Add(new ResumeChunk { Start = expect, End = c.Start - 1, Position = 0 });
+                inserted++;
+            }
+            result.Add(CloneChunk(c));
+            long next = c.End + 1;
+            if (next > expect) expect = next;
+        }
+
+        if (inserted > 0)
+            Chunks = result.ToArray();
+        return inserted;
+    }
+
+    private static ResumeChunk CloneChunk(ResumeChunk c)
+    {
+        return new ResumeChunk { Start = c.Start, End = c.End, Position = c.Position };
+    }
 
     /// <summary>已写入字节总数。</summary>
     public long ReceivedBytes

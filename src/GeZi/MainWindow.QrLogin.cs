@@ -230,6 +230,170 @@ namespace GeZi
         /// 的做法一致，成功率不受 App 环境影响。
         /// </para>
         /// </summary>
+        // ==================== 登录方式菜单 / 注册账号（2026-11-02） ====================
+        // 用户要求：
+        //   ① 夸克卡的「扫码登录 + 内嵌登录」合并为一个「登录账号」，点开二选一；
+        //   ② 空出的位置放「注册账号」；
+        //   ③ 注册提供两种方式：
+        //        a) 软件内 WebView2 注册 —— 注册完**自动登录**（复用凭证捕获逻辑）；
+        //        b) 打开系统浏览器 —— 方便用户以后自己用浏览器访问网盘。
+
+        /// <summary>夸克「登录账号」：弹出扫码 / 内嵌两种方式。</summary>
+        private void OnQuarkLoginMenu(object sender, RoutedEventArgs e)
+        {
+            ShowChoiceMenu(sender, new[]
+            {
+                Tuple.Create("扫码登录 · 手机 App 扫一扫", (Action)(() => OnQuarkPanScan(sender, e))),
+                Tuple.Create("内嵌登录 · 在软件里打开网页", (Action)(() => OnQuarkWebLogin(sender, e))),
+            });
+        }
+
+        /// <summary>夸克「注册账号」：软件内注册（完成后自动登录）/ 浏览器打开。</summary>
+        private void OnQuarkRegisterMenu(object sender, RoutedEventArgs e)
+        {
+            ShowChoiceMenu(sender, new[]
+            {
+                Tuple.Create("在软件内注册（注册后自动登录）",
+                    (Action)(() => OpenWebLoginForRegister(PanKind.Quark))),
+                Tuple.Create("用浏览器打开注册页",
+                    (Action)(() => OpenRegisterInBrowser(PanKind.Quark))),
+            });
+        }
+
+        /// <summary>UC / 阿里 / 迅雷「注册账号」：两种方式同上。</summary>
+        private void OnPanRegisterMenu(object sender, RoutedEventArgs e)
+        {
+            var fe = sender as FrameworkElement;
+            PanKind kind;
+            if (fe == null || !Enum.TryParse(fe.Tag as string, true, out kind))
+                return;
+
+            ShowChoiceMenu(sender, new[]
+            {
+                Tuple.Create("在软件内注册（注册后自动登录）",
+                    (Action)(() => OpenWebLoginForRegister(kind))),
+                Tuple.Create("用浏览器打开注册页",
+                    (Action)(() => OpenRegisterInBrowser(kind))),
+            });
+        }
+
+        /// <summary>
+        /// 在按钮下方弹一个轻量选择菜单（ContextMenu），而不是整块对话框。
+        /// <para>用户点哪一项就执行对应的 Action；菜单本身不持有任何状态。</para>
+        /// </summary>
+        private void ShowChoiceMenu(object sender, Tuple<string, Action>[] items)
+        {
+            var fe = sender as FrameworkElement;
+            if (fe == null || items == null || items.Length == 0)
+                return;
+
+            var cm = new System.Windows.Controls.ContextMenu
+            {
+                PlacementTarget = fe,
+                Placement = System.Windows.Controls.Primitives.PlacementMode.Bottom,
+            };
+            foreach (var it in items)
+            {
+                var mi = new System.Windows.Controls.MenuItem { Header = it.Item1 };
+                var action = it.Item2;
+                mi.Click += (s2, e2) =>
+                {
+                    try { cm.IsOpen = false; } catch { }
+                    try { action(); } catch (Exception ex) { Log("操作失败：" + ex.Message); }
+                };
+                cm.Items.Add(mi);
+            }
+            cm.IsOpen = true;
+        }
+
+        /// <summary>
+        /// 打开内嵌窗口做**注册**（不是登录）。
+        /// <para>
+        /// 🚨 关键点：这里**不需要**新写「注册成功后自动登录」的逻辑 ——
+        /// <see cref="WebLoginWindow"/> 捕获的是 **Cookie / 令牌的变化**，不是「点了登录按钮」。
+        /// 所以用户在窗口里注册完、处于登录态后，捕获回调会**自动触发**，
+        /// 走的还是和登录完全相同的那条落地路径（校验 → 保存 → 保活 → 存档）。
+        /// </para>
+        /// <para>与登录的唯一区别：窗口打开时落在**首页**而不是深链登录页。</para>
+        /// </summary>
+        private void OpenWebLoginForRegister(PanKind kind)
+        {
+            if (!WebView2Runtime.IsInstalled)
+            {
+                ShowWebView2Missing("可以改用「用浏览器打开注册页」。");
+                return;
+            }
+            try
+            {
+                var win = new WebLoginWindow(kind,
+                    captured =>
+                    {
+                        if (kind == PanKind.Quark || kind == PanKind.Uc)
+                        {
+                            _ = ApplyLoginAsync(captured, kind);
+                            Log(PanUrlParser.DisplayNameOf(kind) + " 内嵌注册完成，已自动登录。");
+                        }
+                        else
+                        {
+                            // 阿里 / 迅雷返回的是令牌，走 provider 那条路
+                            _ = ApplyProviderLoginAsync(kind, captured, true);
+                            Log(PanUrlParser.DisplayNameOf(kind) + " 内嵌注册完成，已自动登录。");
+                        }
+                    },
+                    msg => LogDetail(msg))
+                {
+                    Owner = this,
+                    Title = PanUrlParser.DisplayNameOf(kind) + " 注册",
+                };
+                win.ShowDialog();
+            }
+            catch (Exception ex)
+            {
+                Log("打开注册窗口失败: " + ex.Message);
+            }
+        }
+
+        /// <summary>
+        /// 用系统默认浏览器打开注册页。
+        /// <para>
+        /// ⚠️ **不尝试从浏览器抓 Cookie** —— 跨进程读浏览器 Cookie 属于敏感操作，
+        /// 各浏览器加密方式不同、技术上不可靠，也不合适。这里只负责把用户送到正确的地方。
+        /// </para>
+        /// </summary>
+        private void OpenRegisterInBrowser(PanKind kind)
+        {
+            string url = RegisterUrlFor(kind);
+            if (ShellLaunch.OpenUrl(url))
+            {
+                Log("已用浏览器打开" + PanUrlParser.DisplayNameOf(kind) + "注册页：" + url);
+                AppDialog.Show(this,
+                    "已用浏览器打开注册页。\n\n"
+                    + "注册并登录后，回到本软件点「登录账号 → 内嵌登录」即可完成绑定。\n"
+                    + "（软件不会去读取你浏览器的登录信息。）",
+                    "用浏览器注册", MessageBoxButton.OK, MessageBoxImage.Information);
+            }
+            else
+            {
+                Log("打不开浏览器，请手动访问：" + url);
+                AppDialog.Show(this,
+                    "无法启动浏览器。\n\n请手动复制下方地址到浏览器打开：\n\n" + url,
+                    "需要手动打开", MessageBoxButton.OK, MessageBoxImage.Information);
+            }
+        }
+
+        /// <summary>各家网盘的注册/首页地址（都没有独立注册页，注册入口在首页）。</summary>
+        private static string RegisterUrlFor(PanKind kind)
+        {
+            switch (kind)
+            {
+                case PanKind.Uc: return UcConstants.LoginUrl;
+                case PanKind.Aliyun: return "https://www.alipan.com/";
+                case PanKind.Xunlei: return "https://pan.xunlei.com/";
+                default: return "https://pan.quark.cn/";
+            }
+        }
+
+
         private void OnQuarkWebLogin(object sender, RoutedEventArgs e)
         {
             if (!WebView2Runtime.IsInstalled)

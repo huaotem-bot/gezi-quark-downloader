@@ -140,25 +140,81 @@ namespace GeZi
                 return;
             }
 
-            string lastGroup = null;
-            foreach (var it in items)
+            // 🚨 2026-11-01：改成**分批加载**（与目录列表的 RevealNextBatch 同一套思路）。
+            //   原来一次性把几百条行 + 分组标题全塞进 StackPanel，记录多时打开面板
+            //   会明显卡一下。现在先铺第一批，滚动到底部再追加下一批。
+            _historyItems = items;
+            _historyCursor = 0;
+            _historyLastGroup = null;
+            _historyGen = gen;
+            RevealNextHistoryBatch();
+
+            // 行造完再后台校验失效（不 await：面板先出来，标签随后自己冒出来）
+            _ = ProbeHistoryValidityAsync(gen);
+        }
+
+
+        // ---------------- 解析历史：分批加载（2026-11-01） ----------------
+
+        /// <summary>历史面板一次铺多少条（与目录列表的 <c>DirRevealSize</c> 同量级）。</summary>
+        private const int HistoryRevealSize = 20;
+
+        /// <summary>本次要铺的全部记录（<see cref="RebuildHistoryPanel"/> 每次重建时刷新）。</summary>
+        private List<ShareHistoryEntry> _historyItems = new List<ShareHistoryEntry>();
+
+        /// <summary>已经铺到第几条（游标）。</summary>
+        private int _historyCursor;
+
+        /// <summary>上一批最后一个分组标题 —— 跨批次续接，避免同一组出现两个标题。</summary>
+        private string _historyLastGroup;
+
+        /// <summary>把下一批记录追加到面板尾部（滚动到底部时由 <see cref="OnHistoryScrollChanged"/> 调）。</summary>
+        private void RevealNextHistoryBatch()
+        {
+            if (HistoryListPanel == null) return;
+            if (_historyItems == null || _historyCursor >= _historyItems.Count) return;
+
+            int from = _historyCursor;
+            int to = Math.Min(from + HistoryRevealSize, _historyItems.Count);
+            for (int i = from; i < to; i++)
             {
+                var it = _historyItems[i];
                 // 置顶的单独成组排在最前（GetShareHistory 已经把置顶的排到前面了）
                 string g = it.Pinned ? "置顶" : HistoryGroupOf(it.Time);
-                if (!string.Equals(g, lastGroup, StringComparison.Ordinal))
+                if (!string.Equals(g, _historyLastGroup, StringComparison.Ordinal))
                 {
                     HistoryListPanel.Children.Add(new TextBlock
                     {
                         Text = g,
                         Style = (Style)FindResource("HistoryGroupLabel"),
                     });
-                    lastGroup = g;
+                    _historyLastGroup = g;
                 }
                 HistoryListPanel.Children.Add(MakeHistoryRow(it));
             }
+            _historyCursor = to;
+        }
 
-            // 行造完再后台校验失效（不 await：面板先出来，标签随后自己冒出来）
-            _ = ProbeHistoryValidityAsync(gen);
+
+        /// <summary>
+        /// 历史面板滚动：快到底部时追加下一批。
+        /// <para>
+        /// 阈值留 2 条行高（约 120px）：等到真的贴底才加载，用户会看到一段空白停顿；
+        /// 提前一点加载，滚动是连续的。
+        /// </para>
+        /// </summary>
+        private void OnHistoryScrollChanged(object sender, ScrollChangedEventArgs e)
+        {
+            // 只有纵向滚动范围/位置变化才关心，横向（不该出现）直接忽略。
+            if (e.VerticalChange == 0 && e.ExtentHeightChange == 0) return;
+
+            var sv = sender as ScrollViewer;
+            if (sv == null) return;
+            // 还没铺满一屏时 ExtentHeight 可能为 0，此时也允许继续铺（避免首屏就不加载）。
+            if (sv.ScrollableHeight <= 0) { RevealNextHistoryBatch(); return; }
+
+            double remain = sv.ExtentHeight - (sv.VerticalOffset + sv.ViewportHeight);
+            if (remain <= 120) RevealNextHistoryBatch();
         }
 
 
@@ -775,10 +831,25 @@ namespace GeZi
             //   —— 同字号同颜色，看着像日志文件而不是列表（用户反馈"丑"）。
             var records = new List<HistoryRecord>();
 
+            // 2026-11-01：改成分批追加（与解析历史、目录列表同一套思路）。
+            //   原来一次性把全部记录 Add 进去 —— ListBox 虽然虚拟化，
+            //   但每个 item 都要先构造 WPF 控件对象，几百条时打开窗口会明显顿一下。
+            const int HistoryBatch = 30;
+            int revealed = 0;
+
+            Action revealMore = () =>
+            {
+                int to = Math.Min(revealed + HistoryBatch, records.Count);
+                for (int i = revealed; i < to; i++)
+                    list.Items.Add(BuildHistoryRow(records[i]));
+                revealed = to;
+            };
+
             Action reload = () =>
             {
                 records = HistoryStore.GetHistory();
                 list.Items.Clear();
+                revealed = 0;
                 if (records.Count == 0)
                 {
                     var empty = new TextBlock
@@ -792,9 +863,22 @@ namespace GeZi
                     list.Items.Add(empty);
                     return;
                 }
-                foreach (var r in records)
-                    list.Items.Add(BuildHistoryRow(r));
+                revealMore();
             };
+
+            // 滚到底部时追加下一批（阈值 3 条行高，滚动才连续）。
+            list.AddHandler(System.Windows.Controls.ScrollViewer.ScrollChangedEvent,
+                new System.Windows.Controls.ScrollChangedEventHandler((s2, e2) =>
+                {
+                    if (e2.VerticalChange == 0 && e2.ExtentHeightChange == 0) return;
+                    if (revealed >= records.Count) return;
+                    var sv = e2.OriginalSource as System.Windows.Controls.ScrollViewer;
+                    if (sv == null) return;
+                    if (sv.ScrollableHeight <= 0) { revealMore(); return; }
+                    if (sv.ExtentHeight - (sv.VerticalOffset + sv.ViewportHeight) <= 90)
+                        revealMore();
+                }));
+
             reload();
 
             HistoryRecord Sel()

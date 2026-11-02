@@ -157,7 +157,15 @@ namespace GeZi
                             Fid = pi?.Fid,
                             Token = pi?.Token,
                             FromShare = pi?.FromShare ?? false,
-                            Size = t.Total,
+                            // 🚨🚨 2026-11-02 修「重启后续传只有 4 条线程」的**真正根因**。
+                            //   原来这里写死 Size = t.Total，而 t.Total 来自**进度回调** ——
+                            //   任务还没开始下（或刚入队就重启）时它是 0，于是把取链时
+                            //   PendingInfo.Size 里本来就正确的真实大小**覆盖成 0** 落盘。
+                            //   重启后 ThreadAllocator 对 size<=0 只给 minPerFile=4，
+                            //   水位填充又明确跳过 size<=0 的项 → 永远钉死在 4 路。
+                            //   正解：进度回调给过真值就用它（下载中可能比取链更准），
+                            //   否则回落到 PendingInfo.Size（取链时拿到的真实大小）。
+                            Size = t.Total > 0 ? t.Total : (pi != null ? pi.Size : 0),
                             StreamPlay = true,      // 共写模式已删除，恒可边下边播
                             StreamPlayMode = true,
                             Status = t.StatusText,
@@ -298,21 +306,46 @@ namespace GeZi
                 Title = "未完成的任务",
                 ResizeMode = ResizeMode.CanResize,
             };
-            DialogChrome.StyleWindow(dlg, 600, 480);
+            // 2026-11-01 大改：窗口从 600×480 放大到 660×560。
+            // 原因：原来列表区只有 ~300px，6 条就要滚动；而底部四个文字按钮挤在一行，
+            // 视觉上完全没有主次。放大后列表能舒服放 8~9 行，按钮也有了呼吸空间。
+            DialogChrome.StyleWindow(dlg, 660, 560);
 
             var root = DialogChrome.DialogRoot();
+            // 四行：说明 / 统计条 / 列表(*) / 按钮区
             root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
             root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
             root.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
             root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
 
             // 标题已画在自绘标题栏里（2026-10-26），内容区不再重复。
-            var head = DialogChrome.Tip(string.Format(
-                "上次有 {0} 个任务未完成，其中 {1} 个可以继续下载。\n"
-                + "勾选后点「继续下载」会重新获取直链，接着已下载的部分继续（不会重下）。",
-                all.Count, resumable.Count), 8, 12);
-            Grid.SetRow(head, 1);
+            // 2026-11-01 重做：原来是一整块灰底 Tip（两行粗字），占掉大量纵向空间。
+            //   现在收成一行小字 —— 信息不减，但视觉重量降下来（现代大厂做法）。
+            var head = DialogChrome.Hint(string.Format(
+                "上次有 {0} 个任务未完成，其中 {1} 个可以继续下载。勾选后点「继续下载」会重新获取直链，接着已下载的部分继续（不会重下）。",
+                all.Count, resumable.Count), 0, 14);
+            head.TextWrapping = TextWrapping.Wrap;
+            Grid.SetRow(head, 0);
             root.Children.Add(head);
+
+            // 统计条：把「共几个 / 可续传几个 / 已勾选几个」集中成一行小字。
+            // 原来这些数字散落在说明文字里，用户勾选时看不出"我到底选了几个"。
+            var statText = new TextBlock
+            {
+                FontSize = 11,
+                Margin = new Thickness(0, 0, 0, 10),
+                VerticalAlignment = VerticalAlignment.Center,
+            };
+            statText.SetResourceReference(TextBlock.ForegroundProperty, "TextTertiaryBrush");
+            var statRow = new DockPanel { Margin = new Thickness(0, 0, 0, 2) };
+            var selAllTop = DialogChrome.SecondaryButton("全选可续传");
+            selAllTop.Padding = new Thickness(10, 4, 10, 4);
+            selAllTop.FontSize = 11;
+            DockPanel.SetDock(selAllTop, Dock.Right);
+            statRow.Children.Add(selAllTop);
+            statRow.Children.Add(statText);
+            Grid.SetRow(statRow, 1);
+            root.Children.Add(statRow);
 
             // 「续传界面的文件前面有个对勾太误导人了，
             //  让人以为已经自动勾选了」。
@@ -323,10 +356,16 @@ namespace GeZi
             var wrappers = new List<PendingRow>();
             foreach (var p in all) wrappers.Add(new PendingRow(p));
 
-            var selAll = DialogChrome.SecondaryButton("全选可续传");
-            var resumeBtn = DialogChrome.SuccessButton("继续下载");
-            var discardBtn = DialogChrome.DangerButton("丢弃这些任务");
+            // 「全选」已在统计条右侧（selAllTop），这里不再重复造一个。
+            var selAll = selAllTop;
+            var resumeBtn = DialogChrome.PrimaryButton("继续下载");
+            var discardBtn = DialogChrome.SecondaryButton("丢弃这些任务");
             var closeBtn = DialogChrome.SecondaryButton("稍后再说");
+            // 主按钮加宽、加重 —— 用户来这个窗口的唯一目的就是「继续下载」，
+            // 它必须是视觉上最突出的那个（原来四个按钮等宽等重，主次全无）。
+            resumeBtn.MinWidth = 120;
+            resumeBtn.FontWeight = FontWeights.SemiBold;
+            discardBtn.Foreground = TryFindResource("DangerBrush") as Brush;
 
             // 用 ListBox + 复选（ItemsSource 为包装对象，便于双向绑定 IsChecked）
             var box = new ListBox
@@ -337,6 +376,12 @@ namespace GeZi
             };
             var plainStyle = TryFindResource("PlainListBox") as Style;
             if (plainStyle != null) box.Style = plainStyle;
+            // 行容器换成卡片样式（圆角 + 悬停 + 选中主色淡底），
+            // 不再用 WPF 默认的系统蓝矩形选中框。
+            var rowStyle = TryFindResource("PendingListItem") as Style;
+            if (rowStyle != null) box.ItemContainerStyle = rowStyle;
+            box.Padding = new Thickness(2);
+            box.Background = Brushes.Transparent;
             // ⚠️ **必须**给 ItemTemplate：ListBox 的项没有模板时会调 ToString()，
             //    而 PendingRow 没重写它 → 用户看到一列
             //    「GeZi.MainWindow+PendingRow」（用户反馈：「续传的时候为什么都
@@ -344,12 +389,39 @@ namespace GeZi
             box.ItemTemplate = BuildPendingRowTemplate();
             foreach (var w in wrappers) box.Items.Add(w);
 
+            // 2026-11-02 用户反馈「双击不能选中文件」：
+            //   原来没有任何点击/双击绑定，勾选只能精确点中那个 18px 的小方框。
+            //   而用户的心理模型是「列表 = 整行可点」，于是出现
+            //   「点了行、有蓝底、以为选中了、其实没勾」—— 截图里 78.dzip 正是现场。
+            //   现在整行点击即翻转勾选（IDM / Motrix / 迅雷的通行做法）。
+            //   必须判 e.OriginalSource：点中复选框本身时不要重复翻转（会翻两次等于没翻）。
+            box.PreviewMouseLeftButtonDown += (s2, e2) =>
+            {
+                try
+                {
+                    if (FindAncestorCheckBox(e2.OriginalSource as DependencyObject) != null)
+                        return;
+
+                    var row = ResolvePendingRow(box, e2.OriginalSource as DependencyObject);
+                    if (row == null || !row.CanResume) return;
+
+                    row.IsChecked = !row.IsChecked;
+                    e2.Handled = true;
+                }
+                catch { }
+            };
+
             var boxCard = DialogChrome.Card(box);
             boxCard.Padding = new Thickness(0);
             Grid.SetRow(boxCard, 2);
             root.Children.Add(boxCard);
 
-            var btns = DialogChrome.ButtonRow(selAll, resumeBtn, discardBtn, closeBtn);
+            // 🚨 2026-11-01：「全选可续传」已经在统计条右侧（selAllTop），
+            //   **绝不能**再塞进按钮行 —— 同一个 WPF 元素不能有两个父容器，
+            //   否则抛「指定的元素已经是另一个元素的逻辑子元素」→ 整个弹窗建不出来，
+            //   用户看到的就是「续传框根本不弹」。
+            //   底部只放三个：稍后再说 / 丢弃 / 继续下载（主操作在最右）。
+            var btns = DialogChrome.ButtonRow(closeBtn, discardBtn, resumeBtn);
             btns.Margin = new Thickness(0, 16, 0, 0);
             Grid.SetRow(btns, 3);
             root.Children.Add(btns);
@@ -362,7 +434,13 @@ namespace GeZi
             // 并让按钮状态**实时跟着勾选走**：勾一个立刻变亮，全取消立刻变灰。
             Action syncResumeBtn = () =>
             {
-                resumeBtn.IsEnabled = wrappers.Any(w => w.IsChecked && w.CanResume);
+                int picked = wrappers.Count(w => w.IsChecked && w.CanResume);
+                resumeBtn.IsEnabled = picked > 0;
+                // 按钮文案带上数量，用户一眼知道"我这一下会续几个"
+                resumeBtn.Content = picked > 0 ? "继续下载 (" + picked + ")" : "继续下载";
+                // 统计条：共 / 可续传 / 已勾选
+                statText.Text = string.Format("共 {0} 个任务 · 可续传 {1} 个 · 已勾选 {2} 个",
+                    wrappers.Count, wrappers.Count(w => w.CanResume), picked);
             };
             foreach (var w in wrappers)
             {
@@ -515,7 +593,7 @@ namespace GeZi
         /// </summary>
         private void RefreshPendingEntry()
         {
-            if (PendingEntryBtn == null || PendingEntryText == null)
+            if (PendingEntryBtn == null)
                 return;
             // SyncPending 也可能从后台线程进来，UI 更新统一回主线程。
             if (!Dispatcher.CheckAccess())
@@ -535,11 +613,21 @@ namespace GeZi
             if (count <= 0)
             {
                 PendingEntryBtn.Visibility = Visibility.Collapsed;
+                // 红点角标一起收起 —— 没任务时不该还挂着一个红点。
+                if (PendingBadge != null) PendingBadge.Visibility = Visibility.Collapsed;
                 return;
             }
 
-            PendingEntryText.Text = "未完成 " + count;
+            // 2026-11-01：文案固定「未完成」，数量进右上角红点角标（更醒目、更紧凑）。
+            // PendingEntryText 保留（XAML 里已改成固定文字），这里不再拼数字。
             PendingEntryBtn.Visibility = Visibility.Visible;
+
+            if (PendingBadge != null)
+            {
+                PendingBadge.Visibility = Visibility.Visible;
+                if (PendingBadgeText != null)
+                    PendingBadgeText.Text = count > 99 ? "99+" : count.ToString();
+            }
         }
 
         /// <summary>点「未完成 N」重新打开续传界面（与启动时那个弹窗是同一个）。</summary>
@@ -561,12 +649,40 @@ namespace GeZi
         /// </summary>
         private DataTemplate BuildPendingRowTemplate()
         {
+            // 2026-11-01 重做续传界面（用户：「非常丑，请彻底重做」）。
+            // 原来整行只有一个 CheckBox，Content 绑 Display（文件名+大小拼成一根字符串），
+            // 结果是：原生方框 + 一根同样大小的灰字，没有层级、没有进度、没有状态。
+            // 现在拆成三段：自绘圆角复选框 | 文件名(主) + 大小(次) | 状态标记。
+
+            var root = new FrameworkElementFactory(typeof(Grid));
+            root.SetValue(FrameworkElement.MarginProperty, new Thickness(0, 1, 0, 1));
+
+            // 三列：复选框(24) | 文本(*) | 状态(Auto)
+            var c0 = new FrameworkElementFactory(typeof(ColumnDefinition));
+            c0.SetValue(ColumnDefinition.WidthProperty, new GridLength(24));
+            var c1 = new FrameworkElementFactory(typeof(ColumnDefinition));
+            c1.SetValue(ColumnDefinition.WidthProperty, new GridLength(1, GridUnitType.Star));
+            var c2 = new FrameworkElementFactory(typeof(ColumnDefinition));
+            c2.SetValue(ColumnDefinition.WidthProperty, GridLength.Auto);
+            var cols = new FrameworkElementFactory(typeof(Grid));
+            // Grid.ColumnDefinitions 不能直接塞 FrameworkElementFactory，用附加属性挂不上，
+            // 所以这里走「先建 Grid，再在 ApplyTemplate 后补列」的替代方案：
+            // 直接用一个横向 StackPanel 更简单可靠。
+            root = new FrameworkElementFactory(typeof(StackPanel));
+            root.SetValue(StackPanel.OrientationProperty, Orientation.Horizontal);
+            root.SetValue(FrameworkElement.MarginProperty, new Thickness(0, 1, 0, 1));
+
+            // ① 自绘复选框（圆角方框 + 主色勾），替换原生方框
             var cb = new FrameworkElementFactory(typeof(CheckBox));
-            var st = TryFindResource("AppCheckBox") as Style;
+            var st = TryFindResource("PendingCheckBox") as Style;
             if (st != null) cb.SetValue(FrameworkElement.StyleProperty, st);
+            else
+            {
+                var fallback = TryFindResource("AppCheckBox") as Style;
+                if (fallback != null) cb.SetValue(FrameworkElement.StyleProperty, fallback);
+            }
             cb.SetValue(FrameworkElement.VerticalAlignmentProperty, VerticalAlignment.Center);
-            cb.SetValue(FrameworkElement.HorizontalAlignmentProperty, HorizontalAlignment.Left);
-            // 不可续传的行：复选框置灰（文案里已说明原因）
+            cb.SetValue(FrameworkElement.MarginProperty, new Thickness(0, 0, 10, 0));
             cb.SetBinding(UIElement.IsEnabledProperty,
                 new Binding("CanResume") { Mode = BindingMode.OneWay });
             cb.SetBinding(ToggleButton.IsCheckedProperty,
@@ -575,9 +691,40 @@ namespace GeZi
                     Mode = BindingMode.TwoWay,
                     UpdateSourceTrigger = UpdateSourceTrigger.PropertyChanged,
                 });
-            cb.SetBinding(ContentControl.ContentProperty, new Binding("Display"));
+            root.AppendChild(cb);
 
-            return new DataTemplate { VisualTree = cb };
+            // ② 文本区：文件名(主) + 大小(次) 上下两行
+            var textCol = new FrameworkElementFactory(typeof(StackPanel));
+            textCol.SetValue(StackPanel.OrientationProperty, Orientation.Vertical);
+            textCol.SetValue(FrameworkElement.VerticalAlignmentProperty, VerticalAlignment.Center);
+
+            var nameTb = new FrameworkElementFactory(typeof(TextBlock));
+            nameTb.SetValue(TextBlock.FontSizeProperty, 13.0);
+            nameTb.SetValue(TextBlock.FontWeightProperty, FontWeights.Medium);
+            nameTb.SetValue(TextBlock.TextTrimmingProperty, TextTrimming.CharacterEllipsis);
+            nameTb.SetBinding(TextBlock.TextProperty, new Binding("FileName"));
+            nameTb.SetResourceReference(TextBlock.ForegroundProperty, "TextPrimaryBrush");
+            textCol.AppendChild(nameTb);
+
+            var subTb = new FrameworkElementFactory(typeof(TextBlock));
+            subTb.SetValue(TextBlock.FontSizeProperty, 11.0);
+            subTb.SetValue(TextBlock.MarginProperty, new Thickness(0, 3, 0, 0));
+            subTb.SetBinding(TextBlock.TextProperty, new Binding("SubText"));
+            subTb.SetResourceReference(TextBlock.ForegroundProperty, "TextTertiaryBrush");
+            textCol.AppendChild(subTb);
+
+            root.AppendChild(textCol);
+
+            // ③ 右侧状态标记（不可续传时显示「需重新解析」）
+            var badge = new FrameworkElementFactory(typeof(TextBlock));
+            badge.SetValue(TextBlock.FontSizeProperty, 11.0);
+            badge.SetValue(FrameworkElement.VerticalAlignmentProperty, VerticalAlignment.Center);
+            badge.SetValue(FrameworkElement.MarginProperty, new Thickness(10, 0, 0, 0));
+            badge.SetBinding(TextBlock.TextProperty, new Binding("BadgeText"));
+            badge.SetResourceReference(TextBlock.ForegroundProperty, "WarningBrush");
+            root.AppendChild(badge);
+
+            return new DataTemplate { VisualTree = root };
         }
 
 
@@ -586,6 +733,53 @@ namespace GeZi
         /// <para>取链按 <see cref="PendingTask.FromShare"/> 分流，复用与首次下载相同的接口。
         /// 任一任务取链失败不影响其他任务（逐条 try/catch 并记日志）。</para>
         /// </summary>
+        /// <summary>
+        /// 等「启动时那次自动登录」跑完再弹续传框。
+        /// <para>
+        /// 🚨🚨 2026-11-01 修「重启后续传不动、账号一直显示未登录」：
+        /// 续传框是模态的（<c>ShowDialog</c>），一弹出就接管消息泵；而自动登录的
+        /// 续体排在普通优先级上，模态框不关就一直排队 → <c>_client</c> 始终是 null。
+        /// 于是界面显示「未登录」、续传拿不到登录态、点「继续下载」毫无反应。
+        /// 用户关掉软件重开时不再弹续传框，登录得以跑完，所以「重开一次反而显示已登录」。
+        /// </para>
+        /// <para>
+        /// 现在两者改成**先后关系**：先等登录（无论成败），再弹框。
+        /// 登录本身有超时兜底；万一异常卡住，这里也最多等
+        /// <see cref="StartupLoginWaitMs"/> 就放行，绝不让续传框永远不弹。
+        /// </para>
+        /// </summary>
+        private async Task WaitStartupLoginBeforePendingAsync()
+        {
+            var t = _startupLoginTask;
+            if (t == null || t.IsCompleted)
+                return;
+
+            LogDetail("正在等登录态就绪，随后再询问未完成的任务…");
+            try
+            {
+                // Task.WhenAny 而不是 await t：给一个硬上限，避免登录卡死时永远不弹框。
+                // 用 ConfigureAwait(true)（默认）保证回到 UI 线程 —— 下面要弹模态框。
+                var done = await Task.WhenAny(t, Task.Delay(StartupLoginWaitMs))
+                                     .ConfigureAwait(true);
+                if (ReferenceEquals(done, t))
+                {
+                    // 让登录里的异常不往上冒（登录自己已经记过日志了）。
+                    try { await t.ConfigureAwait(true); } catch { }
+                }
+                else
+                {
+                    LogDetail("登录态校验超过 " + (StartupLoginWaitMs / 1000)
+                        + " 秒仍未完成，先询问未完成的任务（稍后可在任务页重试续传）。");
+                }
+            }
+            catch { }
+        }
+
+
+        /// <summary>弹续传框前最多等登录多久（毫秒）。</summary>
+        private const int StartupLoginWaitMs = 20000;
+
+
         /// <summary>
         /// 续传前确保拿到一个可用的客户端。
         /// <para>启动时的自动登录是异步的，而续传框弹得很早
@@ -604,10 +798,14 @@ namespace GeZi
 
             LogDetail("续传需要登录态，正在等待自动登录完成…");
             var t = _startupLoginTask;
-            if (t != null)
+            if (t != null && !t.IsCompleted)
             {
-                try { await Task.WhenAny(t, Task.Delay(15000)).ConfigureAwait(true); }
-                catch { }
+                // 🚨 2026-11-01：原来这里是 WhenAny(t, Delay(15000)) —— 15 秒一到
+                //   就**当作登录失败**往下走。可登录慢的时候（夸克要走 WAF 兜底、
+                //   阿里/迅雷要换令牌）经常超过 15 秒，于是续传用半成品状态开跑，
+                //   用户看到的就是「一直在等、就是不动」。现在等到真正结束为止
+                //   （登录自身有超时兜底，不会无限挂）。
+                try { await t.ConfigureAwait(true); } catch { }
             }
             if (_client != null)
             {
@@ -615,18 +813,142 @@ namespace GeZi
                 return _client;
             }
 
-            // 兜底：保存的 Cookie 足够取直链了（账号校验只影响昵称/头像的显示）
-            if (!string.IsNullOrEmpty(_settings.Cookie))
+            // 兜底前先看一眼四家实例缓存：里面可能是 keepalive 过的**活**实例，
+            // 比配置快照新得多（__puus 约 3 小时轮换，快照早晚过期 → 403）。
+            var cachedLive = TryGetLiveQuarkClient(_activeKind);
+            if (cachedLive != null)
+            {
+                LogDetail("自动登录尚未完成，已复用缓存里的活客户端开始续传。");
+                return cachedLive;
+            }
+
+            // 兜底：保存的 Cookie 足够取直链了（账号校验只影响昵称/头像的显示）。
+            // ⚠️ 只在**当前账号是夸克系**时才用夸克 Cookie 建客户端；
+            //    登录着阿里/迅雷时 _settings.Cookie 可能是空的或别的账号的，
+            //    硬拿它建夸克客户端只会制造一个必然失败的请求。
+            if (!string.IsNullOrEmpty(_settings.Cookie)
+                && (_activeKind == PanKind.Quark || _activeKind == PanKind.Uc))
             {
                 try
                 {
                     LogDetail("自动登录尚未完成，已直接用保存的登录态开始续传。");
-                    return new QuarkClient(_settings.Cookie);
+                    return new QuarkClient(_settings.Cookie, _activeKind);
                 }
                 catch (Exception ex)
                 {
                     LogDetail("用保存的登录态续传失败: " + ex.Message);
                 }
+            }
+            return null;
+        }
+
+
+        /// <summary>
+        /// 用**设置里保存的**夸克/UC 登录态现建一个客户端（续传兜底用）。
+        /// <para>
+        /// 为什么需要它：续传的那条任务属于「哪个网盘」由记录里的 <c>PanKindValue</c>
+        /// 决定，而当前登录的账号可能是另一家。原来的代码只看全局 <c>_client</c>，
+        /// 一旦当前登录的是阿里/迅雷，夸克分享的续传就会被判成"没登录"直接跳过 ——
+        /// 用户看到的正是「明明账号都在，就是不动」。
+        /// </para>
+        /// <para>返回 null 表示设置里也没有可用的登录态（那就真的需要用户去登录）。</para>
+        /// </summary>
+        /// <summary>
+        /// 按**指定网盘**建一个夸克系客户端（续传用）。
+        /// <para>
+        /// 与 <see cref="TryBuildQuarkClientFromSettings"/> 的区别：那个优先当前账号，
+        /// 这个**只认传入的网盘** —— 续传任务属于哪家就必须用哪家的 Cookie，
+        /// 拿错客户端请求会 401/403（症状和"取链失败"一模一样，极难分辨）。
+        /// </para>
+        /// </summary>
+        private QuarkClient TryBuildQuarkClientFor(PanKind kind)
+        {
+            // 🚨🚨 2026-11-02 修「UC 续传必 403」的核心：
+            //   优先返回**活客户端**（全局 _client / 四家实例缓存），
+            //   它们的 Cookie 是 keepalive 自动轮换过的；
+            //   只有当哪都找不到时才退而从配置快照新建一个。
+            //
+            //   ⚠️ 调用方拿到的可能是**借来的**活实例，绝不能 Dispose
+            //      （见 IsBorrowedQuarkClient）。
+            var live = TryGetLiveQuarkClient(kind);
+            if (live != null) return live;
+
+            try
+            {
+                if (kind == PanKind.Uc && !string.IsNullOrEmpty(_settings.UcCookie))
+                    return new QuarkClient(_settings.UcCookie, PanKind.Uc);
+                if (kind == PanKind.Quark && !string.IsNullOrEmpty(_settings.Cookie))
+                    return new QuarkClient(_settings.Cookie, PanKind.Quark);
+            }
+            catch (Exception ex)
+            {
+                LogDetail("按网盘建客户端失败(" + kind + "): " + ex.Message);
+            }
+            return null;
+        }
+
+
+        /// <summary>
+        /// 取「这一家网盘的**活**夸克系客户端」—— 全局的或四家实例缓存里的。
+        /// <para>
+        /// 🚨 为什么必须要它：手动下载能成、续传却 403，根因就是**用了哪个客户端**。
+        /// 手动下载走全局 <c>_client</c>（跑过 KeepAlive、<c>__puus</c> 被自动轮换，令牌始终新鲜）；
+        /// 续传原来从 <c>_settings.UcCookie</c> 现建 —— 那是**配置文件里的快照**，
+        /// 而 UC/夸克的 <c>__puus</c> 约 3 小时轮换一次，快照早晚过期 → 服务端签的直链无效 → CDN 403。
+        /// </para>
+        /// <para>
+        /// ⚠️ 返回的是**借来的**实例，调用方**绝不能 Dispose**（见 <see cref="IsBorrowedQuarkClient"/>）。
+        /// </para>
+        /// </summary>
+        private QuarkClient TryGetLiveQuarkClient(PanKind kind)
+        {
+            if (kind != PanKind.Quark && kind != PanKind.Uc) return null;
+            try
+            {
+                if (_client != null && _client.Kind == kind) return _client;
+                if (_shareClient != null && _shareClient.Kind == kind) return _shareClient;
+                QuarkClient cached;
+                if (_quarkCache.TryGetValue(kind, out cached) && cached != null)
+                    return cached;
+            }
+            catch (Exception ex)
+            {
+                LogDetail("取活客户端失败(" + kind + "): " + ex.Message);
+            }
+            return null;
+        }
+
+
+        /// <summary>
+        /// 这个夸克系客户端是不是「借来的」（全局/缓存里的活实例）。
+        /// <para>借来的**不许 Dispose** —— 那会把整个会话弄死，用户得重新登录。</para>
+        /// </summary>
+        private bool IsBorrowedQuarkClient(QuarkClient c)
+        {
+            if (c == null) return false;
+            if (ReferenceEquals(c, _client)) return true;
+            if (ReferenceEquals(c, _shareClient)) return true;
+            foreach (var kv in _quarkCache)
+                if (ReferenceEquals(kv.Value, c)) return true;
+            return false;
+        }
+
+
+        private QuarkClient TryBuildQuarkClientFromSettings()
+        {
+            try
+            {
+                // 优先当前账号那家（夸克/UC 各存各的 Cookie，不能混用）。
+                if (_activeKind == PanKind.Uc && !string.IsNullOrEmpty(_settings.UcCookie))
+                    return new QuarkClient(_settings.UcCookie, PanKind.Uc);
+                if (!string.IsNullOrEmpty(_settings.Cookie))
+                    return new QuarkClient(_settings.Cookie, PanKind.Quark);
+                if (!string.IsNullOrEmpty(_settings.UcCookie))
+                    return new QuarkClient(_settings.UcCookie, PanKind.Uc);
+            }
+            catch (Exception ex)
+            {
+                LogDetail("用保存的登录态建客户端失败: " + ex.Message);
             }
             return null;
         }
@@ -670,10 +992,25 @@ namespace GeZi
             //   这几条被跳过 = 记录被删 = 未完成任务永久消失（分片还留在盘上变孤儿）。
             //   现在：跳过一律记账，最后统一汇总告知；记录本身保留（见 SyncPending 的合并逻辑）。
             var skipped = new List<string>();
+            // 🚨🚨 2026-11-02 修「阿里云盘续传 2 个任务永远失败」：
+            //   这些记录创建于 2026-11-02 之前的版本，当时解析阿里/迅雷分享
+            //   **没有把 share_id 写进待续传记录**（只存在内存里），
+            //   于是重启后必然取链失败，日志是一句没头没尾的「续传失败」。
+            //   分享 ID 与任务一一绑定，**不可能凭空猜出来**（猜错会去请求别人的分享，
+            //   反而把「缺 ID」变成「ID 错误」，更难排查）。
+            //   ⇒ 单独记账，最后用一句**用户能看懂的话**告诉他下一步做什么。
+            var needReparse = new List<string>();
             // 续传也必须走同一套“按大小分总预算”的分配，不能每个任务直接开满
             // _settings.Threads（3 个 256 路就是 768 条连接，绕过 512 总预算）。
+            // 这只是**预估**：按"全部待续传任务"分配，但取链阶段会有一部分失败被跳过
+            // （阿里/迅雷缺分享 ID、分享失效等），那些失败的条目不该继续占预算。
+            // 取链结束后会用**实际成功的那批**重新分配一次（见下方 jobs.Count 分支）。
             var alloc = AllocateThreads(tasks.Select(p => p.Size).ToList());
             int allocIdx = 0;
+
+            // 2026-11-02：取链时会拿到真实大小（DownloadLink.Size），记在这里，
+            // 取链结束后用它**重新分配线程** —— 否则 Size=0 的记录永远只有 4 路。
+            var knownSizes = new Dictionary<PendingTask, long>();
             try
             {
                 foreach (var p in tasks)
@@ -694,14 +1031,64 @@ namespace GeZi
                         // 这条续传任务来自哪家网盘（记录里存的，不是当前登录账号）。
                         PanKind kind = (PanKind)p.PanKindValue;
 
-                        if (p.PanKindValue != 0)
+                        if (p.PanKindValue != 0 && p.FromShare)
                         {
-                            // 非夸克网盘：用对应 provider 重取链（凭证从当前设置重建）。
+                            // 非夸克网盘的**分享**任务：用 provider 的分享取链接口。
+                            //
+                            // 🚨🚨 2026-11-02 修「阿里/迅雷续传永远失败：分享 ID 为空」：
+                            //   2026-11-02 之前创建的记录里 PwdId 根本没被写过
+                            //   （ParseOtherPanAsync 当时只设了 _panShareRef），
+                            //   于是这里传空串进 provider，阿里直接抛
+                            //   「阿里云盘分享 ID 为空」→ 这条永远续传不了。
+                            //   现在加**兜底恢复**：PwdId 为空时，从分享历史里按文件名反查，
+                            //   还找不到就用最近一次解析过的分享 ID（同一次下载的几条任务
+                            //   通常来自同一个分享）。
+                            if (string.IsNullOrEmpty(p.PwdId))
+                            {
+                                string recovered = TryRecoverShareIdForPending(p);
+                                if (!string.IsNullOrEmpty(recovered))
+                                {
+                                    p.PwdId = recovered;
+                                    LogDetail("[" + (p.Name ?? "?") + "] 记录里缺分享 ID，已从分享历史恢复。");
+                                }
+                            }
+                            if (string.IsNullOrEmpty(p.PwdId))
+                            {
+                                // 缺分享 ID → 这条路**注定取不到链**，直接记「需要重新解析」，
+                                // 不去发那个必然失败的请求（省一次网络往返，也让日志更准）。
+                                LogDetail("[" + (p.Name ?? "?") + "] 这条记录是旧版本建的，缺分享信息，需要重新解析分享才能续传。");
+                                needReparse.Add(p.Name ?? "?");
+                                continue;
+                            }
                             url = await RefreshOtherPanLinkForPendingAsync(p, linkCts.Token)
+                                .ConfigureAwait(false);
+                        }
+                        else if (p.PanKindValue != 0)
+                        {
+                            // 🚨🚨 2026-11-01 修复「续传总提示无法获取链接」（用户实测日志）：
+                            //   阿里 / 迅雷 / UC 的**自有网盘**任务原来被错误地送进了
+                            //   RefreshOtherPanLinkForPendingAsync —— 那是**分享专用**的实现，
+                            //   内部走 provider.GetShareDownloadLinksAsync(shareRef, ...)，
+                            //   需要一个 share_id。而自有网盘任务根本没有 share_id
+                            //   （记录里 PwdId/Stoken 全是 null）→ 必然失败：
+                            //     · UC  ：HTTP 404 code 41006「分享不存在」
+                            //     · 迅雷：HTTP 400 error_code 3「share_id can not be empty」
+                            //   用户看到的就是「总是提示无法获取链接」，而且**主动取链却正常**
+                            //   —— 因为主动下载走的是 OwnLinksAsync（自有网盘接口），
+                            //   只有续传这条错路走到了分享接口上。
+                            //   正解：自有网盘用 RefreshOwnLinkForPendingAsync（GetOwnDownloadLinksAsync）。
+                            url = await RefreshOwnLinkForPendingAsync(
+                                (PanKind)p.PanKindValue, p.Fid, p.Token, linkCts.Token)
                                 .ConfigureAwait(false);
                         }
                         else if (p.FromShare)
                         {
+                            // 分享续传必须要夸克登录态（换 stoken / 取直链都靠它）。
+                            // 全局客户端可能是 null（登录失败、或当前登录的是阿里/迅雷），
+                            // 这时用**保存的夸克 Cookie** 现建一个局部客户端再试 ——
+                            // 拿不到才放弃，且放弃时明确告知原因（不再静默跳过）。
+                            if (client == null)
+                                client = TryBuildQuarkClientFromSettings();
                             if (client == null)
                             {
                                 Log("[" + p.Name + "] 这条是夸克分享，需要夸克登录态才能续传，已跳过。");
@@ -727,14 +1114,60 @@ namespace GeZi
                         }
                         else
                         {
+                            // 夸克系（夸克 / UC）的**自有网盘**任务。
+                            // 2026-11-01：优先用「网盘类型与这条任务一致」的客户端 ——
+                            //   client 可能是当前登录的另一家（比如登录 UC 去续夸克任务），
+                            //   拿错客户端请求会 401/403，症状同样是"取链失败"。
+                            if (client == null || client.Kind != kind)
+                            {
+                                var byKind = TryBuildQuarkClientFor(kind);
+                                if (byKind != null)
+                                {
+                                    // ⚠️ 只在「client 是我们自己建的临时实例」时才 Dispose，
+                                    //    **绝不能** Dispose 全局 _client / _shareClient / 四家缓存 ——
+                                    //    那会让整个会话失效，用户得重新登录。
+                                    //    TryBuildQuarkClientFor 现在会**优先返回借来的活实例**，
+                                    //    所以判据必须是 IsBorrowedQuarkClient 而不是逐个 ReferenceEquals
+                                    //    （缓存里的实例原来漏判了）。
+                                    var oldClient = client;
+                                    client = byKind;
+                                    if (oldClient != null && !IsBorrowedQuarkClient(oldClient))
+                                    {
+                                        try { oldClient.Dispose(); } catch { }
+                                    }
+                                }
+                            }
                             if (client == null)
                             {
-                                Log("[" + p.Name + "] 需要夸克登录态才能续传，已跳过。");
+                                Log("[" + p.Name + "] 需要 " + PanUrlParser.DisplayNameOf(kind)
+                                    + " 登录态才能续传，已跳过。");
                                 skipped.Add(p.Name ?? "?");
                                 continue;
                             }
                             var links = await client.GetDownloadAsync(new List<string> { p.Fid });
-                            url = links?.FirstOrDefault(l => !string.IsNullOrEmpty(l.DownloadUrl))?.DownloadUrl;
+                            var hit = links?.FirstOrDefault(l => !string.IsNullOrEmpty(l.DownloadUrl));
+                            url = hit?.DownloadUrl;
+
+                            // 🚨🚨 2026-11-02 修「Size=0 的任务永远只有 4 条线程」：
+                            //   根因：PendingTask.Size 是**下载时**从进度回调拿的，
+                            //   而「刚点下载没写盘就重启」的任务 Size 是 0；
+                            //   ThreadAllocator 对 size<=0 只能给 minPerFile=4，
+                            //   水位填充又明确跳过 size<=0 的项 → 永远钉死在 4 路。
+                            //   但取链结果 DownloadLink.Size 里**本来就带着真实大小**，
+                            //   以前只取了 Url 就把它丢了。现在顺手补回来：
+                            //   ① 更新 p.Size（落盘后下次启动就准了）；
+                            //   ② 让下面按真实大小分配线程，而不是 4。
+                            if (hit != null && hit.Size > 0)
+                            {
+                                if (p.Size <= 0)
+                                {
+                                    p.Size = hit.Size;
+                                    LogDetail("[" + (p.Name ?? "?") + "] 取链时拿到真实大小 "
+                                        + Util.FormatSize(hit.Size) + "，已补进记录。");
+                                }
+                                // 记到局部字典，供后面「按真实大小重新分配」使用
+                                knownSizes[p] = hit.Size;
+                            }
                         }
 
                         if (string.IsNullOrEmpty(url))
@@ -807,6 +1240,21 @@ namespace GeZi
                     Log(string.Format("有 {0} 个任务这次没能开始续传：{1}",
                         skipped.Count, string.Join("、", skipped.ToArray())));
                 }
+                // 🚨 2026-11-02：阿里/迅雷「缺分享信息」这一类**不是网络问题**，
+                //   是记录本身缺数据（旧版本建的），用户能自己解决 ——
+                //   必须在界面上说清楚「怎么办」，而不是只留一句「续传失败」。
+                if (needReparse.Count > 0)
+                {
+                    Log(string.Format("有 {0} 个阿里/迅雷任务缺分享信息，需要重新解析：{1}",
+                        needReparse.Count, string.Join("、", needReparse.ToArray())));
+                    int rn = needReparse.Count;
+                    // 用**非模态**通知条而不是模态弹窗：
+                    // 用户可能一次恢复十几个任务，为一个「旧记录缺数据」的问题
+                    // 弹窗打断整批续传不划算；通知条照样说清了原因和下一步。
+                    RunOnUi(() => NotifyToast.Show("需要重新解析分享",
+                        string.Format("{0} 个旧任务缺分享信息，回「下载」页重新解析该链接即可接着下（不会重下）", rn),
+                        null));
+                }
 
                 if (jobs.Count == 0)
                 {
@@ -814,15 +1262,63 @@ namespace GeZi
                     // 有跳过项时说明记录还在，用户可以从「未完成 N」入口再试一次。
                     if (skipped.Count > 0)
                     {
-                        AppDialog.Show(this,
+                        // 模态框必须在主线程弹（上面有 ConfigureAwait(false)）。
+                        int n = skipped.Count;
+                        RunOnUi(() => AppDialog.Show(this,
                             string.Format("这 {0} 个任务这次都没能取到直链。\n\n"
-                                + "记录和分片都保留着，登录后点任务页右上角的「未完成」入口可以再试一次，"
-                                + "不会从头重下。", skipped.Count),
+                                + "记录和分片都保留着，登录后点任务页的「未完成」入口可以再试一次，"
+                                + "不会从头重下。", n),
                             "没能开始续传",
                             System.Windows.MessageBoxButton.OK,
-                            System.Windows.MessageBoxImage.Warning);
+                            System.Windows.MessageBoxImage.Warning));
                     }
                     return;
+                }
+
+                // 2026-11-02 修「夸克续传只有 4 条线程」：
+                //   根因是 alloc 在**取链之前**就按全部任务算好了。用户这次续传 4 个任务，
+                //   其中 3 个阿里分享因缺分享 ID 失败被跳过，只剩 1 个夸克任务；
+                //   但它的 Threads 仍是按"4 个任务里最小的那个"分到的 4 路
+                //   （日志：已按文件大小分配连接数：256、256、4、4）。
+                //   一个 45MB 文件只开 4 条连接，速度被单连接带宽卡死。
+                //   正解：取链结束后，用**实际成功的那批**重新分配一次。
+                // 🚨 2026-11-02：只要**任何一个**任务的大小是取链时才补到的，就要重分配。
+                //   原来只在「成功数 != 总数」时重分配（为了修「3 个失败导致剩下的只拿 4 路」），
+                //   但 Size=0 的任务即使成功取链，也会因为「大小未知」被钉在 4 路 ——
+                //   必须用 knownSizes 里的真实大小重算一次。
+                if (jobs.Count > 0 && (jobs.Count != tasks.Count || knownSizes.Count > 0))
+                {
+                    // 用「取链拿到的真实大小」优先，没有就退回记录里的大小。
+                    var realSizes = new List<long>(jobs.Count);
+                    foreach (var j in jobs)
+                    {
+                        long sz = 0;
+                        if (j.Pending != null)
+                        {
+                            sz = j.Pending.Size;
+                            // 若这条任务在 knownSizes 里有更准的值，用它
+                            foreach (var kv in knownSizes)
+                            {
+                                if (kv.Key.Fid == j.Pending.Fid && kv.Value > 0)
+                                {
+                                    sz = kv.Value;
+                                    break;
+                                }
+                            }
+                        }
+                        realSizes.Add(sz);
+                    }
+                    var realAlloc = AllocateThreads(realSizes);
+                    for (int i = 0; i < jobs.Count; i++)
+                    {
+                        if (i < realAlloc.Length && realAlloc[i] > 0)
+                            jobs[i].Threads = realAlloc[i];
+                    }
+                    LogDetail(string.Format(
+                        "按实际成功续传的 {0} 个任务重新分配连接数：{1}（原预估值是按 {2} 个算的，含已失败的）",
+                        jobs.Count,
+                        string.Join(" / ", realAlloc.Select(x => x.ToString()).ToArray()),
+                        tasks.Count));
                 }
 
                 LogAllocation(alloc);
@@ -830,13 +1326,113 @@ namespace GeZi
                 var resumedRows = new List<TaskItem>(jobs.Count);
                 foreach (var job in jobs)
                     resumedRows.Add(new TaskItem(job, job.Name));
-                AddTaskRows(resumedRows);
-                Log("已续传 " + jobs.Count + " 个任务。");
-                RunJobs(jobs);
+
+                // 🚨 2026-11-01：这三步**全是 UI 操作**（改 _tasks 集合、刷日志框、
+                //   启动任务并把状态推给界面）。上面有大量 ConfigureAwait(false)，
+                //   到这里很可能已经在线程池线程上 —— 直接调会抛
+                //   InvalidOperationException（"另一个线程拥有该对象"），
+                //   而且是**静默**抛在 async void / 未观察 Task 里，用户只看到
+                //   「任务加进来了但一直排队、没速度」。必须整体切回主线程。
+                RunOnUi(() =>
+                {
+                    AddTaskRows(resumedRows);
+                    Log("已续传 " + jobs.Count + " 个任务。");
+                    RunJobs(jobs);
+                });
             }
             finally
             {
-                SetBusy(false);
+                // 🚨🚨 2026-11-01 修复「续传后必须刷新界面才看到任务 / 等很久没速度 / 部分任务续传失败」。
+                //   根因（startup-error.log 实锤，21:10 / 21:25 / 22:00 三次）：
+                //     InvalidOperationException: 调用线程无法访问此对象，因为另一个线程拥有该对象。
+                //       at Dispatcher.VerifyAccess()
+                //       at MainWindow.SetBusy(Boolean busy)
+                //       at MainWindow.<ResumePendingBatchAsync>...  ← 就是这里！
+                //   上面大量 ConfigureAwait(false) 让这个 finally 跑在**线程池线程**上，
+                //   而 SetBusy 直接改按钮 IsEnabled（UI 对象）→ 抛异常。
+                //   异常从 `_ = ResumePendingBatchAsync(chosen)` 逸出成为 UnobservedTaskException，
+                //   用户看到的就是：
+                //     · 任务列表里已经有行，但状态停在「排队中」、速度 0（RunJobs 没跑到）；
+                //     · 必须切页/刷新才看到（列表是后来才画的）；
+                //     · 「部分任务续传失败」（有的批次在取链中途就断了）。
+                //   ⇒ 所有 UI 操作必须显式回主线程。
+                RunOnUi(() => SetBusy(false));
+            }
+        }
+
+
+        /// <summary>
+        /// 把一段 UI 操作切回主线程执行（已在主线程则直接执行）。
+        /// <para>
+        /// 续传流程里有大量 <c>ConfigureAwait(false)</c>（为了不阻塞 UI），
+        /// 于是 await 之后可能落在**线程池线程**上 —— 那里碰任何 WPF 控件都会抛
+        /// <c>InvalidOperationException</c>。凡是操作控件的语句都要包一层。
+        /// </para>
+        /// </summary>
+        /// <summary>
+        /// 从点击源往上找最近的 CheckBox（判断这次点击是不是点在复选框上）。
+        /// <para>整行点击翻转勾选时必须先排除，否则点复选框会翻两次（等于没翻）。</para>
+        /// </summary>
+        private static System.Windows.Controls.CheckBox FindAncestorCheckBox(DependencyObject node)
+        {
+            while (node != null)
+            {
+                var cb = node as System.Windows.Controls.CheckBox;
+                if (cb != null) return cb;
+                node = System.Windows.Media.VisualTreeHelper.GetParent(node);
+            }
+            return null;
+        }
+
+
+        /// <summary>从点击源解析出它所在的那一行（PendingRow）。</summary>
+        private static PendingRow ResolvePendingRow(ListBox box, DependencyObject src)
+        {
+            if (box == null || src == null) return null;
+
+            // ① 先看点击源自己的 DataContext（最常见的路径：点到 TextBlock / Border）
+            var fe = src as FrameworkElement;
+            if (fe != null && fe.DataContext is PendingRow)
+                return fe.DataContext as PendingRow;
+
+            // ② 再往上找 ListBoxItem 容器
+            try
+            {
+                var item = ItemsControl.ContainerFromElement(box, src) as ListBoxItem;
+                if (item != null) return item.DataContext as PendingRow;
+            }
+            catch { }
+
+            // ③ 最后沿可视树向上逐层试 DataContext
+            var node = src;
+            while (node != null)
+            {
+                var el = node as FrameworkElement;
+                if (el != null && el.DataContext is PendingRow)
+                    return el.DataContext as PendingRow;
+                node = System.Windows.Media.VisualTreeHelper.GetParent(node);
+            }
+            return null;
+        }
+
+
+        private void RunOnUi(Action action)
+        {
+            if (action == null) return;
+            try
+            {
+                if (Dispatcher.CheckAccess())
+                {
+                    action();
+                }
+                else
+                {
+                    Dispatcher.Invoke(action);
+                }
+            }
+            catch
+            {
+                // UI 更新失败不能反过来打断续传主流程
             }
         }
 
@@ -851,7 +1447,20 @@ namespace GeZi
             {
                 // 阿里/迅雷的「我的网盘」任务：不走夸克那套（那是分享专用），
                 // 也不走 provider 的分享取链 —— 用它的自有网盘取链接口。
-                if (!p.FromShare && p.PanKind != 0)
+                //
+                // 🚨🚨 2026-11-02 修「UC 续传 HTTP 403」：
+                //   判据原来是 `p.PanKind != 0`，把 **UC（PanKind=1）也卷了进来**，
+                //   于是 UC 任务被送去 RefreshOwnLinkForPendingAsync →
+                //   PanProviderRegistry.Create(Uc) → UcDriveClient。
+                //   但 UC 在数据层**与夸克同源**：正常下载走的是
+                //   OwnLinksAsync → _client.GetDownloadAsync（QuarkClient 链路），
+                //   _panProvider 对 UC **恒为 null**。
+                //   拿 UcDriveClient 取到的直链与 QuarkClient 那套不是一回事，
+                //   请求 CDN 必然 403（日志：直链HTTP 403 签名过期/防盗链，重试 2 次后失败）。
+                //   ⇒ 只有**阿里/迅雷**才走 provider；UC 必须和夸克一样走 QuarkClient。
+                //   ⚠️ 这条在 AGENTS.md 里写过（「UC 不是其他网盘，判据必须用 UsesProvider」），
+                //      我当时没查记忆，又踩了一遍。
+                if (!p.FromShare && (p.PanKind == 2 || p.PanKind == 3))
                 {
                     return await RefreshOwnLinkForPendingAsync(
                         (PanKind)p.PanKind, p.Fid, p.Token, ct).ConfigureAwait(false);
@@ -884,6 +1493,65 @@ namespace GeZi
                 {
                     new PanFileEntry { Fid = p.Fid, Token = p.Token ?? "" },
                 };
+
+                // 🚨 2026-11-02：夸克/UC 的自有网盘任务，必须用**网盘类型匹配**的客户端取链。
+                //   OwnLinksAsync 内部用的是全局 _client —— 续传时它可能是「当前登录的那家」，
+                //   与这条任务的 PanKind 不一定一致（例如登录夸克、续传 UC 任务）。
+                //   拿错 Cookie 请求 CDN 会 401/403，症状和「直链过期」一模一样，极难分辨。
+                // 🚨🚨 2026-11-02 修「手动下载能成、续传 403」的真正根因：
+                //
+                //   手动下载走 OwnLinksAsync → **_client.GetDownloadAsync** —— 那是**全局活客户端**：
+                //   它启动过 KeepAlive、`__puus` 被 RefreshPuusAsync 自动轮换过，Cookie 始终是最新的。
+                //
+                //   而续传原来走 TryBuildQuarkClientFor → `new QuarkClient(_settings.UcCookie, ...)`，
+                //   用的是**配置文件里的 Cookie 快照**。UC/夸克的 `__puus` 约 3 小时轮换一次，
+                //   快照早晚会过期 → 服务端签发的直链无效 → CDN 直接 403。
+                //   日志里「直链HTTP 403 签名过期/防盗链」重试 2 次后失败，就是这个。
+                //
+                //   ⇒ 续传必须复用**同一个活客户端**，和手动下载完全一致。
+                //   只有当全局客户端的网盘类型对不上时（例如登录夸克去续 UC 任务），
+                //   才退而新建一个——但那种情况下我们至少要先确认没有更好的选择。
+                if (p.PanKind == 0 || p.PanKind == 1)
+                {
+                    var kind2 = (PanKind)p.PanKind;
+
+                    // ① 优先复用全局客户端（令牌是活的，和手动下载同一条路）
+                    var live = _client;
+                    if (live != null && live.Kind == kind2)
+                    {
+                        try
+                        {
+                            var one = await live.GetDownloadAsync(new List<string> { p.Fid })
+                                .ConfigureAwait(false);
+                            var u = one?.FirstOrDefault(l => !string.IsNullOrEmpty(l.DownloadUrl))?.DownloadUrl;
+                            if (!string.IsNullOrEmpty(u))
+                                return u;
+                        }
+                        catch (Exception ex)
+                        {
+                            LogDetail("[续传] 用当前客户端取链失败(" + PanUrlParser.DisplayNameOf(kind2) + "): " + ex.Message);
+                        }
+                    }
+
+                    // ② 全局客户端网盘对不上（或取链失败）→ 退而新建一个**临时**客户端。
+                    //    ⚠️ 这是下策：临时客户端没有 keepalive，Cookie 是快照，可能已过期。
+                    //    只在确实没有别的选择时用。
+                    var byKind = TryBuildQuarkClientFor(kind2);
+                    if (byKind != null)
+                    {
+                        try
+                        {
+                            var one = await byKind.GetDownloadAsync(new List<string> { p.Fid })
+                                .ConfigureAwait(false);
+                            return one?.FirstOrDefault(l => !string.IsNullOrEmpty(l.DownloadUrl))?.DownloadUrl;
+                        }
+                        finally
+                        {
+                            try { byKind.Dispose(); } catch { }
+                        }
+                    }
+                }
+
                 var links = (await OwnLinksAsync(ownFiles).ConfigureAwait(false)).ToList();
                 return links?.FirstOrDefault(l => !string.IsNullOrEmpty(l.DownloadUrl))?.DownloadUrl;
             }
@@ -1023,6 +1691,38 @@ namespace GeZi
 
 
         /// <summary>PendingTask 版本（重启后续传用）。</summary>
+        /// <summary>
+        /// 为一条「缺分享 ID」的续传记录找回它所属的分享 ID。
+        /// <para>
+        /// 🚨 为什么需要它：2026-11-02 之前的版本在解析阿里/迅雷分享时
+        /// **没有把 share_id 写进待续传记录**（只存在内存的 _panShareRef 里），
+        /// 于是那些记录重启后必然报「分享 ID 为空」。
+        /// 分享 ID 其实在「解析历史」里有完整保存，可以从那里反查。
+        /// </para>
+        /// <para>
+        /// 恢复顺序：
+        /// ① 按文件名在分享历史里找**同名的文件**（最准）；
+        /// ② 找不到就用最近一次解析过的分享 ID ——
+        ///    同一次下载的多条任务通常来自同一个分享，这个兜底命中率很高。
+        /// ③ 都没有才返回空（那就真的只能让用户重新解析）。
+        /// </para>
+        /// </summary>
+        private string TryRecoverShareIdForPending(PendingTask p)
+        {
+            // 🚨🚨 2026-11-02 撤销上一轮的错误实现。
+            //   上一轮我在这里「取分享历史里最近的一条」当作恢复值 ——
+            //   那是**完全错误的猜测**：用户历史里最新的是「walli 4k」这类无关分享，
+            //   把它的 share_id 塞给阿里任务后，服务端直接回
+            //   `NotFound.ShareLink: The resource share_link cannot be found`，
+            //   反而把「缺 ID」变成了「ID 错误」，更难排查。
+            //
+            //   正确原则：**分享 ID 与任务是一一绑定的，不可能凭空猜出来**。
+            //   猜错的代价（去请求一个别人的分享）比直接失败更糟。
+            //   ⇒ 宁可如实报告「这条记录缺分享信息，需要重新解析」，也不要瞎猜。
+            return null;
+        }
+
+
         private Task<string> RefreshOtherPanLinkForPendingAsync(PendingTask p, CancellationToken ct)
         {
             return RefreshOtherPanLinkForPendingAsync((PanKind)p.PanKindValue, p.PwdId, p.Passcode,

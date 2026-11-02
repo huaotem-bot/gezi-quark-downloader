@@ -24,6 +24,7 @@ using GeZi.DownloadEngine;
 using GeZi.DownloadEngine.Framework;
 using GeZi.DownloadEngine.Storage;
 using GeZi.DownloadEngine.Media;
+using GeZi.DownloadEngine.Resume;
 using GeZi.Core.Models;
 using GeZi.Core.Support;
 using GeZi.Providers;
@@ -112,6 +113,8 @@ namespace GeZi.SelfTest
                 Run("write_merge", TestWriteMerge);
         Run("disk_media", TestDiskMedia);
         Run("chunk_queue", TestChunkQueue);
+        Run("resume_gaps", TestResumeGaps);
+        Run("pending_canresume", TestPendingCanResume);
             }
             catch (Exception ex)
             {
@@ -1614,6 +1617,172 @@ namespace GeZi.SelfTest
             Check("queue.bad_window", q.Reorder(-1, 100) == 0 && q.Reorder(100, 50) == 0, "");
             Check("queue.clear", q.Clear() == 1, "");
         }
+
+        /// <summary>
+        /// 续传状态：补洞 / 完整覆盖 / 补成待下分片（2026-11-01 方案 B + C）。
+        /// <para>
+        /// 这三条是「想怎么续传就怎么续传」的正确性基础，必须有用例守住：
+        /// 一旦有人把 NormalizeGaps / CoversAll / FillGapsWithPendingChunks 改坏，
+        /// 症状是「续传从零开始」或更糟的「长度对、内容坏」，而后者极难人工发现。
+        /// </para>
+        /// </summary>
+        /// <summary>
+        /// 待续传记录的「可续传」判定（2026-11-02）。
+        /// <para>
+        /// 重点守住一条：**Size=0 必须仍可续传**。
+        /// 2026-11-01 曾加过「size &lt;= 0 就不可续传」，理由是
+        /// 「连接分配会失衡」「TotalBytes 对不上」—— 两个理由后来都被证伪：
+        /// · ThreadAllocator 对未知大小会退回平分，n==1 时直接给满；
+        /// · 续传的 TotalBytes 来自引擎自己 GetFileSize() 探测，与记录里的 size 无关。
+        /// 那个判断导致「刚点下载没写盘就重启」的记录被禁止续传，用户以为功能坏了。
+        /// 这条用例防止有人再把它加回来。
+        /// </para>
+        /// </summary>
+        private static void TestPendingCanResume()
+        {
+            // 1) 我的网盘，有 dest + fid（size 不参与判断）→ 可续传
+            Check("pending.own_ok",
+                ResumePolicy.CanResume(@"C:\x\a.mp4", "f1", false, null, null, null),
+                "我的网盘有 dest+fid 即可续传");
+
+            // 2) 缺 dest → 不可续传
+            Check("pending.no_dest",
+                !ResumePolicy.CanResume(null, "f2", false, null, null, null),
+                "缺 dest 必须禁选");
+
+            // 3) 缺 fid → 不可续传
+            Check("pending.no_fid",
+                !ResumePolicy.CanResume(@"C:\x\c", "", false, null, null, null),
+                "缺 fid 必须禁选");
+
+            // 4) 分享任务缺 stoken → 不可续传
+            Check("pending.share_no_stoken",
+                !ResumePolicy.CanResume(@"C:\x\d", "f4", true, "t", "p", null),
+                "分享任务缺 stoken 必须禁选");
+
+            // 5) 分享任务凭证齐全 → 可续传
+            Check("pending.share_ok",
+                ResumePolicy.CanResume(@"C:\x\e", "f5", true, "t", "p", "s"),
+                "");
+
+            // 6) 关键回归：size=0 这个场景**根本没有 size 参数**，
+            //    说明判断里刻意不包含大小 —— 用注释锁死这个设计意图。
+            Check("pending.size_not_in_policy", true,
+                "size 不参与 CanResume 判断（刚下载未写盘重启必须仍可续传）");
+
+            // 7) 🚨 2026-11-02 回归：阿里/迅雷的分享任务**不需要 stoken**。
+            //    这两家取链在 IPanProvider 内部完成（阿里 file/copy、迅雷转存临时目录），
+            //    记录里 PwdId/Stoken 天然为空。原来用统一判据把它们判成不可续传，
+            //    用户看到「明明能下，为什么这条不能续传」。
+            Check("pending.aliyun_share_ok",
+                ResumePolicy.CanResume(@"C:\x\ali.pdf", "f7", true, null, null, null, 2),
+                "阿里分享缺 stoken 也必须可续传（取链在 provider 内部）");
+            Check("pending.xunlei_share_ok",
+                ResumePolicy.CanResume(@"C:\x\xl.zip", "f8", true, null, null, null, 3),
+                "迅雷分享缺 stoken 也必须可续传");
+
+            // 8) 夸克/UC 的分享任务仍然必须要有完整凭证（不能因为上面的放宽而松掉）
+            Check("pending.quark_share_still_strict",
+                !ResumePolicy.CanResume(@"C:\x\q.pdf", "f9", true, null, null, null, 0),
+                "夸克分享缺凭证仍必须禁选");
+            Check("pending.uc_share_still_strict",
+                !ResumePolicy.CanResume(@"C:\x\u.pdf", "f10", true, null, null, null, 1),
+                "UC 分享缺凭证仍必须禁选");
+        }
+
+
+        private static void TestResumeGaps()
+        {
+            // 构造一份「每片 1MiB、共 4MiB」的表，中间挖一个 512KiB 的洞
+            const long MiB = 1024L * 1024L;
+            const long HalfMiB = 512L * 1024L;
+
+            ResumeState Make()
+            {
+                return new ResumeState
+                {
+                    TotalBytes = 4 * MiB,
+                    Chunks = new[]
+                    {
+                        new ResumeChunk { Start = 0, End = MiB - 1, Position = MiB },
+                        // 洞里：从 MiB 到 MiB+HalfMiB-1 缺失
+                        new ResumeChunk { Start = MiB + HalfMiB, End = 2 * MiB - 1, Position = HalfMiB },
+                        new ResumeChunk { Start = 2 * MiB, End = 4 * MiB - 1, Position = 0 },
+                    },
+                };
+            }
+
+            // 1) 带洞的表：IsUsable 必须为 false（洞就是洞，不能自欺欺人）
+            var a = Make();
+            Check("resume.gap_not_usable", !a.IsUsable(), "");
+
+            // 2) 但必须「完整覆盖」（首片从 0 起、末片到 TotalBytes-1）
+            Check("resume.gap_covers_all", a.CoversAll(), "");
+
+            // 3) 补洞后应变成可用，且洞被并入前一片、Position 回退到洞起点
+            var b = Make();
+            int filled = b.NormalizeGaps();
+            Check("resume.gap_filled_one", filled == 1, "filled=" + filled);
+            Check("resume.gap_now_usable", b.IsUsable(), "");
+            // 第一片只跨过洞（End = 洞起点-1 = 1.5MiB-1），**不吞并后面那片**
+            // —— 吞并会把后面那片"没下过的数据"当成已完成，产出长度对、内容坏的文件。
+            Check("resume.gap_merged_end", b.Chunks[0].End == MiB + HalfMiB - 1,
+                "end=" + b.Chunks[0].End);
+            Check("resume.gap_pos_rewound", b.Chunks[0].Position == MiB,
+                "pos=" + b.Chunks[0].Position);
+
+            // 4) 洞太大（>16MB）不应被补，保持原样由上层丢弃
+            var big = new ResumeState
+            {
+                TotalBytes = 64 * MiB,
+                Chunks = new[]
+                {
+                    new ResumeChunk { Start = 0, End = MiB - 1, Position = MiB },
+                    new ResumeChunk { Start = 32 * MiB, End = 64 * MiB - 1, Position = 0 },
+                },
+            };
+            int bigFilled = big.NormalizeGaps();
+            Check("resume.big_gap_not_filled", bigFilled == 0, "filled=" + bigFilled);
+            Check("resume.big_gap_still_unusable", !big.IsUsable(), "");
+
+            // 5) 方案 C：补成待下分片 —— 洞必须变成一个 Position=0 的片
+            var c = Make();
+            int inserted = c.FillGapsWithPendingChunks();
+            Check("resume.gap_chunk_inserted", inserted == 1, "inserted=" + inserted);
+            Check("resume.gap_chunk_now_usable", c.IsUsable(),
+                "补成待下分片后必须严格连续");
+            Check("resume.gap_chunk_start", c.Chunks[1].Start == MiB,
+                "start=" + c.Chunks[1].Start);
+            Check("resume.gap_chunk_end", c.Chunks[1].End == MiB + HalfMiB - 1,
+                "end=" + c.Chunks[1].End);
+            Check("resume.gap_chunk_position", c.Chunks[1].Position == 0,
+                "洞必须是待下（Position=0）");
+
+            // 6) 首尾没盖住 → CoversAll 必须为 false（这种才是真的坏了）
+            var bad = new ResumeState
+            {
+                TotalBytes = 4 * MiB,
+                Chunks = new[]
+                {
+                    new ResumeChunk { Start = MiB, End = 4 * MiB - 2, Position = 0 },
+                },
+            };
+            Check("resume.bad_head_not_covers", !bad.CoversAll(), "首片不是从 0 开始");
+
+            // 7) 无洞的表：NormalizeGaps 不应做任何事
+            var ok = new ResumeState
+            {
+                TotalBytes = 4 * MiB,
+                Chunks = new[]
+                {
+                    new ResumeChunk { Start = 0, End = 2 * MiB - 1, Position = MiB },
+                    new ResumeChunk { Start = 2 * MiB, End = 4 * MiB - 1, Position = 0 },
+                },
+            };
+            Check("resume.clean_already_usable", ok.IsUsable(), "");
+            Check("resume.clean_no_fill", ok.NormalizeGaps() == 0, "");
+        }
+
 
         /// <summary>
         /// 磁盘介质探测：固态/机械自动识别 + 推荐落盘策略。

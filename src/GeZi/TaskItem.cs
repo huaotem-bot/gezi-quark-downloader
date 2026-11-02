@@ -41,13 +41,46 @@ namespace GeZi
         /// </summary>
         public string PanGroup { get; }
 
+        /// <summary>
+        /// 第二级分组：这条任务属于**哪一次「点下载」**（同一次选中的文件共用一个 ID）。
+        /// <para>
+        /// 🚨 2026-11-01 用户要求：任务列表要**两级**折叠 ——
+        /// 第一级按网盘，第二级按任务（一次下载 = 一个任务，它下面才是各个文件）。
+        /// 原来只有一级（网盘），同一个任务里的 10 个文件平铺在网盘下面，
+        /// 根本看不出它们是一起的。
+        /// </para>
+        /// <para>
+        /// 用 ID 而不是名字做分组键：两次下载可能选了同名目录，
+        /// 按名字分组会把两个不同任务合并成一个。
+        /// </para>
+        /// </summary>
+        public string TaskGroupId { get; }
+
+        /// <summary>
+        /// 第二级分组的**显示名**（任务名：优先用选中的目录名，其次"任务 N"）。
+        /// 与 <see cref="TaskGroupId"/> 成对使用：ID 决定分组边界，它决定显示什么。
+        /// </summary>
+        public string TaskGroupName { get; }
+
         /// <summary>是否已写入下载历史。终态只记一次，防止重复上报把历史刷屏。</summary>
         public bool HistoryRecorded { get; set; }
 
-        public TaskItem(DownloadJob job, string name)
+        public TaskItem(DownloadJob job, string name,
+            string taskGroupId = null, string taskGroupName = null)
         {
             Job = job;
             Name = name;
+
+            // 第二级分组：没传就退化成"这个文件自成一组"（用文件名兜底）。
+            // 这样即使某个调用点忘了传，列表也不会崩成一级 —— 只是那几条各自成组。
+            TaskGroupId = string.IsNullOrWhiteSpace(taskGroupId)
+                ? "single:" + (name ?? "")
+                : taskGroupId;
+            // ⚠️ 分组头显示的**就是这个字段**（CollectionViewGroup.Name 就是分组键），
+            //    所以它必须是人话。ID 只用来区分"同名但不同任务"的两批文件。
+            TaskGroupName = string.IsNullOrWhiteSpace(taskGroupName)
+                ? (name ?? "")
+                : taskGroupName;
 
             // 分组名：兜底必须和 PanUrlParser.DisplayNameOf 的返回值**完全一致**，
             // 否则同一家网盘会裂成两个分组（历史上兜底写的是「夸克」，而正常路径

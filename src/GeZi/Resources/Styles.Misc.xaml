@@ -158,4 +158,194 @@
         <Setter Property="Margin" Value="0,0,0,10"/>
     </Style>
 
+
+    <!-- ══════════════════════════════════════════════════════════════════
+         分组头展开/折叠按钮（2026-11-01）
+         ══════════════════════════════════════════════════════════════════
+         用户反馈：「展开按钮和折叠按钮太丑，请只优化这两个按钮的视觉样式」。
+
+         根因：项目从未给 Expander 写过样式，用的是 **WPF 默认模板** ——
+         它自带一个灰色圆底 + 三角箭头的 ToggleButton，是 2005 年 WinForms 的观感，
+         和这套自绘界面完全不在一个体系。
+
+         现在换成现代做法：
+           · 去掉圆形底，只留一根**细箭头**（与 Icons.xaml 的描边风格一致）；
+           · 展开时箭头旋转 90°（▸ → ▾），这是 macOS / VS Code / Linear 的通行做法；
+           · 悬停给一点极淡底色，圆角 4px，不喧宾夺主；
+           · 整块 20×20 命中区，视觉上只有 9px 箭头，点击仍然好点。
+
+         ⚠️ 只覆盖 ToggleButton 这一段，Expander 的内容区（ItemsPresenter）
+            与分组头的文字/图标/徽章一律不动 —— 用户明确要求"只优化这两个按钮"。
+         ⚠️ 别在这里加 Background 到 Expander 本身，会盖住整行。
+    -->
+    <Style x:Key="GroupExpanderToggle" TargetType="ToggleButton">
+        <Setter Property="Focusable" Value="False"/>
+        <Setter Property="Width" Value="20"/>
+        <Setter Property="Height" Value="20"/>
+        <Setter Property="Cursor" Value="Hand"/>
+        <Setter Property="Template">
+            <Setter.Value>
+                <ControlTemplate TargetType="ToggleButton">
+                    <Border x:Name="Bg" Background="Transparent" CornerRadius="4">
+                        <!-- 2026-11-01 修复：这里原来**只有箭头**，没有 ContentPresenter，
+                             而 GroupExpander 的 HeaderSite 又绑了 Content={TemplateBinding Header}
+                             → 分组头的文字/图标/条数徽章全都不渲染，只剩一个孤立箭头。
+                             现在改成「箭头 + 内容」横向排列。 -->
+                        <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                        <!-- 箭头：默认朝右（收起），Checked 时旋转 90° 朝下（展开）。
+                             几何用「V 形折线」而不是实心三角 —— 实心三角在 9px 尺寸下
+                             会糊成一团，细线更清爽。 -->
+                        <Path x:Name="Arrow"
+                              Data="M4,2 L8,6 L4,10"
+                              Stretch="Uniform" Width="8" Height="8"
+                              HorizontalAlignment="Center" VerticalAlignment="Center"
+                              Stroke="{DynamicResource TextTertiaryBrush}"
+                              StrokeThickness="1.6"
+                              StrokeStartLineCap="Round"
+                              StrokeEndLineCap="Round"
+                              StrokeLineJoin="Round"
+                              RenderTransformOrigin="0.5,0.5">
+                            <Path.RenderTransform>
+                                <RotateTransform x:Name="ArrowRotate" Angle="0"/>
+                            </Path.RenderTransform>
+                        </Path>
+                            <ContentPresenter Margin="6,0,0,0"
+                                              VerticalAlignment="Center"/>
+                        </StackPanel>
+                    </Border>
+                    <ControlTemplate.Triggers>
+                        <!-- 展开 → 箭头转 90° 朝下。
+                             ⚠️ RotateTransform 不是元素，不能用 TargetName 指向它（MC4111），
+                             所以整个 RenderTransform 一起替换。 -->
+                        <Trigger Property="IsChecked" Value="True">
+                            <Setter TargetName="Arrow" Property="RenderTransform">
+                                <Setter.Value>
+                                    <RotateTransform Angle="90"/>
+                                </Setter.Value>
+                            </Setter>
+                        </Trigger>
+                        <!-- 悬停：极淡底色，让人知道这里能点 -->
+                        <Trigger Property="IsMouseOver" Value="True">
+                            <Setter TargetName="Bg" Property="Background"
+                                    Value="{DynamicResource SurfaceAltBrush}"/>
+                            <Setter TargetName="Arrow" Property="Stroke"
+                                    Value="{DynamicResource TextPrimaryBrush}"/>
+                        </Trigger>
+                    </ControlTemplate.Triggers>
+                </ControlTemplate>
+            </Setter.Value>
+        </Setter>
+    </Style>
+
+    <!-- Expander 本身：去掉默认模板里的圆圈按钮，只保留「箭头 + 内容」 -->
+    <Style x:Key="GroupExpander" TargetType="Expander">
+        <Setter Property="IsExpanded" Value="True"/>
+        <Setter Property="Template">
+            <Setter.Value>
+                <ControlTemplate TargetType="Expander">
+                    <StackPanel>
+                        <!-- ⚠️ ToggleButton 的 Width/Height 在 GroupExpanderToggle 里写死了 20，
+                             但这里要放「箭头 + 分组标题」，所以必须覆盖成 Auto。
+                             不覆盖的话标题会被裁在 20px 里，看起来像"标题没了"。 -->
+                        <ToggleButton x:Name="HeaderSite"
+                                      Style="{StaticResource GroupExpanderToggle}"
+                                      IsChecked="{Binding IsExpanded, Mode=TwoWay,
+                                                  RelativeSource={RelativeSource TemplatedParent}}"
+                                      HorizontalAlignment="Left"
+                                      Margin="0,1,0,1"
+                                      Width="Auto" Height="Auto"
+                                      Padding="2,1"
+                                      Content="{TemplateBinding Header}"/>
+                        <ContentPresenter x:Name="ExpandSite"
+                                          Visibility="Collapsed"
+                                          Focusable="False"/>
+                    </StackPanel>
+                    <ControlTemplate.Triggers>
+                        <Trigger Property="IsExpanded" Value="True">
+                            <Setter TargetName="ExpandSite" Property="Visibility" Value="Visible"/>
+                        </Trigger>
+                    </ControlTemplate.Triggers>
+                </ControlTemplate>
+            </Setter.Value>
+        </Setter>
+    </Style>
+
+
+    <!-- ══════════════════════════════════════════════════════════════
+         设置页「分区式」布局（2026-11-02 结构性重设计）
+         ══════════════════════════════════════════════════════════════
+         用户反复反馈「设置页特别丑」，并明确授权大改。
+
+         旧方案是「6 张卡片分两列堆叠」，本质问题是：
+           · 卡片自带阴影 + 12px 圆角 + 18px 内边距 → 视觉噪音大、密度低；
+           · 两列高度天然不齐 → 短列底部永远有空；
+           · 每张卡里再套 Grid，标签列固定 120px → 左侧大片空白。
+
+         新方案学 Chrome / VS Code / Notion 的**单列分区式**：
+           · 没有卡片，只有「分区标题 + 设置行 + 极淡分隔线」；
+           · 单列居中，彻底消灭"哪列短"；
+           · 行式布局：标签在左、控件在右，中间弹性空白；
+           · 分隔线只在分区之间出现（1px，BorderBrushSoft），行与行之间靠留白。
+    -->
+
+    <!-- 设置分区容器：**没有**圆角、阴影、内边距 —— 这是"去卡片化"的核心。
+         分区之间靠 SettingsDivider 分隔，而不是靠卡片边界。 -->
+    <Style x:Key="SettingsSection" TargetType="Border">
+        <Setter Property="Background" Value="Transparent"/>
+        <Setter Property="BorderThickness" Value="0"/>
+        <Setter Property="Padding" Value="0"/>
+        <Setter Property="SnapsToDevicePixels" Value="True"/>
+    </Style>
+
+    <!-- 分区标题：比 CardTitleText 更弱，只做"分组提示" -->
+    <Style x:Key="SettingsSectionTitle" TargetType="TextBlock">
+        <Setter Property="FontFamily" Value="{StaticResource AppFontFamily}"/>
+        <!-- 2026-11-02：12 → 13px。大厂设置页的分组标题通常比正文小一号、
+             但比"说明文字"大一号，13px + SemiBold + 三级色正好卡在中间。 -->
+        <Setter Property="FontSize" Value="13"/>
+        <Setter Property="FontWeight" Value="SemiBold"/>
+        <Setter Property="Foreground" Value="{DynamicResource TextSecondaryBrush}"/>
+        <Setter Property="Margin" Value="0,0,0,12"/>
+    </Style>
+
+    <!-- 分区之间的分隔线 -->
+    <Style x:Key="SettingsDivider" TargetType="Border">
+        <Setter Property="BorderBrush" Value="{DynamicResource BorderBrushSoft}"/>
+        <Setter Property="BorderThickness" Value="0,1,0,0"/>
+        <Setter Property="Margin" Value="0,20,0,20"/>
+        <Setter Property="SnapsToDevicePixels" Value="True"/>
+    </Style>
+
+    <!-- 设置行：标签(自适应) + 控件(*) -->
+    <Style x:Key="SettingsRow" TargetType="Grid">
+        <Setter Property="Margin" Value="0,0,0,12"/>
+    </Style>
+
+
+    <!-- ══════════════════════════════════════════════════════════════
+         设置页卡片（2026-11-02 视觉重设计）
+         ══════════════════════════════════════════════════════════════
+         上一轮我把卡片全删了（「去卡片化」），结果变成「一堆字段堆在灰底上」，
+         完全没有视觉分层 —— 那是**过度纠正**。
+         Windows 11 设置页是**有卡片**的：白底、圆角、极淡描边，靠卡片形成模块边界。
+         所以这里把卡片加回来，但比原来的 Card 更轻（无阴影、描边更淡）。
+    -->
+    <Style x:Key="SettingsCard" TargetType="Border">
+        <Setter Property="Background" Value="{DynamicResource SurfaceBrush}"/>
+        <Setter Property="BorderBrush" Value="{DynamicResource BorderBrushSoft}"/>
+        <Setter Property="BorderThickness" Value="1"/>
+        <Setter Property="CornerRadius" Value="10"/>
+        <Setter Property="Padding" Value="18,16"/>
+        <Setter Property="SnapsToDevicePixels" Value="True"/>
+    </Style>
+
+    <!-- 分区标题：带图标的一行（图标由调用方用 Path 画，这里只管文字） -->
+    <Style x:Key="SettingsCardTitle" TargetType="TextBlock">
+        <Setter Property="FontFamily" Value="{StaticResource AppFontFamily}"/>
+        <Setter Property="FontSize" Value="14"/>
+        <Setter Property="FontWeight" Value="SemiBold"/>
+        <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}"/>
+        <Setter Property="VerticalAlignment" Value="Center"/>
+    </Style>
+
 </ResourceDictionary>

@@ -86,7 +86,22 @@ namespace GeZi
         private async Task<QuarkClient.DirPage> OwnListDirPageAsync(string fid, int page)
         {
             if (OwnIsQuarkLike)
-                return await _client.ListDirPageAsync(fid, page).ConfigureAwait(true);
+            {
+                // 2026-11-01 修复「切换网盘后一直卡在正在加载」（用户实测截图）：
+                //   原来这里直接解引用 _client，没有判空。
+                //   而 ActivateCachedPanAsync 切换网盘时会先 _client = null 再赋新值，
+                //   目录加载的 await 续体一旦落在那个窗口里就是 NullReferenceException。
+                //   异常被 LoadDirAsync 的 catch 吞掉（只写日志），界面就永远停在转圈。
+                //   这里先判空：拿不到客户端就返回空页（而不是抛异常），
+                //   让界面正常显示空状态，用户至少能看到这个目录是空的而不是无限转圈。
+                var c = _client;
+                if (c == null)
+                {
+                    LogDetail("目录加载被跳过：当前没有可用的网盘客户端（可能正在切换网盘）。");
+                    return new QuarkClient.DirPage();
+                }
+                return await c.ListDirPageAsync(fid, page).ConfigureAwait(true);
+            }
 
             var one = new QuarkClient.DirPage();
             if (page > 1)
@@ -464,6 +479,15 @@ namespace GeZi
             _panKind = shareRef.Kind;
             _panShareRef = shareRef;
             _passcode = shareRef.Passcode ?? "";
+
+            // 2026-11-02：把分享 ID 同步写进 _pwdId。
+            //   原来这里只设 _panShareRef，没设 _pwdId ——
+            //   而 BuildJobs 构造 PendingInfo 时写的是 PwdId = _pwdId，
+            //   于是阿里/迅雷分享任务的「未完成记录」里 PwdId 永远是空的。
+            //   后果：这类记录被 ResumePolicy 判成「缺分享凭证」→ 永远不可续传。
+            //   分享 ID 本来就是现成的（shareRef.ShareId），没有理由不存。
+            _pwdId = shareRef.ShareId ?? "";
+            _stoken = "";   // 阿里/迅雷不走 stoken 那套（provider 内部自己处理）
             _linkCache.Clear();
             _dirCache.Clear();
             _dirSizeCache.Clear();
@@ -702,7 +726,17 @@ namespace GeZi
             }
             catch (Exception ex)
             {
+                // 2026-11-01：失败时不能只写日志 —— 用户看到的是目录区无限转圈，
+                //   完全不知道发生了什么。这里把原因也写进界面（空状态区），
+                //   并明确说"可以点刷新重试"，避免让人以为软件卡死。
                 Log("加载目录失败: " + ex.Message);
+                try
+                {
+                    _files.Clear();
+                    if (FileEmptyText != null)
+                        FileEmptyText.Text = "目录加载失败：" + ErrorText.Describe(ex) + "，可以点右上角「刷新」重试。";
+                }
+                catch { }
             }
             finally
             {
@@ -931,10 +965,43 @@ namespace GeZi
         /// </summary>
         private void OnFileContextMenuOpened(object sender, RoutedEventArgs e)
         {
-            if (NoSaveDownloadMenuItem == null)
-                return;
-            NoSaveDownloadMenuItem.Visibility =
-                ShareMode && !UsesProvider ? Visibility.Visible : Visibility.Collapsed;
+            // 「免转存下载」只在分享模式、且不是阿里/迅雷（它们必须转存）时有意义。
+            if (NoSaveDownloadMenuItem != null)
+            {
+                NoSaveDownloadMenuItem.Visibility =
+                    ShareMode && !UsesProvider ? Visibility.Visible : Visibility.Collapsed;
+            }
+
+            // 🚨 2026-11-02 空菜单兜底（用户报「右键只剩一个白点」）：
+            //   原来这个菜单只有「免转存下载」一项，我的网盘模式下它被折叠 →
+            //   弹出的是**完全空白的菜单**，视觉上就是一个白色小点。
+            //   现在补了「下载文件」且始终可见，理论上不会再空；
+            //   但任何未来改动都可能再次让它变空，所以这里做**通用防御**：
+            //   统计可见项，一个都没有就取消弹出。
+            var cm = sender as System.Windows.Controls.ContextMenu;
+            if (cm == null) return;
+
+            bool anyVisible = false;
+            foreach (var item in cm.Items)
+            {
+                var mi = item as System.Windows.Controls.MenuItem;
+                if (mi != null && mi.Visibility == Visibility.Visible)
+                {
+                    anyVisible = true;
+                    break;
+                }
+                // 非 MenuItem（如 Separator）也算内容，但这里菜单里只有 MenuItem
+            }
+
+            if (!anyVisible)
+            {
+                // 必须异步关：Opened 事件里直接 IsOpen=false 会被 WPF 重新打开。
+                e.Handled = true;
+                cm.Dispatcher.BeginInvoke(new Action(() =>
+                {
+                    try { cm.IsOpen = false; } catch { }
+                }), System.Windows.Threading.DispatcherPriority.Background);
+            }
         }
 
 

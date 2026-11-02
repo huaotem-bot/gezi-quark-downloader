@@ -657,6 +657,159 @@ namespace GeZi
 
         /// <summary>点账号卡直接去「登录」页 —— 侧栏底部那块地方小，放不了按钮。</summary>
         /// <summary>侧栏品牌区那个「?」按钮：打开「关于」窗口（软件介绍 + 赞赏码）。</summary>
+        // ==================== 关于页（2026-11-02，右侧内容区） ====================
+        // 用户要求：不弹新窗口，在右侧内容区显示，和设置/登录一致。
+        // 旧的 AboutWindow 弹窗已废弃，但它里面的「赞赏码 / 检查更新 / 链接」功能必须保留。
+
+        private const string AboutRepoUrl = "https://github.com/huaotem-bot/gezi-quark-downloader";
+        private const string AboutBiliUrl = "https://b23.tv/gIoEfQM";
+
+        /// <summary>把版本号填进关于页（页面加载时调用一次）。</summary>
+        private void RefreshAboutPage()
+        {
+            try
+            {
+                if (AboutVersionText != null)
+                {
+                    var ver = System.Reflection.Assembly.GetExecutingAssembly().GetName().Version;
+                    AboutVersionText.Text = "v" + (ver != null ? ver.ToString(3) : "?");
+                }
+            }
+            catch { }
+        }
+
+        /// <summary>关于页「检查更新」：复用现有的更新服务。</summary>
+        private void OnAboutCheckUpdate(object sender, RoutedEventArgs e)
+        {
+            // 🚨🚨 2026-11-02 修「检查更新点击后没有任何效果」：
+            //   根因是**反馈只写进了日志区**，而日志区在「任务」页 ——
+            //   用户站在「关于」页点按钮，屏幕上什么都不会变，看起来就是「没反应」。
+            //   而且「已是最新版本」这种结果也只写日志，连切过去都看不到。
+            //   ⇒ 必须在**关于页内**直接给出可见反馈：按钮变「检查中…」+ 下方状态文字。
+            var btn = sender as Button;
+            if (btn != null && !btn.IsEnabled)
+                return;   // 防重复点击
+            try
+            {
+                if (btn != null)
+                {
+                    btn.IsEnabled = false;
+                    btn.Content = "检查中…";
+                }
+                SetAboutUpdateStatus("正在检查更新…", false);
+                Log("正在检查更新…");
+                _ = CheckUpdateFromAboutAsync(btn);
+            }
+            catch (Exception ex)
+            {
+                if (btn != null) { btn.IsEnabled = true; btn.Content = "检查更新"; }
+                SetAboutUpdateStatus("检查更新失败：" + ex.Message, true);
+                Log("检查更新失败：" + ex.Message);
+            }
+        }
+
+
+        /// <summary>把检查更新的结果写到关于页上的状态文字（用户能直接看到）。</summary>
+        private void SetAboutUpdateStatus(string text, bool isError)
+        {
+            try
+            {
+                if (AboutUpdateStatusText == null)
+                    return;
+                AboutUpdateStatusText.Text = text ?? "";
+                AboutUpdateStatusText.Visibility = string.IsNullOrEmpty(text)
+                    ? Visibility.Collapsed : Visibility.Visible;
+                AboutUpdateStatusText.SetResourceReference(
+                    TextBlock.ForegroundProperty,
+                    isError ? "DangerBrush" : "TextTertiaryBrush");
+            }
+            catch { }
+        }
+
+        /// <summary>关于页的检查更新（独立成方法，避免 async void 吞异常）。</summary>
+        private async Task CheckUpdateFromAboutAsync(Button btn)
+        {
+            try
+            {
+                var m = await UpdateService.CheckNowAsync();
+                if (m == null)
+                {
+                    SetAboutUpdateStatus("检查失败：网络不通或接口异常，请稍后再试。", true);
+                    Log("检查更新失败（网络不通或接口异常），稍后再试。");
+                    return;
+                }
+                if (UpdateService.Settings != null)
+                    UpdateService.Apply(UpdateService.Settings, m, OnUpdateFound);
+
+                if (UpdateService.HasUpdate && UpdateService.Latest != null)
+                {
+                    SetAboutUpdateStatus("发现新版本 v" + UpdateService.Latest.Version.ToString()
+                        + "，已弹出更新提示。", false);
+                }
+                else
+                {
+                    SetAboutUpdateStatus("已是最新版本。", false);
+                    Log("已是最新版本。");
+                }
+            }
+            catch (Exception ex)
+            {
+                SetAboutUpdateStatus("检查更新出错：" + ex.Message, true);
+                Log("检查更新出错：" + ex.Message);
+            }
+            finally
+            {
+                // 无论成败都要恢复按钮，否则用户永远只能看到「检查中…」。
+                try
+                {
+                    if (btn != null) { btn.IsEnabled = true; btn.Content = "检查更新"; }
+                }
+                catch { }
+            }
+        }
+
+
+        /// <summary>关于页「赞赏支持」：打开赞赏码（复用旧关于窗口那张图）。</summary>
+        private void OnAboutReward(object sender, RoutedEventArgs e)
+        {
+            try
+            {
+                // AboutWindow 里集中放着赞赏码，直接打开它即可
+                //（新关于页只提供入口，图片资源不重复维护）。
+                var w = new AboutWindow { Owner = this };
+                w.ShowDialog();
+            }
+            catch (Exception ex)
+            {
+                Log("打开赞赏页失败：" + ex.Message);
+            }
+        }
+
+        /// <summary>关于页「GitHub 开源地址」。</summary>
+        private void OnAboutGithub(object sender, RoutedEventArgs e)
+        {
+            if (!ShellLaunch.OpenUrl(AboutRepoUrl))
+            {
+                Log("打不开浏览器，请手动访问：" + AboutRepoUrl);
+                AppDialog.Show(this,
+                    "无法启动浏览器。\n\n请手动复制下方地址到浏览器打开：\n\n" + AboutRepoUrl,
+                    "需要手动打开", MessageBoxButton.OK, MessageBoxImage.Information);
+            }
+        }
+
+        /// <summary>关于页「作者 B 站」。</summary>
+        private void OnAboutBilibili(object sender, RoutedEventArgs e)
+        {
+            if (!ShellLaunch.OpenUrl(AboutBiliUrl))
+            {
+                Log("打不开浏览器，请手动访问：" + AboutBiliUrl);
+                AppDialog.Show(this,
+                    "无法启动浏览器。\n\n请手动复制下方地址到浏览器打开：\n\n" + AboutBiliUrl,
+                    "需要手动打开", MessageBoxButton.OK, MessageBoxImage.Information);
+            }
+        }
+
+
         private void OnAboutClick(object sender, RoutedEventArgs e)
         {
             try

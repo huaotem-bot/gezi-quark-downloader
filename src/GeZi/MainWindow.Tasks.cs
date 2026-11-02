@@ -428,7 +428,19 @@ namespace GeZi
                 // 进度（Percent/Done）照常更新：那是真实已下载字节，且暂停后本来就不再增长。
                 if (!keepPaused) item.Speed = u.Progress.Speed;
                 item.Done = u.Progress.Done;
+
+                // 🚨 2026-11-02：Total 首次拿到正数时，**强制**把 Pending 落一次盘。
+                //   背景：DownloadJob 本身没有大小字段，Size 只能从进度回调拿；
+                //   而 SyncPending 的状态指纹把 Queued/Downloading 合并计数（防每秒几十次全量写盘），
+                //   所以「入队时写了 Size=0」之后**再也不会被更新**。
+                //   后果：用户「刚点下载、还没写盘就重启」→ 磁盘上永远是 Size=0 →
+                //   续传界面显示「大小未知」（虽然现在已不再禁止续传，但显示仍不准）。
+                //   这里在 Total 从 0 变正数的那一刻把指纹置为 -1，让下一次 SyncPending
+                //   必定落盘 —— 只多写一次，开销可忽略。
+                bool totalBecameKnown = item.Total <= 0 && u.Progress.Total > 0;
                 item.Total = u.Progress.Total;
+                if (totalBecameKnown)
+                    _pendingLightSig = -1;
                 // 阶段说明（如「正在合并分片」）。非下载态一律清空，
                 // 免得完成/失败后还挂着「正在合并分片」这种残留文案。
                 item.Phase = u.State == JobState.Downloading ? u.Progress.Phase : null;
@@ -747,7 +759,21 @@ namespace GeZi
         /// <summary>
         /// 同步「登录」页里的网盘状态列表（与侧栏账号卡同源，避免两处状态不一致）。
         /// </summary>
-        private void SyncLoginPageState(string nick, long used, long total)
+        /// <param name="kind">
+        /// 这个昵称/容量**属于哪家网盘**。null = 沿用 <see cref="_activeKind"/>。
+        /// <para>
+        /// 🚨🚨 2026-11-02 修复「夸克账号里显示阿里昵称、重启才恢复」：
+        /// 原来这个方法内部用 <c>_panNick[_activeKind] = nick</c> ——
+        /// 键是**当前网盘**（随时会被切换改掉），值是**传进来的昵称**（可能来自上一家）。
+        /// 两者不同步时，阿里的昵称就被写进了夸克的槽位。
+        /// 而 <c>_panNick</c> 是纯内存字典，重启即清空并从账号档案重填 ——
+        /// 这正好解释用户观察到的「只有重启才能恢复」。
+        /// </para>
+        /// <para>
+        /// 现在**所有调用点必须显式传网盘**，不再依赖可变的全局状态。
+        /// </para>
+        /// </param>
+        private void SyncLoginPageState(string nick, long used, long total, PanKind? kind = null)
         {
             if (PanStateList == null)
                 return;
@@ -774,7 +800,11 @@ namespace GeZi
             //    用户实测：第一行写「夸克网盘」、副标题却是「迅雷用户」，
             //    因为 _loginNick 被最近一次登录的那家（迅雷）覆盖了。
             if (!string.IsNullOrEmpty(nick) && IsLoggedInAny)
-                _panNick[_activeKind] = nick;
+            {
+                // 显式指定网盘；没传才回落到 _activeKind（兼容老调用点）。
+                PanKind slot = kind.HasValue ? kind.Value : _activeKind;
+                _panNick[slot] = nick;
+            }
             _loginUsed = used;
             _loginTotal = total;
             RefreshPanStateList();
@@ -1398,6 +1428,12 @@ namespace GeZi
                     switchBtn.Style = ghostStyle;
                 switchBtn.Click += OnOpenAccounts;
                 Grid.SetColumn(switchBtn, 2);
+                // 2026-11-02 修「切换按钮选中框右侧被遮挡」：
+                //   GhostButton 模板里的焦点环是 Margin=-3（向外扩张 3px），
+                //   而这一列是最右列，外层卡片 Padding / ClipToBounds 把超出的 3px 裁掉了
+                //   → 胶囊右边缺一截。这里给按钮留 4px 呼吸位，焦点环就完整了。
+                //   ⚠️ 不能删 FocusRing —— 那是键盘无障碍的焦点指示。
+                switchBtn.Margin = new Thickness(0, 0, 4, 0);
                 grid.Children.Add(switchBtn);
             }
 
@@ -1486,7 +1522,29 @@ namespace GeZi
         private string PanLiveNick(PanKind kind)
         {
             string n;
-            return _panNick.TryGetValue(kind, out n) ? (n ?? "") : "";
+            if (_panNick.TryGetValue(kind, out n) && !string.IsNullOrEmpty(n))
+            {
+                // 🚨 2026-11-02：**以磁盘为准**纠正内存脏数据。
+                //   昵称串台的根因是 _panNick 被写进了错误的槽位（见 SyncLoginPageState），
+                //   而 _panNick 是纯内存字典 —— 重启就清空，所以用户观察到「重启后恢复」。
+                //   但如果不重启，脏数据会一直显示。这里每次取值时与账号档案比对：
+                //   档案（磁盘）是持久事实，内存只是缓存，不一致就以磁盘为准并就地修正。
+                try
+                {
+                    var primary = AccountStore.GetPrimary((int)kind);
+                    string truth = primary != null ? primary.DisplayName : null;
+                    if (!string.IsNullOrEmpty(truth) && !string.Equals(truth, n, StringComparison.Ordinal))
+                    {
+                        LogDetail(PanUrlParser.DisplayNameOf(kind) + " 昵称与账号档案不一致（缓存 "
+                            + n + " / 档案 " + truth + "），已按档案纠正。");
+                        _panNick[kind] = truth;
+                        return truth;
+                    }
+                }
+                catch { }
+                return n;
+            }
+            return "";
         }
 
 

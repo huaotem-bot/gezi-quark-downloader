@@ -317,7 +317,12 @@ namespace GeZi
             {
                 ThreadsBox.SelectedIndex = PresetToIndex(_settings.Threads);
                 HddThreadsBox.SelectedIndex = HddPresetToIndex(_settings.HddMaxConcurrency);
-                ConcurrentBox.Text = _settings.ConcurrentTasks.ToString();
+                // 2026-11-02：并发数改成下拉（1~6），索引 = 值 - 1。
+                // 老配置里可能是 8/10/64，这里夹取到 [1,6]，避免下拉没有对应项。
+                int concLoad = _settings.ConcurrentTasks;
+                if (concLoad < 1) concLoad = 1;
+                if (concLoad > 6) concLoad = 6;
+                ConcurrentBox.SelectedIndex = concLoad - 1;
                 OutDirBox.Text = _settings.OutDir;
                 AutoCleanCheck.IsChecked = _settings.AutoClean;
                 // 2026-11-01（用户拍板方案 B）：设置页「分片/缓存根目录」输入框已整块删除，
@@ -427,14 +432,14 @@ namespace GeZi
         {
             try
             {
-                int conc;
                 int threads = SelectedThreads();
-                int.TryParse((ConcurrentBox.Text ?? "").Trim(), out conc);
+                // 2026-11-02：下拉选择，索引 + 1 = 并发数；空选时回落默认 3。
+                int conc = ConcurrentBox.SelectedIndex >= 0 ? ConcurrentBox.SelectedIndex + 1 : 3;
 
                 _settings.Threads = threads;
 
                 if (conc < 1) conc = 1;
-                if (conc > 64) conc = 64;
+                if (conc > 6) conc = 6;   // 2026-11-02 用户要求：上限 6
                 _settings.ConcurrentTasks = conc;
 
                 // ⚠️ 必须规范化：用户手输的可能是 `C:/a/b`（正斜杠），

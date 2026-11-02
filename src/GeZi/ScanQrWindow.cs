@@ -73,7 +73,9 @@ namespace GeZi
             // 520×560 → 440×440：
             //   原来预览卡是 Star 行拉伸占满整个窗口（白框巨大），
             //   现在预览卡固定 220 高、居中，窗口跟着收小。
-            DialogChrome.StyleWindow(this, 440, 440);
+            // 2026-11-01 重做：440×440 太挤（预览卡 300 + 标题 + 说明 + 按钮放不下）。
+            // 改成 460×620 —— 竖向留够空间，预览区本身仍是 300×300 正方形。
+            DialogChrome.StyleWindow(this, 460, 620);
             // 圆角与标题栏深浅在 OnSourceInitialized 里设 —— 构造函数里窗口句柄还是
             // IntPtr.Zero，那里调是静默无效的（曾经因为这一行以为"圆角已经加过了"）。
         }
@@ -171,8 +173,15 @@ namespace GeZi
             _imgPreviewBox = preview;
 
             var previewCard = DialogChrome.Card(previewHost);
-            // 固定高度 + 居中，不再吃 Star 行撑满窗口（原来 560 高的窗口大半是这块白）
-            previewCard.Height = 220;
+            // 🚨 2026-11-01 重做（用户：「二维码区域应为方形，但界面看起来不方」）：
+            //   根因是这里 Height=220 而窗口宽 440、内边距后可用宽约 380 ——
+            //   卡片被拉成 380×220 的**扁长方形**，视觉上完全不方。
+            //   现在改成**严格正方形**：宽高都取 300，居中。
+            //   300 的理由：窗口内容区约 380 宽，留 40 边距；
+            //   同时 300×300 对二维码来说足够大（识别框本身只有 ~200）。
+            previewCard.Width = 300;
+            previewCard.Height = 300;
+            previewCard.HorizontalAlignment = HorizontalAlignment.Center;
             previewCard.VerticalAlignment = VerticalAlignment.Center;
             Grid.SetRow(previewCard, 2);
             root.Children.Add(previewCard);
@@ -187,13 +196,33 @@ namespace GeZi
             Grid.SetRow(_statusText, 3);
             root.Children.Add(_statusText);
 
+            // 🚨 2026-11-01 重做按钮区（用户：「下方按键也很丑」）：
+            //   原来三个按钮**等宽平铺**（选择图片 / 识别 / 取消），主次全无 ——
+            //   而且「识别」还夹在两个次要按钮中间，用户找不到"我该点哪个"。
+            //   现在：
+            //     · 「取消」放最左、纯文字（幽灵按钮），它是退路不是主操作；
+            //     · 「选择图片…」次按钮；
+            //     · 「识别」主按钮、最右、加宽加重 —— 这是本窗口唯一的目标动作；
+            //     · 三者右对齐，不再等宽铺满整行。
             var pickBtn = DialogChrome.SecondaryButton("选择图片…", (s, a) => PickFile());
             _decodeBtn = DialogChrome.PrimaryButton("识别", (s, a) => DecodeNow());
             _decodeBtn.IsEnabled = false;
+            _decodeBtn.MinWidth = 96;
+            _decodeBtn.FontWeight = FontWeights.SemiBold;
             var cancelBtn = DialogChrome.SecondaryButton("取消", (s, a) => Close());
+            cancelBtn.Padding = new Thickness(10, 6, 10, 6);
 
-            var btns = DialogChrome.ButtonRow(pickBtn, _decodeBtn, cancelBtn);
-            btns.Margin = new Thickness(0, 14, 0, 0);
+            var btns = new StackPanel
+            {
+                Orientation = Orientation.Horizontal,
+                HorizontalAlignment = HorizontalAlignment.Right,
+                Margin = new Thickness(0, 16, 0, 0),
+            };
+            cancelBtn.Margin = new Thickness(0, 0, 8, 0);
+            pickBtn.Margin = new Thickness(0, 0, 8, 0);
+            btns.Children.Add(cancelBtn);
+            btns.Children.Add(pickBtn);
+            btns.Children.Add(_decodeBtn);
             Grid.SetRow(btns, 4);
             root.Children.Add(btns);
 

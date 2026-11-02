@@ -368,6 +368,11 @@
         <Setter Property="ScrollViewer.HorizontalScrollBarVisibility" Value="Disabled"/>
         <Setter Property="VirtualizingPanel.IsVirtualizing" Value="True"/>
         <Setter Property="VirtualizingPanel.VirtualizationMode" Value="Recycling"/>
+        <!-- 🚨 分组会**默认关掉虚拟化**：只要 GroupDescriptions 非空，
+             WPF 就退回非虚拟化模式，几千个任务时一次性生成全部容器 →
+             界面直接卡死。这一条打开分组下的虚拟化（.NET 4.5+ 支持）。
+             任务列表是两级分组的，缺了它等于白分组。 -->
+        <Setter Property="VirtualizingPanel.IsVirtualizingWhenGrouping" Value="True"/>
         <Setter Property="ScrollViewer.CanContentScroll" Value="True"/>
         <Setter Property="Template">
             <Setter.Value>
@@ -375,6 +380,56 @@
                     <ScrollViewer Focusable="False" Padding="{TemplateBinding Padding}">
                         <ItemsPresenter/>
                     </ScrollViewer>
+                </ControlTemplate>
+            </Setter.Value>
+        </Setter>
+    </Style>
+
+
+    <!-- ══════════════════════════════════════════════════════════════
+         续传列表行容器（2026-11-01 大改）
+         ══════════════════════════════════════════════════════════════
+         用户反馈：「当前选中状态框、下方按键以及整体界面都很丑」。
+
+         原来的问题：
+           · 选中是 WPF 默认的系统蓝矩形，套在圆角界面里非常突兀；
+           · 行与行之间没有边界，6 个文件糊成一片；
+           · 复选框、文件名、大小、状态标记全挤在一行，没有层级。
+
+         现在：
+           · 每行是一张**圆角卡片**（8px），悬停浅底，选中用主色淡底 + 主色描边；
+           · 行间 4px 间距，一眼能数清几条；
+           · 内容由 ItemTemplate 负责三段式排版（复选框 / 文本 / 状态）。
+    -->
+    <Style x:Key="PendingListItem" TargetType="ListBoxItem">
+        <Setter Property="Padding" Value="0"/>
+        <Setter Property="Margin" Value="0,0,0,4"/>
+        <Setter Property="HorizontalContentAlignment" Value="Stretch"/>
+        <Setter Property="SnapsToDevicePixels" Value="True"/>
+        <Setter Property="FocusVisualStyle" Value="{x:Null}"/>
+        <Setter Property="Template">
+            <Setter.Value>
+                <ControlTemplate TargetType="ListBoxItem">
+                    <Border x:Name="Bd"
+                            CornerRadius="8"
+                            Background="Transparent"
+                            BorderBrush="Transparent"
+                            BorderThickness="1"
+                            Padding="12,9">
+                        <ContentPresenter/>
+                    </Border>
+                    <ControlTemplate.Triggers>
+                        <Trigger Property="IsMouseOver" Value="True">
+                            <Setter TargetName="Bd" Property="Background"
+                                    Value="{DynamicResource SurfaceAltBrush}"/>
+                        </Trigger>
+                        <Trigger Property="IsSelected" Value="True">
+                            <Setter TargetName="Bd" Property="Background"
+                                    Value="{DynamicResource PrimarySoftBrush}"/>
+                            <Setter TargetName="Bd" Property="BorderBrush"
+                                    Value="{DynamicResource PrimaryBrush}"/>
+                        </Trigger>
+                    </ControlTemplate.Triggers>
                 </ControlTemplate>
             </Setter.Value>
         </Setter>

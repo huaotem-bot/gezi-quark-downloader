@@ -77,6 +77,39 @@ public class DownloadService : AbstractDownloadService
         new ConcurrentDictionary<string, Chunk>(StringComparer.Ordinal);
 
     /// <summary>
+    /// 分片表读写的互斥锁（2026-11-01，续传可靠性方案 A）。
+    /// <para>
+    /// 🚨🚨 为什么必须有它：<c>TrySplitChunk</c> / <c>TrySplitChunkTail</c> 的动作是两步 ——
+    /// ① <c>chunk.End = mid</c>（把原片改短）；② <c>_splitChunks[tail.Id] = tail</c>（登记新片）。
+    /// 这两步**不是原子的**。若保存快照恰好落在两步之间，快照里就是
+    /// 「原片变短了 + 新片不在」→ 分片表出现一个空洞 →
+    /// <c>ResumeState.IsUsable()</c> 判不连续 → **整份续传被丢弃 → 从零重下**。
+    /// </para>
+    /// <para>
+    /// 实测证据（用户日志 2026-11-01）：6 次空洞全部**恰好 524288 字节 = 512 KiB**，
+    /// 起点全部落在 X.5 MiB，时间点全在下载开始后 1~6 秒 ——
+    /// 512KiB 正是 <c>PreemptMinBytes</c> 的默认值，说明就是切分瞬间被快照撞上了。
+    /// </para>
+    /// <para>
+    /// 锁内只做「改 End + 登记新片」这一组极短的操作，不含任何 I/O，
+    /// 因此不会影响下载吞吐（实测每任务切分几十次，每次微秒级）。
+    /// </para>
+    /// </summary>
+    private readonly object _chunkTableLock = new object();
+
+    /// <summary>
+    /// 保存快照期间**暂停切分**（2026-11-01，续传可靠性方案 E）。
+    /// <para>
+    /// 锁（方案 A）已经保证了「改 End + 登记新片」的原子性，但保存本身要遍历全表、
+    /// 调 <c>FlushAsync</c>、裁剪 Position，耗时可能几十毫秒。
+    /// 这段时间里切分线程会一直阻塞在锁上 —— 与其阻塞，不如让它们**直接跳过这一轮**：
+    /// 切分本来就是「下次再切也行」的优化，跳过一轮对吞吐没有可感知影响，
+    /// 却能让保存更快完成，进一步降低撞进中间态的概率。
+    /// </para>
+    /// </summary>
+    private volatile bool _chunkSplitPaused;
+
+    /// <summary>
     /// 末段补片的串行闸门。
     /// <para>
     /// 队列空时会有**多个 worker 同时**调 <c>TryRefillTail</c>，若不串行，
@@ -824,7 +857,35 @@ public class DownloadService : AbstractDownloadService
             return null;
         }
 
-        if (state == null || !state.IsUsable())
+        if (state == null)
+        {
+            return null;
+        }
+
+        // 🚨 2026-11-01（方案 C）：不再要求「严格连续」。
+        //    只要分片表**完整覆盖**整个文件（首片从 0 开始、末片覆盖到末尾），
+        //    中间的洞就补成「待下分片」继续用 —— 这样用户「想怎么续传就怎么续传」，
+        //    不会再因为一处 512KB 的空洞丢掉整份进度。
+        //    洞里的字节由补出来的分片负责下载，所以不会产出「长度对、内容坏」的文件。
+        if (!state.IsUsable())
+        {
+            if (state.CoversAll())
+            {
+                int filled = state.FillGapsWithPendingChunks();
+                if (filled > 0)
+                {
+                    _logger?.LogDebug(string.Format(
+                        "续传表有 {0} 处空洞，已补成待下分片继续续传（不会从零重下）", filled));
+                }
+            }
+            else
+            {
+                // 首尾都没盖住 → 状态真的坏了，整份作废
+                return null;
+            }
+        }
+
+        if (!state.IsUsable() && !state.CoversAll())
         {
             return null;
         }
@@ -880,8 +941,13 @@ public class DownloadService : AbstractDownloadService
 
             if (c.Start != expect)
             {
-                // 表本身不连续：不敢相信任何前缀，退回让落盘层按文件长度处理（最坏是重下）
-                return -1;
+                // 🚨 2026-11-01（方案 C）：表中间有洞时，**不能**返回 -1。
+                //    -1 的含义是「不敢相信任何前缀，让落盘层按文件长度处理」——
+                //    而文件长度里可能包含洞里那段没下过的字节（预分配/空洞），
+                //    那正是「长度对、内容坏」的来源。
+                //    正解：返回**洞之前那段连续可信前缀**的长度（expect）。
+                //    落盘层从 expect 往后重新刷，洞里的字节由补出来的分片重新下载。
+                return expect;
             }
 
             if (c.Position < c.Length)
@@ -1110,17 +1176,32 @@ public class DownloadService : AbstractDownloadService
 
         // 必须把抢占切出来的新片一起算进去：原片的 End 已被改小，后半段只存在于 _splitChunks，
         // 漏了它就会在分片表里留下空洞，IsUsable() 判不连续后整份续传被丢弃。
-        var all = new List<Chunk>(chunks.Length + _splitChunks.Count);
-        all.AddRange(chunks.Where(c => c != null));
-        foreach (var extra in _splitChunks.Values)
+        // 🚨 2026-11-01（方案 E）：保存期间暂停切分。
+        //    锁已经保证原子性，但保存要遍历全表 + FlushAsync + 裁剪，可能几十毫秒；
+        //    这段时间让切分线程直接跳过，比让它们阻塞在锁上更快、更安全。
+        //    ⚠️ 必须在 try/finally 里复位，否则保存中途抛异常会让切分永久停摆。
+        _chunkSplitPaused = true;
+        try
         {
-            if (extra != null)
-            {
-                all.Add(extra);
-            }
-        }
 
-        var sorted = all.OrderBy(c => c.Start).ToArray();
+        // 🚨 2026-11-01（方案 A）：读分片表必须与「切分」互斥。
+        //    否则可能读到「原片已改短、新片还没登记」的中间态 —— 那正好是一个空洞，
+        //    会让整份续传被 IsUsable() 判废（实测每次都恰好缺 512KiB）。
+        Chunk[] sorted;
+        lock (_chunkTableLock)
+        {
+            var all = new List<Chunk>(chunks.Length + _splitChunks.Count);
+            all.AddRange(chunks.Where(c => c != null));
+            foreach (var extra in _splitChunks.Values)
+            {
+                if (extra != null)
+                {
+                    all.Add(extra);
+                }
+            }
+
+            sorted = all.OrderBy(c => c.Start).ToArray();
+        }
         if (sorted.Length == 0)
         {
             return;
@@ -1194,30 +1275,55 @@ public class DownloadService : AbstractDownloadService
             state.Chunks[i] = new ResumeChunk { Start = c.Start, End = c.End, Position = position };
         }
 
+        // 🚨 2026-11-01（方案 B）：先尝试**吃掉小空洞**再判可用性。
+        //    原来是一处空洞就让整份作废（实测那空洞恰好只有 512KiB，
+        //    却让 178MB 的续传从零重下）。补洞的代价只是重下那几百 KB。
+        //    只有 gap 超过 16MB（说明状态真坏了）才仍然整份作废 —— 那是正确的。
         if (!state.IsUsable())
         {
-            // 分片表有空洞或越界 → 宁可不存也不能存坏表（下次会从零开始，至少不会写坏文件）。
-            // 这条日志很关键：没有它，「取消后没有续传文件」看起来就像保存根本没被调用。
-            long expect = 0;
-            string firstGap = "";
-            foreach (var rc in sorted)
+            int filled = state.NormalizeGaps();
+            if (filled > 0)
             {
-                if (rc.Start != expect)
+                _logger?.LogDebug(
+                    string.Format("续传状态有 {0} 处小空洞，已并入相邻分片（续传时重下这几段，不影响其余进度）",
+                        filled));
+            }
+        }
+
+        if (!state.IsUsable())
+        {
+            // 🚨 2026-11-01（方案 C）：补洞后仍不连续时，只要**完整覆盖**就照样存 ——
+            //    加载侧会把它补成待下分片继续用（见 LoadResumeAsync）。
+            //    真正要丢弃的只有「首尾都没盖住」这种彻底坏掉的状态。
+            if (state.CoversAll())
+            {
+                _logger?.LogDebug("续传表带空洞但完整覆盖，已保存（加载时会补成待下分片）");
+            }
+            else
+            {
+                // 首尾没盖住 → 存下去也没用，只会让下次白读一次。
+                // 这条日志很关键：没有它，「取消后没有续传文件」看起来就像保存根本没被调用。
+                long expect = 0;
+                string firstGap = "";
+                foreach (var rc in state.Chunks)
                 {
-                    firstGap = string.Format("首处不连续：期望 Start={0}，实际 {1}（End={2}）", expect, rc.Start, rc.End);
-                    break;
+                    if (rc.Start != expect)
+                    {
+                        firstGap = string.Format("首处不连续：期望 Start={0}，实际 {1}（End={2}）", expect, rc.Start, rc.End);
+                        break;
+                    }
+
+                    expect = rc.End + 1;
                 }
 
-                expect = rc.End + 1;
-            }
+                if (firstGap.Length == 0)
+                {
+                    firstGap = string.Format("末片 End 与总长不符：覆盖到 {0}，总长 {1}", expect, state.TotalBytes);
+                }
 
-            if (firstGap.Length == 0)
-            {
-                firstGap = string.Format("末片 End 与总长不符：覆盖到 {0}，总长 {1}", expect, state.TotalBytes);
+                _logger?.LogWarning("续传状态不可用，已丢弃：" + firstGap);
+                return;
             }
-
-            _logger?.LogWarning("续传状态不可用，已丢弃：" + firstGap);
-            return;
         }
 
         try
@@ -1231,6 +1337,12 @@ public class DownloadService : AbstractDownloadService
         catch
         {
             // 状态存不下不影响下载本身
+        }
+        }
+        finally
+        {
+            // 无论成功/失败/异常，都必须恢复切分，否则引擎会永久不再切分。
+            _chunkSplitPaused = false;
         }
     }
 
@@ -2055,6 +2167,9 @@ public class DownloadService : AbstractDownloadService
     /// <param name="tailBytes">要切出的尾巴大小（字节）。</param>
     private bool TrySplitChunkTail(Chunk chunk, ChunkQueue queue, long tailBytes)
     {
+        // 保存快照期间不切分（方案 E）：切分是「下次再切也行」的优化，跳过一轮无感知。
+        if (_chunkSplitPaused) return false;
+
         long pos = Interlocked.Read(ref chunk.PositionRaw);
         long curStart = chunk.Start + pos;
         long curEnd = chunk.End;
@@ -2068,18 +2183,22 @@ public class DownloadService : AbstractDownloadService
         long newEnd = tailStart - 1;
 
         // 先改原片 End，再入队 —— 顺序与 TrySplitChunk 一致（理由见那里的注释）。
-        chunk.End = newEnd;
-
-        var tail = new Chunk(tailStart, curEnd)
+        // 同 TrySplitChunk：改 End 与登记新片必须原子（方案 A）。
+        lock (_chunkTableLock)
         {
-            Id = chunk.Id + "t_" + Guid.NewGuid().ToString("N").Substring(0, 6),
-            MaxTryAgainOnFailover = chunk.MaxTryAgainOnFailover,
-            Timeout = chunk.Timeout
-        };
+            chunk.End = newEnd;
 
-        queue.Enqueue(tail);
-        _splitChunks[tail.Id] = tail;
-        _logger?.LogDebug($"TailRefill: chunk {chunk.Id} tail {tail.Id} ({tailBytes} bytes, {tailStart}-{curEnd})");
+            var tail = new Chunk(tailStart, curEnd)
+            {
+                Id = chunk.Id + "t_" + Guid.NewGuid().ToString("N").Substring(0, 6),
+                MaxTryAgainOnFailover = chunk.MaxTryAgainOnFailover,
+                Timeout = chunk.Timeout
+            };
+
+            queue.Enqueue(tail);
+            _splitChunks[tail.Id] = tail;
+            _logger?.LogDebug($"TailRefill: chunk {chunk.Id} tail {tail.Id} ({tailBytes} bytes, {tailStart}-{curEnd})");
+        }
         return true;
     }
 
@@ -2096,6 +2215,9 @@ public class DownloadService : AbstractDownloadService
     /// </param>
     private bool TrySplitChunk(Chunk chunk, ChunkQueue queue, CancellationToken cancel, long minBytes)
     {
+        // 保存快照期间不切分（方案 E）。
+        if (_chunkSplitPaused) return false;
+
         long pos = Interlocked.Read(ref chunk.PositionRaw);
         long curStart = chunk.Start + pos;
         long curEnd = chunk.End;
@@ -2110,18 +2232,23 @@ public class DownloadService : AbstractDownloadService
         // 顺序很重要：若先入队再改 End，后半段可能被 worker 立刻领走并开始下载，
         // 而原分片仍以为 End 是旧值，两边就会下同一段（虽然写盘位置不同不会损坏，
         // 但白白浪费带宽）。
-        chunk.End = mid;
-
-        var tail = new Chunk(mid + 1, curEnd)
+        // 2026-11-01（方案 A）：「改 End + 登记新片」必须原子，否则保存快照会撞进中间态。
+        // 锁内不含任何 I/O，微秒级，对吞吐无影响。
+        lock (_chunkTableLock)
         {
-            Id = chunk.Id + "_" + Guid.NewGuid().ToString("N").Substring(0, 6),
-            MaxTryAgainOnFailover = chunk.MaxTryAgainOnFailover,
-            Timeout = chunk.Timeout
-        };
+            chunk.End = mid;
 
-        queue.Enqueue(tail);
-        _splitChunks[tail.Id] = tail;
-        _logger?.LogDebug($"Preempted chunk {chunk.Id}: split at {mid}, tail={tail.Id} ({curEnd - mid} bytes)");
+            var tail = new Chunk(mid + 1, curEnd)
+            {
+                Id = chunk.Id + "_" + Guid.NewGuid().ToString("N").Substring(0, 6),
+                MaxTryAgainOnFailover = chunk.MaxTryAgainOnFailover,
+                Timeout = chunk.Timeout
+            };
+
+            queue.Enqueue(tail);
+            _splitChunks[tail.Id] = tail;
+            _logger?.LogDebug($"Preempted chunk {chunk.Id}: split at {mid}, tail={tail.Id} ({curEnd - mid} bytes)");
+        }
         return true;
     }
 

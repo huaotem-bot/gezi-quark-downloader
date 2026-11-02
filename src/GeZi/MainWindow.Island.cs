@@ -245,7 +245,9 @@ namespace GeZi
                 //    实际前 8 个早就在下了 —— 这是用户明确反馈过的误解。
                 if (_islandJobs > 0)
                 {
-                    text = "已开始下载 · 直链准备 "
+                    // 2026-11-01（用户反馈「文案不准确，同时执行取链和下载，却只写直链获取」）：
+                    // 两个进度都要报 —— 左边是已入队下载的文件数，右边是取链进度。
+                    text = "下载中 " + _islandJobs + " · 直链准备 "
                         + _islandShownQueued + "/" + _islandChainTotal;
                 }
                 else

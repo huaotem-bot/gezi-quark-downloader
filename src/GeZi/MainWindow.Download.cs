@@ -968,10 +968,15 @@ namespace GeZi
             if (jobs.Count == 0) { Log("没有可下载的条目。"); return; }
 
             LogAllocation(alloc);
+            // 「下载这些文件」也是**一次下载**，同样自成一个二级分组。
+            // 这条路径没有 ShareFileItem，用条目里的 RelDir 顶层目录名当任务名。
+            var taskGroup = MakeTaskGroupFromItems(items);
             // 一次性加：可能一次几百条，逐条加会让分组视图反复重排
             var reuseRows = new List<TaskItem>(jobs.Count);
             foreach (var job in jobs)
-                reuseRows.Add(new TaskItem(job, job.Name));
+                reuseRows.Add(new TaskItem(job, job.Name,
+                    taskGroup != null ? taskGroup.Id : null,
+                    taskGroup != null ? taskGroup.Name : null));
             AddTaskRows(reuseRows);
             Log("已加入下载队列: " + jobs.Count + " 个文件（复用已取链接）");
             // 不直接跳页签，改用灵动岛提示（用户 2026-10-26 要求）
@@ -1062,7 +1067,12 @@ namespace GeZi
                 // 以前要等**全部**文件取完直链才建任务、才开始下载 ——
                 // 2000 个文件时要干等好几分钟，界面像卡死。
                 // 现在按块取链，每块取到立刻入队并开始下载，后面的块在后台继续取。
-                await QueueInChunksAsync(files, forceNoSave, srcKind, ct);
+                // 🚨 2026-11-01 两级分组：这一次「点下载」选中的所有文件 = 一个任务，
+                //   它们要在列表里折叠到同一个二级分组下面（用户要求）。
+                //   ID 必须唯一 —— 两次下载可能选同名目录，按名字分会把两个任务并成一个。
+                var taskGroup = MakeTaskGroup(selected);
+
+                await QueueInChunksAsync(files, forceNoSave, srcKind, ct, taskGroup);
             }
             finally
             {
@@ -1073,8 +1083,27 @@ namespace GeZi
 
         // ==================== 取链水位（2026-10-31） ====================
 
-        /// <summary>队列里「排队中 + 下载中」的任务数低于这个值就补货。</summary>
+        /// <summary>
+        /// 队列里「排队中 + 下载中」的任务数低于这个值就补货（保留给旧路径，见
+        /// <see cref="WatermarkSatisfied"/> 里新的判据）。
+        /// </summary>
         private int _queueLowWater = 6;
+
+        /// <summary>
+        /// 🚨 2026-11-01 用户定的硬规则：**已取到直链但还没开始下载的，最多只允许
+        /// 比「正在下载的」多两个**。
+        /// <para>
+        /// 为什么：直链是有 TTL 的（夸克/UC 约几小时，阿里/迅雷更短）。原来按
+        /// <c>并发 × 2</c> 补货，并发 8 就一次预取十几条直链 —— 排在后面的那些
+        /// 等轮到它时链路可能已经过期，只能重取，既浪费请求又拖慢整体。
+        /// </para>
+        /// <para>
+        /// 这个数字**不要调大**：预取多一条就多一条可能过期的直链；
+        /// 也不能调到 0 —— 那样每次都要等上一个下完才开始取链，
+        /// 取链延迟（0.3~2 秒，转存路径更慢）会直接变成空转。
+        /// </para>
+        /// </summary>
+        private const int QueueAheadLimit = 2;
 
         /// <summary>
         /// 剩余时间预算（秒）。在跑的任务按当前总速度还能跑这么久时，也提前补货 ——
@@ -1086,12 +1115,21 @@ namespace GeZi
         /// <summary>水位满足时由 <see cref="PumpWatermark"/> 唤醒等待方。</summary>
         private TaskCompletionSource<bool> _watermarkTcs;
 
-        /// <summary>按当前并发数重算低水位（并发 3 → 6，并发 8 → 16）。</summary>
+        /// <summary>
+        /// 按当前并发数重算低水位。
+        /// <para>
+        /// 🚨 2026-11-01 改：原来是 <c>并发 × 2</c>（并发 8 → 一次预取 16 条直链），
+        /// 预取太多会让排在后面的直链白白过期。现在只留
+        /// 「正在下载的 + <see cref="QueueAheadLimit"/>」这一条缓冲，
+        /// 与实际并发数解耦 —— 并发再高也不会多囤直链。
+        /// </para>
+        /// </summary>
         private void ResetQueueWatermark()
         {
             int conc = _settings != null ? _settings.ConcurrentTasks : 3;
             if (conc < 1) conc = 1;
-            _queueLowWater = Math.Max(2, conc * 2);
+            // 下限 3：至少要够「一两条在跑 + 两条缓冲」，否则取链延迟会变成空转。
+            _queueLowWater = Math.Max(3, conc + QueueAheadLimit);
         }
 
         /// <summary>
@@ -1109,7 +1147,13 @@ namespace GeZi
         /// </summary>
         private bool WatermarkSatisfied()
         {
-            int pending = 0;
+            // 🚨 2026-11-01 用户定的硬规则：
+            //   **已取到直链但还没开始下载的，最多只比「正在下载的」多两个。**
+            //   所以判据从"总数不超过低水位"改成"排队数 ≤ 下载中数 + 2"。
+            //   这样并发 8 时最多囤 2 条直链，而不是原来的 16 条 ——
+            //   直链 TTL 有限，囤多了轮到它时已经过期，只能重取。
+            int downloading = 0;   // 正在下载
+            int queued = 0;        // 已拿到直链、排队等着下
             long remainBytes = 0;
             double speedSum = 0.0;
 
@@ -1118,10 +1162,10 @@ namespace GeZi
                 var t = _tasks[i];
                 if (t == null) continue;
                 var st = t.State;
-                if (st == JobState.Queued) { pending++; continue; }
+                if (st == JobState.Queued) { queued++; continue; }
                 if (st != JobState.Downloading) continue;
 
-                pending++;
+                downloading++;
                 if (t.Speed <= 0) continue;
 
                 long total = t.Total;
@@ -1131,8 +1175,16 @@ namespace GeZi
                 speedSum += t.Speed;
             }
 
-            if (pending <= _queueLowWater) return true;
+            // ① 主判据：排队数不超过「下载中 + 2」。
+            if (queued <= downloading + QueueAheadLimit) return true;
+
+            // ② 兜底：一个都没在下（全失败 / 全暂停 / 还没起来）时，
+            //    等下去没有意义 —— 直接放行，否则取链循环会永久卡死在这里。
+            if (downloading == 0 && queued > 0) return true;
+
+            // ③ 时间兜底：在跑的任务按当前速度马上要跑完，提前补货避免空转。
             if (speedSum > 0 && (remainBytes / speedSum) <= QueueLeadSeconds) return true;
+
             return false;
         }
 
@@ -1193,13 +1245,142 @@ namespace GeZi
         }
 
 
+        // ==================== 二级分组：一次下载 = 一个任务 ====================
+
+        /// <summary>
+        /// 一次「点下载」对应的任务分组（ID 决定分组边界，Name 决定显示什么）。
+        /// <para>为什么用类而不是直接传两个 string：分组 ID 与名字必须**成对**传递，
+        /// 拆成两个参数很容易只传一个，导致列表里出现"有名字但归错组"。</para>
+        /// </summary>
+        private sealed class TaskGroupRef
+        {
+            public string Id;
+            public string Name;
+        }
+
+        /// <summary>本次下载的任务序号（"任务 N" 里的 N）。</summary>
+        private int _taskGroupSeq;
+
+        /// <summary>
+        /// 🚨 2026-11-01 用户要求：任务序号必须**按网盘各自计数**。
+        /// <para>
+        /// 原来只有一个全局 _taskGroupSeq，于是「夸克→任务1、UC→任务2、夸克→任务3」，
+        /// 用户原话：「任务名应按其在对应网盘中的序号命名，而不是按当前分组序号；
+        /// 每个网盘分别按各自任务序列命名」。
+        /// </para>
+        /// <para>现在每家网盘一个独立计数器：夸克下永远是任务 1/2/3…，UC 也从任务 1 开始。</para>
+        /// </summary>
+        private readonly Dictionary<PanKind, int> _taskSeqByPan = new Dictionary<PanKind, int>();
+
+        /// <summary>
+        /// 已经用过的任务显示名。第二级分组键用的是**显示名**，
+        /// 而 WPF 按「键相等」归组 —— 两次都叫「新建文件夹」的任务会被并成一组，
+        /// 用户会看到"一个任务里混了两批文件"。这里保证同名自动追加序号。
+        /// </summary>
+        private readonly HashSet<string> _taskGroupNamesUsed = new HashSet<string>();
+
+        /// <summary>
+        /// 为这一次「点下载」造一个任务分组。
+        /// <para>
+        /// 名字优先用**选中的那个目录名**（用户下了一整个文件夹时，"任务 1" 毫无意义，
+        /// 文件夹名才看得出这是什么）；只选了散文件时才退回"任务 N"。
+        /// </para>
+        /// <para>
+        /// ID 用「时间戳 + 序号」而不是名字：两次下载选同名目录是常事，
+        /// 按名字分组会把两个不同任务并成一个，用户会看到"一个任务里混了两批文件"。
+        /// </para>
+        /// </summary>
+        /// <summary>
+        /// 为「下载这些文件」（<see cref="StartDownloadFromItems"/>）造任务分组。
+        /// <para>与 <see cref="MakeTaskGroup"/> 的区别只是名字来源：这里没有
+        /// <see cref="ShareFileItem"/>，只能用条目 <c>RelDir</c> 的顶层目录名。</para>
+        /// </summary>
+        private TaskGroupRef MakeTaskGroupFromItems(IList<DownloadItem> items)
+        {
+            string name = null;
+            if (items != null && items.Count > 0)
+            {
+                string top = null;
+                bool same = true;
+                for (int i = 0; i < items.Count; i++)
+                {
+                    string rel = items[i] != null ? (items[i].RelDir ?? "") : "";
+                    int cut = rel.IndexOfAny(new[] { '/', '\\' });
+                    string seg = cut > 0 ? rel.Substring(0, cut) : "";
+                    if (i == 0) top = seg;
+                    else if (!string.Equals(top, seg, StringComparison.Ordinal)) { same = false; break; }
+                }
+                if (same && !string.IsNullOrWhiteSpace(top)) name = top.Trim();
+            }
+            return NewTaskGroupRef(name, DownloadPanKind);
+        }
+
+
+        /// <summary>
+        /// 造一个任务分组（两条下载入口共用）。
+        /// <para>
+        /// <paramref name="name"/> 为空 → 自动叫「任务 N」。
+        /// 重名自动追加序号 —— 第二级分组键用的就是**显示名**，
+        /// 而 WPF 按"键相等"归组，两次都叫「新建文件夹」的任务会被并成一个。
+        /// </para>
+        /// </summary>
+        private TaskGroupRef NewTaskGroupRef(string name, PanKind kind)
+        {
+            // 序号按**网盘各自计数**（见 _taskSeqByPan 的注释）。
+            int panSeq;
+            _taskSeqByPan.TryGetValue(kind, out panSeq);
+            panSeq++;
+            _taskSeqByPan[kind] = panSeq;
+
+            int seq = ++_taskGroupSeq;   // 仅用于生成唯一 ID，不参与显示
+            if (string.IsNullOrWhiteSpace(name))
+                name = "任务 " + panSeq;
+
+            if (!_taskGroupNamesUsed.Add(name))
+            {
+                int dup = 2;
+                string candidate;
+                do { candidate = name + " (" + dup + ")"; dup++; }
+                while (!_taskGroupNamesUsed.Add(candidate));
+                name = candidate;
+            }
+
+            return new TaskGroupRef
+            {
+                Id = "tg:" + DateTime.Now.Ticks.ToString() + ":" + seq,
+                Name = name,
+            };
+        }
+
+
+        private TaskGroupRef MakeTaskGroup(IList<ShareFileItem> selected)
+        {
+            // 只选了一个**目录**时用目录名当任务名（最常见的"下整个文件夹"场景）。
+            string name = null;
+            if (selected != null && selected.Count > 0)
+            {
+                ShareFileItem dir = null;
+                for (int i = 0; i < selected.Count; i++)
+                {
+                    var it = selected[i];
+                    if (it == null || !it.IsDir) { dir = null; break; }
+                    if (dir == null) dir = it;
+                }
+                if (dir != null && selected.Count == 1 && !string.IsNullOrWhiteSpace(dir.Name))
+                    name = dir.Name.Trim();
+            }
+            // 序号按「这次下载来自哪家网盘」计数（分享看 _panKind、自有看 _activeKind）。
+            return NewTaskGroupRef(name, DownloadPanKind);
+        }
+
+
         /// <summary>
         /// 顺次取链 + 顺次下载。
         /// 按块取链，每块取到立刻建任务、入队、开始下载；后面的块继续在后台取。
         /// 取链进度通过灵动岛显示（见 <see cref="SetIslandChainProgress"/>）。
         /// </summary>
         private async Task QueueInChunksAsync(List<ShareFileItem> files, bool forceNoSave,
-            PanKind srcKind, CancellationToken ct)
+            PanKind srcKind, CancellationToken ct, TaskGroupRef taskGroup = null)
         {
             // 每块 30 个：够填满并发，又不至于让首块等太久。
             // 🚨 首块单独缩小到 8 个：2000 个文件时用户最在意的是「点了多久才真正开始下载」，
@@ -1282,7 +1463,9 @@ namespace GeZi
                     // 整块一次性加进列表：30 条只触发 1 次视图刷新（见 AddTaskRows 注释）
                     var newRows = new List<TaskItem>(jobs.Count);
                     foreach (var job in jobs)
-                        newRows.Add(new TaskItem(job, job.Name));
+                        newRows.Add(new TaskItem(job, job.Name,
+                            taskGroup != null ? taskGroup.Id : null,
+                            taskGroup != null ? taskGroup.Name : null));
                     AddTaskRows(newRows);
                     chain.AllJobs.AddRange(jobs);
                     queued += jobs.Count;

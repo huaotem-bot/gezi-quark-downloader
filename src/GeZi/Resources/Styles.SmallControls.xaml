@@ -282,4 +282,52 @@
         </Setter>
     </Style>
 
+
+    <!-- 续传界面专用复选框（2026-11-01 重做）
+         原生 WPF 方框与这套自绘 UI 不在一个体系（用户：「续传界面非常丑」）。
+         这里换成 18px 圆角方框 + 主色勾，勾选有轻微底色反馈。 -->
+    <Style x:Key="PendingCheckBox" TargetType="CheckBox">
+        <Setter Property="Width" Value="18"/>
+        <Setter Property="Height" Value="18"/>
+        <Setter Property="Cursor" Value="Hand"/>
+        <Setter Property="Template">
+            <Setter.Value>
+                <ControlTemplate TargetType="CheckBox">
+                    <Border x:Name="Box" Width="18" Height="18"
+                            CornerRadius="5"
+                            Background="Transparent"
+                            BorderBrush="{DynamicResource BorderBrushStrong}"
+                            BorderThickness="1.5">
+                        <Path x:Name="Tick"
+                              Data="M2,6 L5.5,9.5 L11,3"
+                              Stretch="Uniform" Width="9" Height="9"
+                              HorizontalAlignment="Center" VerticalAlignment="Center"
+                              Stroke="{DynamicResource TextOnPrimaryBrush}"
+                              StrokeThickness="2"
+                              StrokeStartLineCap="Round"
+                              StrokeEndLineCap="Round"
+                              StrokeLineJoin="Round"
+                              Visibility="Collapsed"/>
+                    </Border>
+                    <ControlTemplate.Triggers>
+                        <Trigger Property="IsChecked" Value="True">
+                            <Setter TargetName="Box" Property="Background"
+                                    Value="{DynamicResource TextPrimaryBrush}"/>
+                            <Setter TargetName="Box" Property="BorderBrush"
+                                    Value="{DynamicResource TextPrimaryBrush}"/>
+                            <Setter TargetName="Tick" Property="Visibility" Value="Visible"/>
+                        </Trigger>
+                        <Trigger Property="IsMouseOver" Value="True">
+                            <Setter TargetName="Box" Property="BorderBrush"
+                                    Value="{DynamicResource TextPrimaryBrush}"/>
+                        </Trigger>
+                        <Trigger Property="IsEnabled" Value="False">
+                            <Setter TargetName="Box" Property="Opacity" Value="0.35"/>
+                        </Trigger>
+                    </ControlTemplate.Triggers>
+                </ControlTemplate>
+            </Setter.Value>
+        </Setter>
+    </Style>
+
 </ResourceDictionary>

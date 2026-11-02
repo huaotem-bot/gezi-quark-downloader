@@ -666,10 +666,18 @@ namespace GeZi
         {
             get
             {
-                if (string.IsNullOrEmpty(Dest) || string.IsNullOrEmpty(Fid)) return false;
-                if (FromShare) return !string.IsNullOrEmpty(Token) && !string.IsNullOrEmpty(PwdId)
-                                  && !string.IsNullOrEmpty(Stoken);
-                return true;   // 我的网盘：只需 fid
+                // 判据已抽到 GeZi.Core 的 ResumePolicy（纯函数，自检可直接覆盖）。
+                // 🚨 2026-11-02 撤销 2026-11-01 的 Size<=0 禁选 —— 那两个理由都是错的：
+                //   ① 「AllocateThreads 按大小分配，Size=0 分不到合理值」：
+                //      错。ThreadAllocator 对未知大小会退回平分，n==1 时直接给满。
+                //   ② 「续传时 TotalBytes 与 0 对不上」：
+                //      错。那个 totalBytes 来自引擎自己 GetFileSize() 探测，与本字段无关。
+                //   ⇒ 禁选纯属自伤：用户「刚点下载、还没写盘就重启」时 Size 必然是 0，
+                //      于是被挡住、标「需重新解析」，用户以为续传坏了，实际是被我拦了。
+                // 必须把 PanKindValue 一起传进去：阿里/迅雷的分享任务不需要 stoken
+                //（取链在 provider 内部完成），用统一判据会把它们误判成不可续传。
+                return GeZi.Core.Models.ResumePolicy.CanResume(
+                    Dest, Fid, FromShare, Token, PwdId, Stoken, PanKindValue);
             }
         }
     }
