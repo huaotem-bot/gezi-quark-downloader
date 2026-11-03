@@ -69,8 +69,19 @@ namespace GeZi
 
         private WebView2 _web;
         private TextBlock _status;
+
+        /// <summary>状态圆点（2026-11-03 新增）：颜色随状态变，替代原来的一长串技术说明。</summary>
+        private System.Windows.Shapes.Ellipse _statusDot;
+
+        /// <summary>
+        /// 打开时是否先清掉内嵌浏览器的登录状态（见构造函数的参数说明）。
+        /// <para>true = 登新账号；false = 自动续期（必须保留会话）。</para>
+        /// </summary>
+        private readonly bool _clearSessionOnStart;
         private Button _manualBtn;
-        private Button _switchBtn;
+        // 🚨 2026-11-03：「换账号」按钮已从界面删除（用户要求），
+        //   _switchBtn 字段随之移除。SwitchAccountAsync 里那几处引用已改成无操作，
+        //   避免留下一个永远为 null 的死字段（编译器会报 CS0649）。
 
         private System.Windows.Threading.DispatcherTimer _poll;
         private DateTime _lastValidateAt = DateTime.MinValue;
@@ -90,11 +101,32 @@ namespace GeZi
         /// <param name="kind">要登录的网盘。</param>
         /// <param name="onCaptured">拿到并验证通过的 Cookie（原始整串）。</param>
         /// <param name="log">日志回调（可为 null）。</param>
-        public WebLoginWindow(PanKind kind, Action<string> onCaptured, Action<string> log)
+        /// <param name="clearSessionOnStart">
+        /// 打开时是否先清掉内嵌浏览器记住的登录状态。
+        /// <para>
+        /// 🚨🚨 2026-11-03 新增，**这是本轮最关键的一个参数**。
+        /// </para>
+        /// <para>
+        /// 背景：内嵌浏览器按网盘固定 profile（profile-aliyun / -xunlei …），
+        /// 上一次登录的 Cookie 一直在，页面一打开服务端就把你当老用户，
+        /// 直接跳进已登录首页 —— 用户报「点登录账号，几乎瞬间就关掉了，根本没法登新账号」。
+        /// </para>
+        /// <para>
+        /// <b>true</b> = 用户主动要登**新账号**（点「登录账号」/ 账号列表「去登录新账号」/ 注册）→ 先清 Cookie。
+        /// </para>
+        /// <para>
+        /// <b>false</b> = **自动续期**那条路（<c>MainWindow.AliyunRenew</c>）→ 绝对不能清！
+        /// 阿里的续期手段正是「重开一次内嵌登录，让 profile 里的老会话自己把页面登好」，
+        /// 清了 Cookie 这个机制会 100% 失效，用户会看到「凭证已保存但一直用不了」。
+        /// </para>
+        /// </param>
+        public WebLoginWindow(PanKind kind, Action<string> onCaptured, Action<string> log,
+            bool clearSessionOnStart = false)
         {
             _kind = kind;
             _onCaptured = onCaptured;
             _log = log;
+            _clearSessionOnStart = clearSessionOnStart;
 
             Title = PanUrlParser.DisplayNameOf(kind) + " 登录";
             // 与其它弹窗统一：自绘标题栏 + 主题背景 + 主题字体。
@@ -124,6 +156,10 @@ namespace GeZi
             top.SetResourceReference(Border.BackgroundProperty, "AppBgBrush");
             top.SetResourceReference(Border.BorderBrushProperty, "BorderBrushSoft");
 
+            // 🚨 2026-11-03 重做顶部（用户报「怎么这么多奇怪的字，普通用户根本不懂」）：
+            //   原来三行：标题 / 「在下方页面完成登录，成功后会自动保存凭证。」/ 状态。
+            //   现在两行：标题 + 状态，状态前面带一个彩色圆点。
+            //   技术细节（Cookie 数量、__pus 等）全部进日志，不进界面。
             var topPanel = new StackPanel();
             var titleRow = new StackPanel { Orientation = Orientation.Horizontal };
             var titleText = new TextBlock
@@ -137,24 +173,32 @@ namespace GeZi
             titleRow.Children.Add(titleText);
             topPanel.Children.Add(titleRow);
 
-            var subText = new TextBlock
+            // 状态行：圆点 + 一句话（圆点颜色随状态变，比长句更直观）
+            var statusRow = new StackPanel
             {
-                Text = "在下方页面完成登录，成功后会自动保存凭证。",
-                FontSize = 12,
-                Margin = new Thickness(0, 4, 0, 0),
+                Orientation = Orientation.Horizontal,
+                Margin = new Thickness(0, 8, 0, 0),
             };
-            subText.SetResourceReference(TextBlock.ForegroundProperty, "TextTertiaryBrush");
-            topPanel.Children.Add(subText);
+            _statusDot = new System.Windows.Shapes.Ellipse
+            {
+                Width = 7,
+                Height = 7,
+                VerticalAlignment = VerticalAlignment.Center,
+                Margin = new Thickness(0, 0, 8, 0),
+            };
+            _statusDot.SetResourceReference(System.Windows.Shapes.Shape.FillProperty, "TextTertiaryBrush");
+            statusRow.Children.Add(_statusDot);
 
             _status = new TextBlock
             {
-                Text = "正在加载登录页…",
-                FontSize = 12,
-                Margin = new Thickness(0, 8, 0, 0),
+                Text = "正在加载…",
+                FontSize = 12.5,
+                VerticalAlignment = VerticalAlignment.Center,
                 TextWrapping = TextWrapping.Wrap,
             };
             _status.SetResourceReference(TextBlock.ForegroundProperty, "TextSecondaryBrush");
-            topPanel.Children.Add(_status);
+            statusRow.Children.Add(_status);
+            topPanel.Children.Add(statusRow);
             top.Child = topPanel;
             Grid.SetRow(top, 0);
             root.Children.Add(top);
@@ -184,17 +228,16 @@ namespace GeZi
             //   修法：给一个「换账号」——只清**内嵌浏览器自己的** Cookie 与本地存储，
             //   软件里已经保存的账号凭证（Settings 里的 Cookie / refresh_token）**一个字都不动**，
             //   所以自动续期的账号不会掉；清完重新打开登录页就是干净的登录界面。
-            _switchBtn = DialogChrome.SecondaryButton("换账号");
-            _switchBtn.ToolTip = "清掉内嵌浏览器记住的上次登录状态，用另一个账号登录。\n"
-                + "已保存的账号不受影响，不会被登出。";
-            _switchBtn.Click += async (s, e) => await SwitchAccountAsync();
-            _switchBtn.IsEnabled = false;   // CoreWebView2 就绪后才可用
+            // 🚨🚨 2026-11-03（用户明确要求）：**删掉「换账号」按钮**。
+            //   理由：窗口现在**默认就是新账号模式**（打开时先清 Cookie，见 OnLoaded），
+            //   「换账号」已经冗余。用户要换账号只需关掉窗口重新点一次「登录账号」。
+            //   ⚠️ SwitchAccountAsync 方法保留 —— 它被「打开时清 Cookie」复用。
 
             var closeBtn = DialogChrome.SecondaryButton("取消");
             closeBtn.IsCancel = true;
             closeBtn.Click += (s, e) => Close();
 
-            var btnRow = DialogChrome.ButtonRow(_switchBtn, _manualBtn, closeBtn);
+            var btnRow = DialogChrome.ButtonRow(_manualBtn, closeBtn);
             btnRow.HorizontalAlignment = HorizontalAlignment.Right;
             bottom.Child = btnRow;
             Grid.SetRow(bottom, 2);
@@ -240,8 +283,27 @@ namespace GeZi
                         : "页面加载失败（" + e2.WebErrorStatus + "），可点「导入 Cookie」。";
                 };
 
+                // 🚨🚨 2026-11-03：登新账号时必须先清掉内嵌浏览器记住的登录状态。
+                //   否则阿里/迅雷的页面会**瞬间跳进已登录首页**（用户报「点登录账号
+                //   几乎瞬间就把页面关掉了」），根本没法输入新账号。
+                //   ⚠️ 自动续期那条路传的是 false，**绝不能**清 —— 它正是靠 profile 里
+                //      的老会话把页面自动登好来抓新令牌的。
+                if (_clearSessionOnStart)
+                {
+                    SetStatus("正在准备登录…");
+                    try
+                    {
+                        await ClearBrowsingDataAsync(_web.CoreWebView2);
+                        _log?.Invoke("[登录] 已清除内嵌浏览器的登录状态（新账号模式）");
+                    }
+                    catch (Exception ex)
+                    {
+                        // 清不掉不阻塞：最坏情况是用户看到已登录页，还能点「导入 Cookie」。
+                        _log?.Invoke("[登录] 清除登录状态失败（继续打开）：" + ex.Message);
+                    }
+                }
+
                 _web.Visibility = Visibility.Visible;
-                if (_switchBtn != null) _switchBtn.IsEnabled = true;
                 _web.CoreWebView2.Navigate(LoginUrlFor(_kind));
 
                 StartPolling();
@@ -264,45 +326,62 @@ namespace GeZi
         /// </para>
         /// 清完必须**重新导航**：有些站点的登录态存在内存里的 SPA store，光清 Cookie 页面不会变。
         /// </summary>
+        /// <summary>
+        /// 清掉内嵌浏览器记住的登录状态（Cookie / localStorage / IndexedDB）。
+        /// <para>
+        /// 🚨 2026-11-03 从 <see cref="SwitchAccountAsync"/> 里抽出来，
+        /// 因为「打开时清」和「换账号清」用的是同一套逻辑 —— 复制两份必然漂移。
+        /// 这里只清数据、**不导航**，导航由调用方决定。
+        /// </para>
+        /// </summary>
+        private static async Task ClearBrowsingDataAsync(CoreWebView2 core)
+        {
+            if (core == null) return;
+
+            // 🚨 2026-10-28 的教训（保留说明）：原来的做法是两半：
+            //   ① core.CookieManager.DeleteAllCookies()   —— 清整个 profile 的 Cookie，够彻底；
+            //   ② core.ExecuteScriptAsync(wipe)          —— 清 localStorage / IndexedDB，
+            //      但脚本只跑在**当前页面**所在的 origin 上。
+            //   于是阿里这类多子域的站点清不干净：当前页在 www.alipan.com，
+            //   passport.alipan.com / auth.alipan.com 下的登录态原封不动，
+            //   用户清完刷新一下还是已登录的那个号。
+            //
+            //   现在改用 Profile.ClearBrowsingDataAsync(kinds)：按**数据类型**清，
+            //   一次覆盖 profile 里所有 origin，不再受「当前页面在哪个域」限制。
+            //   只清登录态相关的几类，保留 Cache —— 否则重新加载登录页会慢一大截。
+            await core.Profile.ClearBrowsingDataAsync(
+                CoreWebView2BrowsingDataKinds.Cookies
+                | CoreWebView2BrowsingDataKinds.LocalStorage
+                | CoreWebView2BrowsingDataKinds.IndexedDb);
+
+            // 再补一发页面内清理：有些 SPA 把状态挂在内存 store 里，
+            // 光清存储不清内存，页面自己还以为登着。这发只作为兜底。
+            try
+            {
+                const string wipe =
+                    "try{localStorage.clear();}catch(e){}"
+                    + "try{sessionStorage.clear();}catch(e){}";
+                await core.ExecuteScriptAsync(wipe);
+            }
+            catch { }
+
+            // 给 Cookie 管理器一点落盘时间
+            await Task.Delay(300);
+        }
+
+
         private async Task SwitchAccountAsync()
         {
             var core = _web != null ? _web.CoreWebView2 : null;
             if (core == null) return;
 
-            _switchBtn.IsEnabled = false;
             _status.Text = "正在清除内嵌浏览器记住的登录状态…";
             try
             {
-                // 🚨 2026-10-28 重写这段。原来的做法是两半：
-                //   ① core.CookieManager.DeleteAllCookies()   —— 清整个 profile 的 Cookie，够彻底；
-                //   ② core.ExecuteScriptAsync(wipe)          —— 清 localStorage / IndexedDB，
-                //      但脚本只跑在**当前页面**所在的 origin 上。
-                //   于是阿里这类多子域的站点清不干净：当前页在 www.alipan.com，
-                //   passport.alipan.com / auth.alipan.com 下的登录态原封不动，
-                //   用户点完「换账号」刷新一下还是已登录的那个号。
-                //
-                //   现在改用 Profile.ClearBrowsingDataAsync(kinds)：按**数据类型**清，
-                //   一次覆盖 profile 里所有 origin，不再受「当前页面在哪个域」限制。
-                //   只清登录态相关的几类，保留 Cache —— 否则重新加载登录页会慢一大截。
-                await core.Profile.ClearBrowsingDataAsync(
-                    CoreWebView2BrowsingDataKinds.Cookies
-                    | CoreWebView2BrowsingDataKinds.LocalStorage
-                    | CoreWebView2BrowsingDataKinds.IndexedDb);
+                // 清理逻辑已抽到 ClearBrowsingDataAsync（打开时与换账号共用同一份）
+                await ClearBrowsingDataAsync(core);
 
-                // 再补一发页面内清理：有些 SPA 把状态挂在内存 store 里，
-                // 光清存储不清内存，页面自己还以为登着。这发只作为兜底，
-                // 清不干净也没关系（上面那步已经把持久化存储清空了）。
-                try
-                {
-                    const string wipe =
-                        "try{localStorage.clear();}catch(e){}"
-                        + "try{sessionStorage.clear();}catch(e){}";
-                    await core.ExecuteScriptAsync(wipe);
-                }
-                catch { }
-
-                // 给 Cookie 管理器一点落盘时间，然后重新打开登录页（加时间戳绕开缓存）
-                await Task.Delay(300);
+                // 重新打开登录页（加时间戳绕开缓存）
                 string url = LoginUrlFor(_kind);
                 core.Navigate(url + (url.Contains("?") ? "&" : "?") + "_r="
                     + DateTime.Now.Ticks.ToString(CultureInfo.InvariantCulture));
@@ -317,7 +396,6 @@ namespace GeZi
             }
             finally
             {
-                if (_switchBtn != null) _switchBtn.IsEnabled = true;
             }
         }
 
@@ -382,8 +460,13 @@ namespace GeZi
             //    完全不知道是没登录、还是登录了但程序没读到 Cookie。
             if (!LooksPlausible(cookie))
             {
-                _status.Text = "等待登录完成…（已读到 " + CountCookies(cookie)
-                    + " 个 Cookie，尚未出现 " + RequiredFieldsHint() + "）";
+                // 🚨 2026-11-03：界面只留一句人话，技术细节进日志。
+                //   原来这里显示「已读到 10 个 Cookie，尚未出现 __pus / __puus」——
+                //   普通用户完全不懂，而且 __pus/__puus 是内部字段名，
+                //   AGENTS.md 二十·文案规范明确禁止它们出现在界面上。
+                SetStatus("等待登录…");
+                _log?.Invoke("[登录] 已读到 " + CountCookies(cookie) + " 个 Cookie，尚未出现 "
+                    + RequiredFieldsHint() + "（技术细节，仅日志）");
                 return;
             }
 
@@ -399,7 +482,7 @@ namespace GeZi
             _validating = true;
             try
             {
-                _status.Text = "检测到登录凭证，正在校验…";
+                SetStatus("正在验证…", "TextPrimaryBrush");
 
                 var (ok, nick, error) = await ValidateAsync(cookie);
                 if (ok)
@@ -407,7 +490,7 @@ namespace GeZi
                     _finished = true;
                     try { _poll?.Stop(); } catch { }
 
-                    _status.Text = "登录成功：" + nick;
+                    SetStatus("登录成功：" + nick, "SuccessBrush");
                     _log?.Invoke("[登录] " + PanUrlParser.DisplayNameOf(_kind) + " 登录成功: " + nick);
 
                     _onCaptured?.Invoke(cookie);
@@ -417,7 +500,7 @@ namespace GeZi
 
                 // 校验失败视为中间态，记下来继续等
                 _lastFailedCookie = cookie;
-                _status.Text = "等待登录完成…（" + error + "）";
+                SetStatus("等待登录…");
             }
             finally
             {
@@ -473,7 +556,7 @@ namespace GeZi
             _validating = true;
             try
             {
-                _status.Text = "检测到登录令牌，正在校验…";
+                SetStatus("正在验证…", "TextPrimaryBrush");
 
                 var (ok, nick, error) = await ValidateTokenAsync(token);
                 if (ok)
@@ -481,7 +564,7 @@ namespace GeZi
                     _finished = true;
                     try { _poll?.Stop(); } catch { }
 
-                    _status.Text = "登录成功：" + nick;
+                    SetStatus("登录成功：" + nick, "SuccessBrush");
                     _log?.Invoke("[登录] " + PanUrlParser.DisplayNameOf(_kind) + " 登录成功: " + nick);
 
                     _onCaptured?.Invoke(token);
@@ -490,7 +573,7 @@ namespace GeZi
                 }
 
                 _lastFailedCookie = token;
-                _status.Text = "等待登录完成…（" + error + "）";
+                SetStatus("等待登录…");
             }
             finally
             {
@@ -1100,6 +1183,30 @@ namespace GeZi
         }
 
         /// <summary>提示当前网盘需要哪几个关键 Cookie。</summary>
+        /// <summary>
+        /// 统一设置状态：文字 + 圆点颜色。
+        /// <para>
+        /// 🚨 2026-11-03：原来各处直接赋 <c>_status.Text</c>，圆点不会跟着变。
+        /// 抽成一个方法后，「等待 / 验证 / 成功 / 失败」四种状态颜色自动对应。
+        /// </para>
+        /// </summary>
+        /// <param name="text">给人看的一句话。</param>
+        /// <param name="brushKey">圆点颜色的资源键；null = 默认三级色。</param>
+        private void SetStatus(string text, string brushKey = null)
+        {
+            try
+            {
+                if (_status != null) _status.Text = text ?? "";
+                if (_statusDot != null)
+                {
+                    _statusDot.SetResourceReference(System.Windows.Shapes.Shape.FillProperty,
+                        string.IsNullOrEmpty(brushKey) ? "TextTertiaryBrush" : brushKey);
+                }
+            }
+            catch { }
+        }
+
+
         private string RequiredFieldsHint()
         {
             switch (_kind)

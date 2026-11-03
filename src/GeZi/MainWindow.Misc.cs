@@ -540,13 +540,20 @@ namespace GeZi
         private void ApplyFusionSettingsToScheduler()
         {
             if (_scheduler == null) return;
-            // 2026-10-24 起落盘策略统一为「共写 + 16 MB 写合并」（大厂形态）：
-            // 预分配 + 多连接各写最终偏移 + 批量排序刷盘 → 没有合并阶段，
-            // 固态盘和机械盘走同一套，不再让用户选、也不再按磁盘类型分叉。
-            // Settings.StorageMode 保留只为兼容老配置文件，不再影响行为。
-            _scheduler.FusionStorageMode = GeZi.DownloadEngine.Storage.StorageMode.Shared;
+            // 🚨🚨 2026-11-03：恢复「让用户选落盘方式」（用户明确要求）。
+            //
+            //   2026-10-24 曾经统一成「共写 + 16 MB 写合并」，把选择权收走了 ——
+            //   理由是固态盘和机械盘走同一套更简单。但机械盘用户确实需要顺序写
+            //   （全程顺序 I/O，磁头不来回跳）。所以现在两套都保留，由设置页决定：
+            //     · 0 = Sequential（顺序写，机械盘推荐）
+            //     · 1 = Shared（共写，默认，固态盘推荐）
+            //
+            //   ⚠️ 默认值仍然是 Shared —— 那是被大量实测验证过的那条路径。
+            //      顺序写从未启用过，第一次开放给用户时必须自己实测续传 + MD5。
+            _scheduler.FusionStorageMode = _settings.StorageMode == 0
+                ? GeZi.DownloadEngine.Storage.StorageMode.Sequential
+                : GeZi.DownloadEngine.Storage.StorageMode.Shared;
             // 0 = 用 SequentialFileStorage 的默认窗口（32 MB）。
-            // 顺序写已不是默认路径，这个值只在有人手动改 FusionStorageMode 时才生效。
             _scheduler.FusionSequentialWindowBytes = 0;
             // 机械盘连接上限：用户可以自己调（设置页「机械盘连接上限」）。
             // 调度器只在 DiskMedia 判定为 HDD 时才用它，固态盘不受影响。

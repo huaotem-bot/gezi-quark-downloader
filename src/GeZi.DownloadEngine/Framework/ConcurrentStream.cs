@@ -222,6 +222,14 @@ public class ConcurrentStream : TaskStateManagement, IDisposable
 
                 try
                 {
+                    // 🚨🚨 2026-11-03 修「暂停后文件还在变大」（用户实测确认无效）：
+                    //   原来闸门只在**取包之前**等（上面那句），
+                    //   而「已经取出 batch、正在写」的窗口内暂停是**拦不住**的 ——
+                    //   这一批（最多 16 MB / 64 个 packet）照样全部写进磁盘。
+                    //   16 MB 在 26 MB/s 下约 0.6 秒，用户看到的就是「点了暂停文件还在涨」。
+                    //   ⇒ 写之前**再等一次闸门**：暂停时把已取出的这批留在内存里，
+                    //      恢复后接着写，不丢包也不重复写。
+                    await WaitWhileWritePausedAsync().ConfigureAwait(false);
                     await WriteBatchOnFile(batch).ConfigureAwait(false);
                 }
                 finally
@@ -476,14 +484,37 @@ public class ConcurrentStream : TaskStateManagement, IDisposable
     /// <summary>刷盘等待上限（毫秒）。超过就强制放行并告警，绝不无限等。</summary>
     private const int FlushTimeoutMs = 30000;
 
-    public async Task FlushAsync()
+    /// <summary>
+    /// 刷盘。
+    /// <para>
+    /// 🚨🚨 2026-11-03 重大修正：原来这个方法**开头无条件 <c>ResumeWrites()</c>** ——
+    /// 而它被续传保存器**每 3 秒**调一次。后果是：
+    /// 用户点暂停 → 3 秒内这个 FlushAsync 就把闸门**强行打开** →
+    /// Watcher 继续写盘 → 文件继续变大。**暂停在 3 秒内必然失效。**
+    /// 这才是「暂停确实无效」的真正根因。
+    /// </para>
+    /// <para>
+    /// 现在区分两种语义：
+    /// <list type="bullet">
+    /// <item><c>force: false</c>（默认，周期刷盘）—— 暂停时**直接跳过**，不碰闸门。
+    ///       数据留在内存/OS 缓冲里，恢复后由下一次 Flush 落盘，不会丢。</item>
+    /// <item><c>force: true</c>（收尾/取消/完成）—— 先放行闸门再排空，
+    ///       保证「暂停 → 取消下载」时 Watcher 不会卡死、最后一次刷盘不漏。</item>
+    /// </list>
+    /// </para>
+    /// </summary>
+    public async Task FlushAsync(bool force = false)
     {
-        // 🚨 2026-10-28：收尾刷盘必须先放行写盘闸门。
+        // 周期刷盘遇到暂停：什么都不做，直接返回。
+        // ⚠️ 绝不能在这里 ResumeWrites() —— 那等于把用户的暂停操作作废。
+        if (!force && WritesPaused)
+            return;
+
+        // 收尾刷盘必须先放行写盘闸门。
         // 否则「用户暂停 → 取消下载」时 Watcher 卡在 WaitWhileWritePausedAsync，
-        // 队列永远不排空，下面的 WaitToComplete 只能等满 30 秒超时，日志还会留一条
-        // 「刷盘等待超过 30000 ms」的假故障。
-        // 刷盘语义本来就是「把已收下的全部落盘」，与暂停无关。
-        ResumeWrites();
+        // 队列永远不排空，下面的 WaitToComplete 只能等满 30 秒超时。
+        if (force)
+            ResumeWrites();
 
         // 🚨 2026-10-25：原来这里是无超时的 await _inputBuffer.WaitToComplete()。
         // 只要 Watcher 因为任何原因退出（写盘抛 IOException、文件被删、磁盘错误），

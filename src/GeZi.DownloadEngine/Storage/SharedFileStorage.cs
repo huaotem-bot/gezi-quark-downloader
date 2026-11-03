@@ -54,7 +54,11 @@ public sealed class SharedFileStorage : IChunkStorage
     public Task WriteAsync(long position, byte[] bytes, int length, bool fireAndForget = true)
         => _inner.WriteAsync(position, bytes, length, fireAndForget);
 
-    public Task FlushAsync() => _inner.FlushAsync();
+    /// <summary>
+    /// 刷盘。<paramref name="force"/> = true 表示收尾/取消场景，
+    /// 必须先放行写盘闸门（见 ConcurrentStream.FlushAsync 的说明）。
+    /// </summary>
+    public Task FlushAsync(bool force = false) => _inner.FlushAsync(force);
 
     /// <summary>
     /// 暂停/恢复写盘队列。共写模式下 worker 停了，Watcher 线程仍会继续把

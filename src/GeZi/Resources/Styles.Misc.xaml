@@ -383,6 +383,52 @@
         <Setter Property="MaxWidth" Value="260"/>
     </Style>
 
+    <!-- ==============================================================
+         普通单选按钮（2026-11-03 新增）
+         ==============================================================
+         设置页「落盘方式」需要二选一，而项目里原来只有 SegmentedRadio（分段控件）
+         和 FilterTabRadio（筛选标签），都不适合「选项 + 说明」这种形态。
+         这里给一个最朴素的单选：圆点 + 文字，跟随主题色。
+    -->
+    <Style x:Key="AppRadioButton" TargetType="RadioButton">
+        <Setter Property="FontFamily" Value="{StaticResource AppFontFamily}"/>
+        <Setter Property="FontSize" Value="13"/>
+        <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}"/>
+        <Setter Property="Cursor" Value="Hand"/>
+        <Setter Property="VerticalContentAlignment" Value="Center"/>
+        <Setter Property="Template">
+            <Setter.Value>
+                <ControlTemplate TargetType="RadioButton">
+                    <StackPanel Orientation="Horizontal" Background="Transparent">
+                        <Grid Width="16" Height="16" VerticalAlignment="Center">
+                            <Ellipse x:Name="Outer" Width="16" Height="16"
+                                     Stroke="{DynamicResource BorderBrushStrong}" StrokeThickness="1.4"
+                                     Fill="Transparent"/>
+                            <Ellipse x:Name="Inner" Width="8" Height="8"
+                                     Fill="{DynamicResource TextPrimaryBrush}"
+                                     Visibility="Collapsed"/>
+                        </Grid>
+                        <ContentPresenter Margin="8,0,0,0" VerticalAlignment="Center"/>
+                    </StackPanel>
+                    <ControlTemplate.Triggers>
+                        <Trigger Property="IsChecked" Value="True">
+                            <Setter TargetName="Inner" Property="Visibility" Value="Visible"/>
+                            <Setter TargetName="Outer" Property="Stroke"
+                                    Value="{DynamicResource TextPrimaryBrush}"/>
+                        </Trigger>
+                        <Trigger Property="IsMouseOver" Value="True">
+                            <Setter TargetName="Outer" Property="Stroke"
+                                    Value="{DynamicResource TextSecondaryBrush}"/>
+                        </Trigger>
+                        <Trigger Property="IsEnabled" Value="False">
+                            <Setter Property="Opacity" Value="0.5"/>
+                        </Trigger>
+                    </ControlTemplate.Triggers>
+                </ControlTemplate>
+            </Setter.Value>
+        </Setter>
+    </Style>
+
     <!-- 分区卡片的标题行（图标 + 标题 + 右上角附加内容） -->
     <Style x:Key="SettingsCardHeader" TargetType="Grid">
         <Setter Property="Margin" Value="0,0,0,16"/>

@@ -474,7 +474,7 @@ namespace GeZi
                 //    四张网盘卡现在只在「登录」页（2026-10-26 修正过期指引）。
                 AppDialog.Show(this,
                     "还没有登录" + panName + "。\n\n"
-                    + "请到「登录」页，点" + panName + "卡片上的「内嵌登录」登录一次即可。",
+                    + "请到「登录」页，点" + panName + "卡片上的「" + LoginEntryName + "」登录一次即可。",
                     panName + "未登录", MessageBoxButton.OK, MessageBoxImage.Information);
                 provider.Dispose();
                 return;

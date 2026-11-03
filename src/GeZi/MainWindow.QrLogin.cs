@@ -205,7 +205,8 @@ namespace GeZi
                         Log("UC网盘 内嵌登录成功，凭证已保存。");
                         RefreshUcRuntimeStatus();
                     },
-                    msg => LogDetail(msg))
+                    // 点「登录账号」= 用户要登新账号 → 打开前先清 Cookie
+                    msg => LogDetail(msg), clearSessionOnStart: true)
                 {
                     Owner = this,
                 };
@@ -238,13 +239,34 @@ namespace GeZi
         //        a) 软件内 WebView2 注册 —— 注册完**自动登录**（复用凭证捕获逻辑）；
         //        b) 打开系统浏览器 —— 方便用户以后自己用浏览器访问网盘。
 
+        /// <summary>
+        /// 统一的「打开内嵌登录窗口登新账号」入口（账号列表等处调用）。
+        /// <para>
+        /// 🚨 2026-11-03：原来账号列表的「去登录新账号」只弹一句提示，
+        /// 让用户自己去找卡片按钮 —— 而按钮文案早就改名了，用户根本找不到。
+        /// 现在四处入口（UC / 阿里 / 迅雷 / 夸克）统一走这里。
+        /// </para>
+        /// <para>一律 <c>clearSessionOnStart: true</c>：用户明确要登新账号。</para>
+        /// </summary>
+        private void OpenWebLoginForNewAccount(PanKind kind)
+        {
+            switch (kind)
+            {
+                case PanKind.Quark: OnQuarkWebLogin(this, new RoutedEventArgs()); break;
+                case PanKind.Uc: OnUcWebLogin(this, new RoutedEventArgs()); break;
+                case PanKind.Aliyun: OnAliyunWebLogin(this, new RoutedEventArgs()); break;
+                case PanKind.Xunlei: OnXunleiWebLogin(this, new RoutedEventArgs()); break;
+            }
+        }
+
+
         /// <summary>夸克「登录账号」：弹出扫码 / 内嵌两种方式。</summary>
         private void OnQuarkLoginMenu(object sender, RoutedEventArgs e)
         {
             ShowChoiceMenu(sender, new[]
             {
-                Tuple.Create("扫码登录 · 手机 App 扫一扫", (Action)(() => OnQuarkPanScan(sender, e))),
-                Tuple.Create("内嵌登录 · 在软件里打开网页", (Action)(() => OnQuarkWebLogin(sender, e))),
+                Tuple.Create("扫码登录", (Action)(() => OnQuarkPanScan(sender, e))),
+                Tuple.Create("内嵌登录", (Action)(() => OnQuarkWebLogin(sender, e))),
             });
         }
 
@@ -253,9 +275,9 @@ namespace GeZi
         {
             ShowChoiceMenu(sender, new[]
             {
-                Tuple.Create("在软件内注册（注册后自动登录）",
+                Tuple.Create("软件内注册",
                     (Action)(() => OpenWebLoginForRegister(PanKind.Quark))),
-                Tuple.Create("用浏览器打开注册页",
+                Tuple.Create("浏览器打开",
                     (Action)(() => OpenRegisterInBrowser(PanKind.Quark))),
             });
         }
@@ -270,9 +292,9 @@ namespace GeZi
 
             ShowChoiceMenu(sender, new[]
             {
-                Tuple.Create("在软件内注册（注册后自动登录）",
+                Tuple.Create("软件内注册",
                     (Action)(() => OpenWebLoginForRegister(kind))),
-                Tuple.Create("用浏览器打开注册页",
+                Tuple.Create("浏览器打开",
                     (Action)(() => OpenRegisterInBrowser(kind))),
             });
         }
@@ -287,23 +309,65 @@ namespace GeZi
             if (fe == null || items == null || items.Length == 0)
                 return;
 
-            var cm = new System.Windows.Controls.ContextMenu
+            // 🚨🚨 2026-11-03 重做（用户报「菜单左边一大片空白、文字太长」）：
+            //   原来用原生 ContextMenu + MenuItem —— 而 MenuItem 的默认模板
+            //   **硬编码了一个图标列**（约 24~28px），即使没有 Icon 也保留这个宽度。
+            //   这就是左边那片空白的来源。改样式要重写整个 ControlTemplate，
+            //   成本比自绘高，所以这里改成 Popup + Border + Button。
+            //   顺带：文案全部精简（AGENTS.md 二十·文案规范：
+            //   「按钮/标题已表达过的话，正文里不许再写一遍」）。
+            var pop = new System.Windows.Controls.Primitives.Popup
             {
                 PlacementTarget = fe,
                 Placement = System.Windows.Controls.Primitives.PlacementMode.Bottom,
+                StaysOpen = false,
+                AllowsTransparency = true,
+                VerticalOffset = 6,
+                HorizontalOffset = 0,
             };
+
+            var panel = new StackPanel();
             foreach (var it in items)
             {
-                var mi = new System.Windows.Controls.MenuItem { Header = it.Item1 };
-                var action = it.Item2;
-                mi.Click += (s2, e2) =>
+                var btn = new Button
                 {
-                    try { cm.IsOpen = false; } catch { }
+                    Content = it.Item1,
+                    HorizontalContentAlignment = HorizontalAlignment.Left,
+                    HorizontalAlignment = HorizontalAlignment.Stretch,
+                    Padding = new Thickness(14, 8, 14, 8),
+                    BorderThickness = new Thickness(0),
+                    Background = System.Windows.Media.Brushes.Transparent,
+                    FontSize = 12.5,
+                    Cursor = System.Windows.Input.Cursors.Hand,
+                };
+                btn.SetResourceReference(ForegroundProperty, "TextPrimaryBrush");
+                var action = it.Item2;
+                btn.Click += (s2, e2) =>
+                {
+                    try { pop.IsOpen = false; } catch { }
                     try { action(); } catch (Exception ex) { Log("操作失败：" + ex.Message); }
                 };
-                cm.Items.Add(mi);
+                panel.Children.Add(btn);
             }
-            cm.IsOpen = true;
+
+            var border = new Border
+            {
+                CornerRadius = new CornerRadius(8),
+                BorderThickness = new Thickness(1),
+                Padding = new Thickness(4),
+                Child = panel,
+                Effect = new System.Windows.Media.Effects.DropShadowEffect
+                {
+                    BlurRadius = 16,
+                    ShadowDepth = 2,
+                    Direction = 270,
+                    Opacity = 0.10,
+                },
+            };
+            border.SetResourceReference(Border.BackgroundProperty, "SurfaceBrush");
+            border.SetResourceReference(Border.BorderBrushProperty, "BorderBrushSoft");
+            pop.Child = border;
+            pop.IsOpen = true;
         }
 
         /// <summary>
@@ -340,7 +404,8 @@ namespace GeZi
                             Log(PanUrlParser.DisplayNameOf(kind) + " 内嵌注册完成，已自动登录。");
                         }
                     },
-                    msg => LogDetail(msg))
+                    // 注册必然是新账号 → 打开前先清 Cookie
+                    msg => LogDetail(msg), clearSessionOnStart: true)
                 {
                     Owner = this,
                     Title = PanUrlParser.DisplayNameOf(kind) + " 注册",
@@ -411,7 +476,8 @@ namespace GeZi
                         _ = ApplyLoginAsync(cookie, PanKind.Quark);
                         Log("夸克网盘 内嵌登录成功，凭证已保存。");
                     },
-                    msg => LogDetail(msg))
+                    // 点「登录账号」= 用户要登新账号 → 打开前先清 Cookie
+                    msg => LogDetail(msg), clearSessionOnStart: true)
                 {
                     Owner = this,
                 };
@@ -471,7 +537,9 @@ namespace GeZi
                         // 拿到就立刻设成当前账号，用户不用再点"验证"
                         _ = ApplyProviderLoginAsync(kind, shown);
                     },
-                    msg => LogDetail(msg))
+                    // 点「登录账号」= 用户要登新账号 → 打开前先清 Cookie。
+                    // 🚨 阿里/迅雷最需要这个：不清的话页面会瞬间跳进已登录首页。
+                    msg => LogDetail(msg), clearSessionOnStart: true)
                 {
                     Owner = this,
                 };

@@ -224,6 +224,18 @@ namespace GeZi
                     return;
                 _pendingSig = sig;
                 HistoryStore.SetPending(list);
+                // 🚨 2026-11-03：**新的未完成任务**出现时，自动取消静音 ——
+                //   静音只针对「用户已经看过并选择稍后再说」的那一批，
+                //   新问题该重新提醒，不能一直哑着。
+                try
+                {
+                    if (list.Count > 0 && _settings != null && _settings.PendingReminderMuted)
+                    {
+                        _settings.PendingReminderMuted = false;
+                        SettingsStore.Save(_settings);
+                    }
+                }
+                catch { }
                 RefreshPendingEntry();
             }
             catch { }
@@ -568,7 +580,20 @@ namespace GeZi
 
             if (!doResume)
             {
+                // 🚨 2026-11-03：用户选了「稍后再说」/右上角 × —— 语义是
+                //   「这次不想续，别一直提醒我」，而记录**保留**（分片还在，随时能续）。
+                //   所以这里把「未完成」入口静音掉，避免图标一直挂着让人以为放弃没生效。
+                try
+                {
+                    if (_settings != null)
+                    {
+                        _settings.PendingReminderMuted = true;
+                        SettingsStore.Save(_settings);
+                    }
+                }
+                catch { }
                 Log("未完成的任务已保留记录，稍后可从下载页重新下载（分片在，会自然续传）。");
+                RefreshPendingEntry();
                 return;
             }
 
@@ -626,6 +651,18 @@ namespace GeZi
                 if (all != null) count = all.Count;
             }
             catch { count = 0; }
+
+            // 🚨 2026-11-03 修「选了放弃续传，未完成图标还在」：
+            //   用户点「稍后再说」时记录是**故意保留**的（方便下次续传），
+            //   所以只数条数就会让图标永远亮着，看起来像「放弃没生效」。
+            //   现在按 PendingReminderMuted 判断：静音期间不显示图标，
+            //   但记录仍然保留、仍然能从下载页重新开始。
+            if (count > 0 && _settings != null && _settings.PendingReminderMuted)
+            {
+                PendingEntryBtn.Visibility = Visibility.Collapsed;
+                if (PendingBadge != null) PendingBadge.Visibility = Visibility.Collapsed;
+                return;
+            }
 
             if (count <= 0)
             {

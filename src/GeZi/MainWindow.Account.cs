@@ -63,6 +63,16 @@ namespace GeZi
     {
 
         /// <summary>
+        /// 登录入口按钮的**显示名**（四个网盘卡上统一用这个）。
+        /// <para>
+        /// 🚨 2026-11-03：按钮文案从「内嵌登录」改成「登录账号」之后，
+        /// 代码里有 5 处提示还写着「请点『内嵌登录』」，用户找不到那个按钮。
+        /// 抽成常量后，以后再改名只改这一处，不会再有漏网的文案。
+        /// </para>
+        /// </summary>
+        private const string LoginEntryName = "登录账号";
+
+        /// <summary>
         /// 把 provider **当前**的令牌写回配置（只在真的变了时才写盘）。
         /// <para>
         /// 为什么需要它：阿里会**轮换** refresh_token —— 每次换 access_token 都可能下发
@@ -420,30 +430,33 @@ namespace GeZi
                 //    ⇒ loggedHint 一律传空串：已登录时那一行**只显示账号昵称**。
                 //    savedHint 改成一句操作指引（不是技术描述）：告诉用户怎么刷新。
                 //    emptyHint 保留原样 —— 它是「这家怎么登录」的操作指路，不是噪音。
-                const string SavedTip = "点「内嵌登录」刷新";
+                // 🚨 2026-11-03：按钮文案已统一改成「登录账号」，所有提示必须跟着改，
+                //    否则用户会去找一个界面上根本不存在的「内嵌登录」按钮。
+                //    统一用 LoginEntryName 常量，以后改名只改一处。
+                const string SavedTip = "点「" + LoginEntryName + "」刷新";
 
                 ApplyPanCard(PanKind.Quark, QuarkPanStatusText, QuarkPanHintText,
                     !string.IsNullOrWhiteSpace(_settings.Cookie), PanIsLive(PanKind.Quark),
                     PanAccountName(PanKind.Quark),
-                    "", SavedTip, "扫码或内嵌登录");
+                    "", SavedTip, "扫码或" + LoginEntryName);
 
                 ApplyPanCard(PanKind.Uc, UcPanStatusText, UcPanHintText,
                     !string.IsNullOrWhiteSpace(_settings.UcCookie), PanIsLive(PanKind.Uc),
                     PanAccountName(PanKind.Uc),
-                    "", SavedTip, "内嵌登录或粘贴 Cookie");
+                    "", SavedTip, LoginEntryName + "或粘贴 Cookie");
 
                 ApplyPanCard(PanKind.Aliyun, AliyunPanStatusText, AliyunPanHintText,
                     !string.IsNullOrWhiteSpace(_settings.AliyunRefreshToken)
                         || !string.IsNullOrWhiteSpace(_settings.AliyunAccessToken),
                     PanIsLive(PanKind.Aliyun),
                     PanAccountName(PanKind.Aliyun),
-                    "", SavedTip, "内嵌登录或粘贴令牌");
+                    "", SavedTip, LoginEntryName + "或粘贴令牌");
 
                 // 迅雷的「短信登录」入口已按用户要求删掉，空态文案不能再说「或短信登录」。
                 ApplyPanCard(PanKind.Xunlei, XunleiPanStatusText, XunleiPanHintText,
                     !string.IsNullOrWhiteSpace(_settings.XunleiPanToken), PanIsLive(PanKind.Xunlei),
                     PanAccountName(PanKind.Xunlei),
-                    "", SavedTip, "内嵌登录或粘贴令牌");
+                    "", SavedTip, LoginEntryName + "或粘贴令牌");
             }
             catch { }
         }
@@ -887,9 +900,12 @@ namespace GeZi
                 }
                 else
                 {
-                    AppDialog.Show(this,
-                        "请点" + panName + "卡片上的「内嵌登录」，在弹出的网页里登录一次即可。",
-                        panName, MessageBoxButton.OK, MessageBoxImage.Information);
+                    // 🚨🚨 2026-11-03 修「去登录新账号只弹一句提示，没真打开登录」：
+                    //   原来这里只 AppDialog.Show 一句话，让用户自己去找卡片按钮 ——
+                    //   用户报「点了去登录新账号，却提示我去找内嵌登录」。
+                    //   现在直接打开该家的内嵌登录窗口（新账号模式：先清 Cookie）。
+                    // filter 是 PanKind?（单家视图时非空），allPans 时回落到当前账号那家。
+                    OpenWebLoginForNewAccount(filter ?? _activeKind);
                 }
             };
             closeBtn.Click += (s, ev) => win.Close();
@@ -2060,7 +2076,7 @@ namespace GeZi
                     if (notifyFailure)
                     {
                         AppDialog.Show(this,
-                            hint + "\n\n请重新点「内嵌登录（自动获取）」；"
+                            hint + "\n\n请重新点「" + LoginEntryName + "」；"
                             + "手动粘贴的话注意要把整条凭证复制完整。",
                             panName + " 登录失败", MessageBoxButton.OK, MessageBoxImage.Warning);
                     }
@@ -2112,9 +2128,20 @@ namespace GeZi
                 // 阿里/迅雷登录成功后从不写档案，结果「账号列表」里永远是空的，
                 // 用户看到的「阿里里没有账号了」就是这个原因。
                 // 标识优先用 provider 给的账号名，取不到回退昵称。
-                string acctKey = !string.IsNullOrEmpty(provider.AccountName)
-                    ? provider.AccountName
-                    : _settings.Who;
+                // 🚨🚨 2026-11-03 修「迅雷账号列表冒出 4 个『迅雷用户』」：
+                //   根因：迅雷网页登录**拿不到真实昵称**（AccountName 恒空），
+                //   于是 acctKey 回退成昵称「迅雷用户」—— 四个账号算出同一个 Key，
+                //   靠 AccountStore 的「同名不同号加后缀」才没互相覆盖，
+                //   结果就是 迅雷用户 / -8715cdad / -9e173f7f / -03064786 四条。
+                //   ⇒ 阿里/迅雷必须用**设备号**（稳定）参与 Key 生成。
+                string acctKey = provider.AccountName;
+                if (string.IsNullOrEmpty(acctKey))
+                {
+                    string dev = AccountStore.ExtractDeviceIdForDisplay(credentialForArchive ?? "");
+                    acctKey = string.IsNullOrEmpty(dev)
+                        ? _settings.Who
+                        : _settings.Who + "-" + dev.Substring(0, Math.Min(8, dev.Length));
+                }
                 if (!string.IsNullOrEmpty(acctKey))
                 {
                     AccountStore.Save(acctKey, _settings.Who, credentialForArchive ?? "", (int)kind);

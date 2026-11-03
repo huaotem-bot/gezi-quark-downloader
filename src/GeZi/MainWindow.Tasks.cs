@@ -421,13 +421,20 @@ namespace GeZi
             }
             if (u.Progress != null)
             {
-                item.Percent = u.Progress.Percent;
-                // 暂停期间**冻结速度**：核心层仍会上报在途请求的残余速度
-                // （闸门式暂停，见 TaskItem.PauseRequested 注释），照收就会把刚置的 0
-                // 又拉回一个非零值 → 界面又变成"速度慢慢降"。用户要求暂停即时生效 → 不收。
-                // 进度（Percent/Done）照常更新：那是真实已下载字节，且暂停后本来就不再增长。
-                if (!keepPaused) item.Speed = u.Progress.Speed;
-                item.Done = u.Progress.Done;
+                // 🚨🚨 2026-11-03 修「暂停后进度条和数字还在变」（用户实测确认无效）：
+                //   原来这里**无条件**更新 Percent/Done/Total，只冻结了 Speed。
+                //   而引擎是闸门式暂停：worker 要等当前 64KB 读完才停，
+                //   写队列里已缓冲的数据还会继续落盘并上报进度 ——
+                //   于是用户看到「点了暂停，进度条还在走、数字还在涨」。
+                //   ⇒ 暂停期间**一个字段都不更新**，界面完全冻结。
+                //   真实进度不会丢：恢复时下一帧自然追上。
+                if (!keepPaused)
+                {
+                    item.Percent = u.Progress.Percent;
+                    item.Speed = u.Progress.Speed;
+                    item.Done = u.Progress.Done;
+                    item.Total = u.Progress.Total;
+                }
 
                 // 🚨 2026-11-02：Total 首次拿到正数时，**强制**把 Pending 落一次盘。
                 //   背景：DownloadJob 本身没有大小字段，Size 只能从进度回调拿；
@@ -437,8 +444,11 @@ namespace GeZi
                 //   续传界面显示「大小未知」（虽然现在已不再禁止续传，但显示仍不准）。
                 //   这里在 Total 从 0 变正数的那一刻把指纹置为 -1，让下一次 SyncPending
                 //   必定落盘 —— 只多写一次，开销可忽略。
+                // 暂停期间不更新 Total（见上面的冻结说明），但**指纹失效**照常做 ——
+                // 那是落盘记账，与界面显示无关。
                 bool totalBecameKnown = item.Total <= 0 && u.Progress.Total > 0;
-                item.Total = u.Progress.Total;
+                if (!keepPaused)
+                    item.Total = u.Progress.Total;
                 if (totalBecameKnown)
                     _pendingLightSig = -1;
                 // 阶段说明（如「正在合并分片」）。非下载态一律清空，
@@ -923,7 +933,8 @@ namespace GeZi
                 {
                     var kind = kinds[i];
                     bool active = IsLoggedInAny && _activeKind == kind;
-                    bool hasCred = HasPanCredential(kind) || PanIsLive(kind);
+                    // 统一判据（见 PanUsable 的说明）
+                    bool hasCred = PanUsable(kind);
 
                     var stack = new StackPanel { Orientation = Orientation.Vertical };
                     var label = new TextBlock
@@ -1508,13 +1519,37 @@ namespace GeZi
         private bool _panLiveDone;
 
 
-        /// <summary>这家网盘是否已实测可用（当前账号天然算可用）。</summary>
+        /// <summary>
+        /// 这家网盘是否已实测可用（当前账号天然算可用）。
+        /// <para>
+        /// 🚨 2026-11-03 修「明明已登录却显示未登录」：
+        /// 原来判据散在三处（<c>PanIsLive</c> / <c>HasPanCredential</c> /
+        /// <c>IsLoggedInAny</c>），各写各的，于是出现「有凭证但标记被清 → 显示未登录」。
+        /// 现在统一由 <see cref="PanUsable"/> 提供单一结论，所有显示处都调它。
+        /// </para>
+        /// </summary>
         private bool PanIsLive(PanKind kind)
         {
             if (IsLoggedInAny && _activeKind == kind)
                 return true;
             bool ok;
             return _panLive.TryGetValue(kind, out ok) && ok;
+        }
+
+
+        /// <summary>
+        /// 这家网盘「能不能用」的**唯一判据**（登录页四卡、网盘切换页签都调它）。
+        /// <para>
+        /// 🚨 2026-11-03 修「已登录却显示未登录」：
+        /// 原来各处自己拼「有凭证 || 实测通过」，而 <c>InvalidatePanLive</c> 会作废
+        /// 实测标记 —— 于是凭证明明在、只是标记被清了一下，界面就退回「未登录」。
+        /// 现在统一成：**有凭证就算能用**（凭证是否过期由校验去判断，
+        /// 不该让显示层替它下结论）。
+        /// </para>
+        /// </summary>
+        private bool PanUsable(PanKind kind)
+        {
+            return HasPanCredential(kind) || PanIsLive(kind);
         }
 
 

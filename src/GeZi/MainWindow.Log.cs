@@ -234,6 +234,10 @@ namespace GeZi
         {
             try
             {
+                // 🚨 2026-11-03：启动时先清理过期日志（用户要求「只保留一天」）。
+                //   放在读取之前：这样即使要删的正好是即将恢复的文件，也不会先读进来再删。
+                try { LogStore.PurgeOldLogs(); } catch { }
+
                 var lines = LogStore.LoadTail(LogMaxLines);
                 if (lines == null || lines.Count == 0) return;
                 foreach (var raw in lines)

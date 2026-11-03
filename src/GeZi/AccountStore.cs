@@ -426,6 +426,16 @@ namespace GeZi
         /// </list>
         /// </para>
         /// </summary>
+        /// <summary>
+        /// 供界面层用的设备号提取（用于生成稳定的账号 Key）。
+        /// <para>
+        /// 🚨 2026-11-03：阿里/迅雷的账号名拿不到，必须靠设备号区分不同账号，
+        /// 否则四个迅雷账号会算出同一个 Key。
+        /// </para>
+        /// </summary>
+        public static string ExtractDeviceIdForDisplay(string credential)
+            => ExtractDeviceId(credential);
+
         private static string ExtractDeviceId(string credential)
         {
             if (string.IsNullOrEmpty(credential))

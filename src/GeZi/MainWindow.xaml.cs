@@ -731,6 +731,17 @@ namespace GeZi
                 Dispatcher);
             _logFlushTimer.Start();
 
+            // 🚨 2026-11-03：日志清理定时器（每 6 小时一次）。
+            //   为什么需要它：启动时清一次不够 —— 程序可能连续运行好几天，
+            //   跨零点后旧的日志就超期了，但没人去删。
+            //   6 小时是个折中：足够及时，又不会频繁碰磁盘。
+            _logPurgeTimer = new System.Windows.Threading.DispatcherTimer(
+                TimeSpan.FromHours(6),
+                System.Windows.Threading.DispatcherPriority.Background,
+                (s, e) => { try { LogStore.PurgeOldLogs(); } catch { } },
+                Dispatcher);
+            _logPurgeTimer.Start();
+
             // 全局未处理异常也灌进界面日志（见 App.LogFatal）。
             // 用户反馈「日志里显示的东西不够全面」：原来异常只写 startup-error.log，
             // 界面和诊断包里都看不到，出问题时切「详细」也一个字都没有。
@@ -1117,6 +1128,9 @@ namespace GeZi
 
         /// <summary>日志攒批刷新器。见 <see cref="Log"/> 的注释。</summary>
         private System.Windows.Threading.DispatcherTimer _logFlushTimer;
+
+        /// <summary>日志过期清理定时器（2026-11-03，每 6 小时跑一次 PurgeOldLogs）。</summary>
+        private System.Windows.Threading.DispatcherTimer _logPurgeTimer;
 
 
         /// <summary>保活复查定时器：有任务活跃下载时阻止系统空闲睡眠。见 <see cref="RefreshSleepGuard"/>。</summary>

@@ -53,17 +53,21 @@ public class DownloadPackage : IDisposable
         Chunks = null;
     }
 
+    /// <summary>
+    /// 收尾刷盘 —— **必须 force**：即使处于暂停也要把已收下的数据真正落盘，
+    /// 否则「暂停 → 取消下载」会丢掉最后一个窗口的数据。
+    /// </summary>
     public async Task FlushAsync()
     {
         if (Storage?.CanWrite == true)
-            await Storage.FlushAsync().ConfigureAwait(false);
+            await Storage.FlushAsync(force: true).ConfigureAwait(false);
     }
 
     [Obsolete("This method has been deprecated. Please use FlushAsync instead.")]
     public void Flush()
     {
         if (Storage?.CanWrite == true)
-            Storage?.FlushAsync().Wait();
+            Storage?.FlushAsync(force: true).Wait();
     }
 
     public void Validate()

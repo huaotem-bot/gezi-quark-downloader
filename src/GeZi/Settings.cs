@@ -71,6 +71,21 @@ namespace GeZi
         public bool AutoClean { get; set; } = true;
 
         /// <summary>
+        /// 「未完成」入口是否已被用户静音（2026-11-03）。
+        /// <para>
+        /// 🚨 修「我明明选了放弃续传，未完成图标还一直挂着」：
+        /// 原来 <c>RefreshPendingEntry</c> 只看记录条数，而「稍后再说」/右上角 ×
+        /// **会保留记录**（这是设计如此，记录留着方便下次续传）→
+        /// 图标自然一直亮着，用户以为「放弃」没生效。
+        /// </para>
+        /// <para>
+        /// 现在：用户点「稍后再说」时把这里置 true，图标隐藏；
+        /// 一旦**产生新的未完成任务**就自动重置为 false（新问题该提醒）。
+        /// </para>
+        /// </summary>
+        public bool PendingReminderMuted { get; set; }
+
+        /// <summary>
         /// 是否跟随 Windows 系统代理（2026-10-11 新增）。默认 **false = 直连**。
         /// 程序历来强制直连（理由见 <see cref="NetworkOptions"/>：
         /// 本机代理软件会把夸克接口劫持到 127.0.0.1；代理会改变 TLS ClientHello

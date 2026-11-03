@@ -93,6 +93,80 @@ namespace GeZi
             catch { }
         }
 
+        /// <summary>
+        /// 日志保留天数（用户要求：只保存一天，超过就删）。
+        /// <para>
+        /// 🚨 边界处理：<b>保留「今天 + 昨天」</b>，而不是严格只留今天 ——
+        /// 因为跨零点时昨天的日志可能还在被写（进程没重启），
+        /// 直接删会丢掉刚写的最后几行，甚至因文件被占用而失败。
+        /// 多留一天的成本可以忽略，换来的是「绝不误删正在写的文件」。
+        /// </para>
+        /// </summary>
+        private const int KeepDays = 1;
+
+        /// <summary>
+        /// 清理过期日志。
+        /// <para>
+        /// 调用点：启动时一次 + 主窗口定时器每 6 小时一次（跨零点后能自动清）。
+        /// </para>
+        /// <para>
+        /// 边界条件（逐条处理）：
+        /// <list type="bullet">
+        /// <item><b>跨零点</b> —— 保留今天+昨天（见 KeepDays 说明）。</item>
+        /// <item><b>文件被占用</b> —— catch 静默忽略，下次再删（用户可能正用记事本打开）。</item>
+        /// <item><b>系统时间被改</b> —— 用 LastWriteTime 判断，不解析文件名。</item>
+        /// <item><b>目录不存在</b> —— Directory.Exists 先挡。</item>
+        /// <item><b>误删别的文件</b> —— 只匹配 GeZi*.log，且只在日志目录内。</item>
+        /// <item><b>当前正在写的那个文件</b> —— 名字相同就跳过，绝不删自己。</item>
+        /// </list>
+        /// </para>
+        /// </summary>
+        public static void PurgeOldLogs()
+        {
+            try
+            {
+                string cur = FilePath;
+                if (string.IsNullOrEmpty(cur)) return;
+                string dir = Path.GetDirectoryName(cur);
+                if (string.IsNullOrEmpty(dir) || !Directory.Exists(dir)) return;
+
+                DateTime cutoff = DateTime.Today.AddDays(-(KeepDays + 1));
+                string[] files;
+                try { files = Directory.GetFiles(dir, "GeZi*.log"); }
+                catch { return; }
+
+                int removed = 0;
+                foreach (string p in files)
+                {
+                    try
+                    {
+                        // 绝不删当前正在写的那个
+                        if (string.Equals(p, cur, StringComparison.OrdinalIgnoreCase))
+                            continue;
+                        var fi = new FileInfo(p);
+                        if (!fi.Exists) continue;
+                        if (fi.LastWriteTime >= cutoff) continue;
+                        fi.Delete();
+                        removed++;
+                    }
+                    catch
+                    {
+                        // 被占用 / 权限不足 —— 静默跳过，下次再试
+                    }
+                }
+                if (removed > 0)
+                {
+                    try
+                    {
+                        Append("[日志] 已清理 " + removed + " 个超过 " + (KeepDays + 1) + " 天的日志文件");
+                    }
+                    catch { }
+                }
+            }
+            catch { }
+        }
+
+
         /// <summary>超过上限就把文件读后半段重写（近似"截掉最早的一半"）。</summary>
         private static void RollIfTooBig(string path)
         {

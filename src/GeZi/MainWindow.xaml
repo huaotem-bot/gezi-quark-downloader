@@ -1766,8 +1766,12 @@
                                     <!-- ==================== 左列 ==================== -->
 
                                     <!-- ① 网络与下载 -->
-                                    <!-- ① 网络与下载：跨 Row 0-2 占满整个左列（用户指定的红框范围） -->
-                                    <Border Grid.Row="0" Grid.RowSpan="3" Grid.Column="0" Style="{StaticResource SettingsCard}"
+                                    <!-- ① 网络与下载：跨 Row 0-1（用户指定的红框范围）。
+                                         🚨 2026-11-03 修正：原来是 RowSpan="3"（跨到 Row 2），
+                                         但它的内容只有约 500px，而右列三张卡把它撑到 750px →
+                                         卡片下方空出 250px。现在只跨 2 行，
+                                         剩下的 Row 2 左列放「外观」，两列高度自然接近。 -->
+                                    <Border Grid.Row="0" Grid.RowSpan="2" Grid.Column="0" Style="{StaticResource SettingsCard}"
                                             Margin="0,0,12,14" HorizontalAlignment="Stretch">
                                         <StackPanel>
                                             <Grid Style="{StaticResource SettingsCardHeader}">
@@ -1852,6 +1856,33 @@
                                                 </StackPanel>
                                             </Grid>
 
+                                            <!-- 🚨 2026-11-03 新增：落盘方式（用户要求恢复选择权）
+                                                 共写 = 预分配 + 多连接各写最终偏移（固态盘推荐，默认）
+                                                 顺序写 = 乱序数据先重排再严格顺序刷盘（机械盘推荐） -->
+                                            <Grid Style="{StaticResource SettingsRow3}" Margin="0">
+                                                <Grid.ColumnDefinitions>
+                                                    <ColumnDefinition Width="160"/>
+                                                    <ColumnDefinition Width="*"/>
+                                                </Grid.ColumnDefinitions>
+                                                <TextBlock Grid.Column="0" Text="落盘方式"
+                                                           Style="{StaticResource SettingsRowLabel}"/>
+                                                <StackPanel Grid.Column="1">
+                                                    <RadioButton x:Name="StorageSharedRadio" GroupName="StorageMode"
+                                                                 Content="共写（默认）"
+                                                                 Style="{StaticResource AppRadioButton}"
+                                                                 Checked="OnSettingChanged"
+                                                                 Margin="0,0,0,6"/>
+                                                    <RadioButton x:Name="StorageSequentialRadio" GroupName="StorageMode"
+                                                                 Content="顺序写（机械盘推荐）"
+                                                                 Style="{StaticResource AppRadioButton}"
+                                                                 Checked="OnSettingChanged"/>
+                                                    <TextBlock Style="{StaticResource SettingsRowHint}"
+                                                               Margin="0,7,0,0" MaxWidth="320"
+                                                               HorizontalAlignment="Left"
+                                                               Text="共写内存占用低；顺序写全程顺序 I/O，机械盘不来回寻道。改完重新开始下载才生效。"/>
+                                                </StackPanel>
+                                            </Grid>
+
                                             <Grid Style="{StaticResource SettingsRow3}">
                                                 <Grid.ColumnDefinitions>
                                                     <ColumnDefinition Width="160"/>
@@ -1908,9 +1939,9 @@
                                     </Border>
 
                                     <!-- ② 存储（从左列第 2 张 → 仍是左列，与「网络与下载」同列配平） -->
-                                    <!-- ② 存储：从左边移到**右列**「窗口与后台」下方（用户指定的绿框位置） -->
-                                    <Border Grid.Row="1" Grid.Column="1" Style="{StaticResource SettingsCard}"
-                                            Margin="0,0,0,14" HorizontalAlignment="Stretch">
+                                    <!-- ② 存储：**左列第三行**（网络卡跨 Row 0-1，存储接在它下面） -->
+                                    <Border Grid.Row="2" Grid.Column="0" Style="{StaticResource SettingsCard}"
+                                            Margin="0,0,12,14" HorizontalAlignment="Stretch">
                                         <StackPanel>
                                             <Grid Style="{StaticResource SettingsCardHeader}">
                                                 <StackPanel Orientation="Horizontal">
@@ -2053,9 +2084,9 @@
                                     </Border>
 
                                     <!-- ④ 外观 -->
-                                    <!-- ③ 外观：顺延到右列第三行 -->
-                                    <Border Grid.Row="2" Grid.Column="1" Style="{StaticResource SettingsCard}"
-                                            Margin="0,0,0,0" HorizontalAlignment="Stretch">
+                                    <!-- ③ 外观：右列第二行（窗口与后台下方） -->
+                                    <Border Grid.Row="1" Grid.Column="1" Style="{StaticResource SettingsCard}"
+                                            Margin="0,0,0,14" HorizontalAlignment="Stretch">
                                         <StackPanel>
                                             <Grid Style="{StaticResource SettingsCardHeader}">
                                                 <StackPanel Orientation="Horizontal">
@@ -2161,18 +2192,15 @@
                                     </Border>
 
                                     <!-- ⑤ 播放器（边下边播用）—— 横跨两列，压成一行横条 -->
-                                    <!-- ④ 播放器：最底部横跨两列（Row 3） -->
-                                    <Border Grid.Row="3" Grid.Column="0" Grid.ColumnSpan="2"
-                                            Style="{StaticResource SettingsCard}"
-                                            Margin="0,0,0,0" Padding="22,16" HorizontalAlignment="Stretch">
-                                        <Grid>
-                                            <Grid.ColumnDefinitions>
-                                                <ColumnDefinition Width="Auto"/>
-                                                <ColumnDefinition Width="*"/>
-                                                <ColumnDefinition Width="Auto"/>
-                                            </Grid.ColumnDefinitions>
-
-                                            <StackPanel Grid.Column="0" Orientation="Horizontal" VerticalAlignment="Center">
+                                    <!-- ④ 播放器：右列第三行（Row 2）。
+                                         🚨 2026-11-03：原来它横跨两列占满整行、内容只有一行，
+                                         下方大片空白。现在放进右列第三行，与左列「存储」对齐，
+                                         两列高度自然一致，整页也不需要滚动条了。 -->
+                                    <Border Grid.Row="2" Grid.Column="1" Style="{StaticResource SettingsCard}"
+                                            Margin="0,0,0,14" Padding="18,16" HorizontalAlignment="Stretch">
+                                        <StackPanel>
+                                            <!-- 标题行（与其它卡一致的图标+标题） -->
+                                            <StackPanel Orientation="Horizontal" Margin="0,0,0,12">
                                                 <Path Data="{StaticResource IconFileVideo}" Stretch="Uniform"
                                                       Width="16" Height="16" VerticalAlignment="Center"
                                                       Stroke="{DynamicResource TextTertiaryBrush}" StrokeThickness="1.7"/>
@@ -2180,18 +2208,19 @@
                                                            Margin="10,0,0,0"/>
                                             </StackPanel>
 
-                                            <TextBlock x:Name="PlayerStatusText" Grid.Column="1"
-                                                       Margin="20,0,16,0" VerticalAlignment="Center"
-                                                       TextWrapping="Wrap"
+                                            <!-- 检测结果（竖排：放在半列里必须换行） -->
+                                            <TextBlock x:Name="PlayerStatusText"
+                                                       TextWrapping="Wrap" Margin="0,0,0,12"
                                                        Style="{StaticResource BodyText}"/>
 
-                                            <StackPanel Grid.Column="2" Orientation="Horizontal" VerticalAlignment="Center">
-                                                <Button x:Name="GetVlcBtn" Content="打开 VLC 下载页" Click="OnGetVlc"
-                                                        Style="{StaticResource SecondaryButton}" Margin="0,0,8,0"/>
+                                            <StackPanel Orientation="Horizontal">
+                                                <Button x:Name="GetVlcBtn" Content="打开下载页" Click="OnGetVlc"
+                                                        Style="{StaticResource SecondaryButton}" Margin="0,0,8,0"
+                                                        ToolTip="在浏览器里打开 VLC 官方下载页"/>
                                                 <Button x:Name="RecheckPlayerBtn" Content="重新检测"
                                                         Click="OnRecheckPlayer" Style="{StaticResource SecondaryButton}"/>
                                             </StackPanel>
-                                        </Grid>
+                                        </StackPanel>
                                     </Border>
 
                                 </Grid>
@@ -2612,17 +2641,17 @@
                 <TabItem Style="{StaticResource HeadlessTabItem}">
                     <ScrollViewer VerticalScrollBarVisibility="Auto" Padding="0,0,10,0"
                                   HorizontalContentAlignment="Stretch">
-                        <StackPanel Margin="24,24,24,32" HorizontalAlignment="Stretch">
+                        <StackPanel Margin="20,18,20,16" HorizontalAlignment="Stretch">
 
                             <TextBlock Text="关于" Style="{StaticResource PageTitleText}" Margin="0,0,0,4"/>
                             <TextBlock Text="鸽子下载 —— 多网盘下载器"
-                                       Style="{StaticResource TertiaryText}" Margin="0,0,0,18"/>
+                                       Style="{StaticResource TertiaryText}" Margin="0,0,0,14"/>
 
                             <!-- ==================== ① 品牌区（最高层） ====================
                                  整块横跨全宽、带背景与描边，是这一页的视觉焦点。
                                  左侧图标 + 中间名称/定位 + 右侧版本徽章与操作按钮。 -->
-                            <Border Style="{StaticResource SettingsCard}" Margin="0,0,0,16"
-                                    Padding="24,22" HorizontalAlignment="Stretch">
+                            <Border Style="{StaticResource SettingsCard}" Margin="0,0,0,12"
+                                    Padding="22,18" HorizontalAlignment="Stretch">
                                 <Grid>
                                     <Grid.ColumnDefinitions>
                                         <ColumnDefinition Width="Auto"/>
@@ -2691,7 +2720,7 @@
                             <!-- ==================== ② 数据条（扫一眼就知道） ====================
                                  四个等宽小格子并排，替代原来「四行文字」的读法。
                                  这一层是"信息密度"，不是"阅读内容"，所以格子要小、要横排。 -->
-                            <Grid Margin="0,0,0,16">
+                            <Grid Margin="0,0,0,12">
                                 <Grid.ColumnDefinitions>
                                     <ColumnDefinition Width="*"/>
                                     <ColumnDefinition Width="*"/>
@@ -2744,7 +2773,7 @@
                                  使用教程与注意事项并排：这两块是"读"的内容，
                                  并排才不显得空，也让页面在宽窗口下被填满。
                                  ⚠️ 两栏都用 * 等宽，不设固定宽度 —— 窗口变宽时一起变宽。 -->
-                            <Grid Margin="0,0,0,16">
+                            <Grid Margin="0,0,0,12">
                                 <Grid.ColumnDefinitions>
                                     <ColumnDefinition Width="*"/>
                                     <ColumnDefinition Width="*"/>
@@ -2752,7 +2781,7 @@
 
                                 <!-- 使用教程：每条带序号徽章，形成清晰的步骤层次 -->
                                 <Border Grid.Column="0" Style="{StaticResource SettingsCard}"
-                                        Margin="0,0,12,0" Padding="22,20">
+                                        Margin="0,0,12,0" Padding="18,16">
                                     <StackPanel>
                                         <Grid Style="{StaticResource SettingsCardHeader}">
                                             <StackPanel Orientation="Horizontal">
@@ -2864,7 +2893,7 @@
                                 </Border>
 
                                 <!-- 注意事项：每条前一个警示小点，语气是"提醒"不是"步骤" -->
-                                <Border Grid.Column="1" Style="{StaticResource SettingsCard}" Padding="22,20">
+                                <Border Grid.Column="1" Style="{StaticResource SettingsCard}" Padding="18,16">
                                     <StackPanel>
                                         <Grid Style="{StaticResource SettingsCardHeader}">
                                             <StackPanel Orientation="Horizontal">
@@ -2941,7 +2970,7 @@
 
                             <!-- ==================== ④ 底部条（横跨全宽） ====================
                                  左侧是入口按钮，右侧是一句话 —— 一行铺满，不留空白。 -->
-                            <Border Style="{StaticResource SettingsCard}" Padding="22,16" HorizontalAlignment="Stretch">
+                            <Border Style="{StaticResource SettingsCard}" Padding="20,14" HorizontalAlignment="Stretch">
                                 <Grid>
                                     <Grid.ColumnDefinitions>
                                         <ColumnDefinition Width="Auto"/>

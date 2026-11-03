@@ -20,9 +20,20 @@ namespace GeZi.DownloadEngine.Storage;
 ///
 /// 1. <b>共写（SharedFile）</b>：所有连接直接 <c>Seek</c> 到目标文件的随机偏移写。
 ///    优点：不需要合并、内存占用低、写完即完。
-///    缺点：机械硬盘磁头疯狂寻道 → 磁盘 100%、吞吐反向崩塌；文件中间有空洞，
-///          未下完时不是有效媒体文件，<b>不能边下边看</b>；
-///          预分配 + 随机写会出现「长度对、内容坏」（gopeed 也踩过，只能整份重下）。
+///    <para>
+///    🚨 2026-11-03 更正：这里原来写「<b>不能边下边看</b>」，<b>那是过时的错误描述</b>。
+///    实际 <see cref="SharedFileStorage"/> 已经通过两件事支持边下边看：
+///    ① <see cref="EnsureLength"/> 预分配 —— 文件长度从第一秒就是全量，
+///       播放器不会因为「看到一截不完整文件」而拒绝打开；
+///    ② <see cref="WriteBypass"/> + moov 优先 —— 索引表单独抓下来直接写到文件末尾的正确偏移，
+///       所以下到几 MB 就能播。
+///    用户实测确认：现在用的就是共写，**确实能边下边看**。
+///    </para>
+///    <para>
+///    仍然存在的缺点：机械硬盘磁头疯狂寻道 → 磁盘 100%、吞吐反向崩塌；
+///    预分配 + 随机写有「长度对、内容坏」的风险（gopeed 也踩过，只能整份重下）——
+///    本项目用 16 MB 写合并窗口 + 完成时内容校验来压这两个风险。
+///    </para>
 ///
 /// 2. <b>顺序（Sequential）</b>：乱序到达的数据先进内存重排窗口，再严格按偏移递增
 ///    顺序刷盘。目标文件从偏移 0 起<b>连续增长</b>。
@@ -58,7 +69,11 @@ public interface IChunkStorage : IDisposable
     Task WriteAsync(long position, byte[] bytes, int length, bool fireAndForget = true);
 
     /// <summary>把窗口内可写的数据全部刷盘，并 fsync。下载完成时调用。</summary>
-    Task FlushAsync();
+    /// <param name="force">
+    /// true = 收尾/取消场景，必须真正落盘（暂停中也要放行）；
+    /// false = 周期刷盘，暂停时直接跳过。
+    /// </param>
+    Task FlushAsync(bool force = false);
 
     /// <summary>打开一个只读流用于校验/读取。</summary>
     Stream OpenRead();

@@ -224,7 +224,7 @@ public class DownloadService : AbstractDownloadService
             RefreshExtraReceivedBytes();
             SchedulePhase("正在写入磁盘…");
             var flushClock = System.Diagnostics.Stopwatch.StartNew();
-            await (Package?.Storage?.FlushAsync() ?? Task.FromResult(0)).ConfigureAwait(false);
+            await (Package?.Storage?.FlushAsync(force: true) ?? Task.FromResult(0)).ConfigureAwait(false);
             flushClock.Stop();
             CancelScheduledPhase();
             _logger?.LogInfo("收尾：刷盘耗时 " + flushClock.ElapsedMilliseconds + " ms");
@@ -320,7 +320,8 @@ public class DownloadService : AbstractDownloadService
         var isCancelled = state == DownloadStatus.Stopped;
         Package.IsSaveComplete = state == DownloadStatus.Completed;
         Status = state;
-        await (Package?.Storage?.FlushAsync() ?? Task.FromResult(0)).ConfigureAwait(false);
+        // 任务终态（完成/取消/失败）必须强制刷盘，不能因为处于暂停而跳过
+        await (Package?.Storage?.FlushAsync(force: true) ?? Task.FromResult(0)).ConfigureAwait(false);
         await (_logger?.FlushAsync() ?? Task.FromResult(0)).ConfigureAwait(false);
         OnDownloadFileCompleted(new AsyncCompletedEventArgs(error, isCancelled, Package));
     }
@@ -558,7 +559,7 @@ public class DownloadService : AbstractDownloadService
         int okCount = 0;
         for (int i = 0; i < written.Length; i++) okCount += written[i];
 
-        await Package.Storage.FlushAsync().ConfigureAwait(false);
+        await Package.Storage.FlushAsync(force: true).ConfigureAwait(false);
 
         if (okCount == pieces)
         {

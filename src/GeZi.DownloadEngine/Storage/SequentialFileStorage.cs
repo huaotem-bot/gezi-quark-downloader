@@ -310,7 +310,12 @@ public sealed class SequentialFileStorage : IChunkStorage
         }
     }
 
-    public async Task FlushAsync()
+    /// <summary>
+    /// 刷盘。顺序写**没有独立写线程**（worker 自己同步写），
+    /// 所以暂停时 worker 一停就没有新数据进来，不需要闸门概念。
+    /// <paramref name="force"/> 参数只为满足接口统一，这里忽略。
+    /// </summary>
+    public async Task FlushAsync(bool force = false)
     {
         // 反复排空：刷掉一块后可能又有新块接上，直到没有可刷的为止。
         // 下载完成时所有分片都已写入，这里必然能排空。

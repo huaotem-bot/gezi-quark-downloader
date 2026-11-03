@@ -145,7 +145,14 @@ namespace GeZi
                         captured = true;
                         capturedToken = tok;
                     },
-                    msg => LogDetail(msg));
+                    msg => LogDetail(msg),
+                    // 🚨🚨🚨 这里**必须**是 false，绝对不能传 true！
+                    //   自动续期的原理正是「profile 里的老会话还活着 →
+                    //   重开一次窗口页面自己就登好了 → 读 localStorage 拿到新令牌」。
+                    //   一旦清了 Cookie，这个机制会 100% 失效，
+                    //   用户会看到「凭证已保存」但阿里一直用不了，且无法自动恢复。
+                    //   （2026-11-03 加参数时特意显式写出来，防止以后有人顺手改成 true。）
+                    clearSessionOnStart: false);
 
                 // ⚠️ 必须放到虚拟屏幕之外，不能 Hide / 最小化 / 设 Opacity：
                 //    WebView2 是 HwndHost，窗口不可见时它不渲染、也不执行脚本。
@@ -214,7 +221,7 @@ namespace GeZi
                 _aliyunAutoRenewBlockedUntil = DateTime.UtcNow + AliyunAutoRenewCooldown;
                 Log("阿里自动续期未成功（内嵌浏览器里的登录态可能也已过期），"
                     + (int)AliyunAutoRenewCooldown.TotalMinutes
-                    + " 分钟内不再自动尝试；需要时点阿里卡的「内嵌登录」重新登录。");
+                    + " 分钟内不再自动尝试；需要时点阿里卡的「登录账号」重新登录。");
                 RefreshPanCards();
                 RefreshPanStateList();
             }

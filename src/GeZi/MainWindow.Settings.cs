@@ -170,6 +170,10 @@ namespace GeZi
                         Name = f.Name, Size = f.Size, Url = link.DownloadUrl, RelDir = f.RelDir,
                         Md5 = link.Md5, Sha1 = link.Sha1, Sha256 = link.Sha256,
                         Fid = f.Fid, Token = f.Token, FromShare = true,
+                        // 🚨 2026-11-03：把原始分享链接与转存 fid 也带上，
+                        //   续传记录靠它们实现「百分百可恢复」。
+                        ShareUrl = _shareUrl,
+                        SavedFid = link.StoredId,
                         // f.RelDir 是「相对当前浏览目录」的，拼上 shareDir 才是「相对分享进入点」的完整路径
                         Passcode = passcode, StartFid = startFid,
                         ShareRelDir = Path.Combine(shareDir, f.RelDir ?? ""),
@@ -298,6 +302,9 @@ namespace GeZi
                                 Md5 = link.Md5, Sha1 = link.Sha1, Sha256 = link.Sha256,
                                 // 转存后要按"新 fid"取链，所以这里记的是转存后的 fid，不是分享里的
                                 Fid = newFids[j], FromShare = false,
+                                // 🚨 2026-11-03：原始链接 + 转存后 fid 都带上（续传兜底）
+                                ShareUrl = _shareUrl,
+                                SavedFid = newFids[j],
                             });
                         else
                             LogDetail("无直链: " + batch[j].Name);
@@ -329,8 +336,14 @@ namespace GeZi
                 // 这里不再回填任何控件。
                 // ⚠️ 不要顺手把 PartsRoot 也清空 —— 老配置里它可能指向一个真实存在的老分片目录，
                 //    AllPartsRoots() 还要靠它去扫历史 .qparts 残留（见 MainWindow.Download.cs）。
-                // 2026-10-26：「落盘方式」整行已从设置页删除（策略固定，无选项），
-                // 这里不再刷新 StorageModeInfo 的悬停说明。
+                // 落盘方式（2026-11-03 恢复为用户可选）：0 = 顺序写，1 = 共写
+                if (StorageSequentialRadio != null && StorageSharedRadio != null)
+                {
+                    if (_settings.StorageMode == 0)
+                        StorageSequentialRadio.IsChecked = true;
+                    else
+                        StorageSharedRadio.IsChecked = true;
+                }
                 CloseActionBox.SelectedIndex = (int)_settings.OnCloseButton;
                 // 剪贴板自动解析（默认开）。注意这里**只回填控件**：真正的注册在窗口句柄
                 // 建好之后由 AttachWindowHooks→ApplyClipboardListener 做。
@@ -457,9 +470,11 @@ namespace GeZi
                 _settings.AutoClean = AutoCleanCheck.IsChecked == true;
                 // 2026-11-01（方案 B）：输入框已删除，这里不再取值、不再改写 PartsRoot，
                 // 也不再调 RegisterPartsDirHistory（没有入口能再改它，记历史已无意义）。
-                // 落盘策略 2026-10-24 起固定为「共写 + 写合并」（大厂形态），不再由用户选择。
-                // 字段保留只为兼容老配置：这里恒写 1，避免旧的 -1/0 在新版里被误读。
-                _settings.StorageMode = 1;
+                // 🚨 2026-11-03：落盘方式恢复成**用户可选**（用户明确要求）。
+                //   原来这里恒写 1（共写），把选择权写死了。
+                //   现在读设置页的单选：0 = 顺序写（机械盘推荐），1 = 共写（默认）。
+                _settings.StorageMode = (StorageSequentialRadio != null
+                    && StorageSequentialRadio.IsChecked == true) ? 0 : 1;
                 // 机械盘连接上限：用户自己选档位（32~256）。固态盘任务不受影响。
                 int hddIdx = HddThreadsBox.SelectedIndex;
                 if (hddIdx < 0 || hddIdx >= HddThreadPresets.Length) hddIdx = 3;   // 默认 128
