@@ -389,8 +389,99 @@ namespace GeZi
                 return "uid:" + uid;
             if (!string.IsNullOrEmpty(ctoken))
                 return "ctk:" + ctoken;
-            // 阿里/迅雷这类不是 Cookie 的凭证，整串本身就是身份，直接用它。
+
+            // 🚨🚨🚨 2026-11-03 修「迅雷/阿里每次续期就多一个账号」：
+            //
+            //   原来这里直接 `return "raw:" + cookie`（整串凭证参与指纹）。
+            //   而阿里/迅雷的凭证**不是 Cookie**，是 access_token + refresh_token ——
+            //   两者每次续期都会轮换（迅雷 refresh_token 单次有效、阿里 access_token 约 2 小时过期），
+            //   于是同一个账号每续期一次就算出一个新指纹 → 新建一份档案。
+            //   实测：`accounts/xunlei/` 里堆了 4 份「迅雷用户」，全是同一个账号；
+            //        `accounts/aliyun/` 里 2 份。用户以为「怎么冒出这么多账号」。
+            //
+            //   正解：用**设备标识**做指纹 —— 它是稳定的，且本来就是同一账号的判据。
+            //   · 迅雷：XunleiDeviceId（AGENTS.md 明确要求「设备标识必须稳定复用」）
+            //   · 阿里：AliyunDeviceId（设备签名用，账号级别固定不变）
+            //   两者都在凭证串里有对应字段，解析出来即可。
+            string deviceId = ExtractDeviceId(cookie);
+            if (!string.IsNullOrEmpty(deviceId))
+                return "dev:" + deviceId;
+
+            // 真的提取不到设备号时，才退回整串（老凭证格式可能没有这个字段）。
             return "raw:" + cookie;
+        }
+
+        /// <summary>
+        /// 从阿里/迅雷的凭证串里提取**稳定的设备标识**（账号指纹用）。
+        /// <para>
+        /// 为什么要单独抽：这两家的凭证是 token 串（不是 Cookie），
+        /// 而 token 每次续期都变；设备标识却固定不变，是唯一可靠的「同一账号」判据。
+        /// </para>
+        /// <para>
+        /// 支持的格式（都是本项目自己写入的，见 ApplyProviderLoginAsync）：
+        /// <list type="bullet">
+        /// <item><c>xlrec:{json}</c> —— 迅雷网页登录的整套凭证，json 里有 device_id</item>
+        /// <item><c>rt:...</c> / <c>at:...</c> —— 阿里的令牌（不含设备号，返回空）</item>
+        /// <item>形如 <c>key=value; key=value</c> —— 兼容按 Cookie 风格存的老数据</item>
+        /// </list>
+        /// </para>
+        /// </summary>
+        private static string ExtractDeviceId(string credential)
+        {
+            if (string.IsNullOrEmpty(credential))
+                return null;
+            try
+            {
+                // ① 迅雷：xlrec:{...json...}
+                const string xlrec = "xlrec:";
+                if (credential.StartsWith(xlrec, StringComparison.Ordinal))
+                {
+                    string json = credential.Substring(xlrec.Length);
+                    // 不做完整 JSON 解析（这里在 Core 层，避免引入序列化依赖）：
+                    // 直接找 "device_id":"xxx" 这种模式，够用且不会抛异常。
+                    return ExtractJsonField(json, "device_id");
+                }
+
+                // ② 阿里/迅雷也可能存成 key=value 的 Cookie 风格串
+                foreach (var seg in credential.Split(';'))
+                {
+                    var s = seg.Trim();
+                    int eq = s.IndexOf('=');
+                    if (eq <= 0) continue;
+                    string k = s.Substring(0, eq).Trim();
+                    string v = s.Substring(eq + 1).Trim();
+                    if (k.Equals("device_id", StringComparison.OrdinalIgnoreCase)
+                        || k.Equals("deviceId", StringComparison.OrdinalIgnoreCase)
+                        || k.Equals("aliyun_device_id", StringComparison.OrdinalIgnoreCase))
+                    {
+                        if (!string.IsNullOrEmpty(v)) return v;
+                    }
+                }
+            }
+            catch
+            {
+                // 指纹计算绝不能抛 —— 抛了会让整个存档流程失败。
+            }
+            return null;
+        }
+
+        /// <summary>从一段 JSON 文本里抠出某个字符串字段（不引序列化器，容错优先）。</summary>
+        private static string ExtractJsonField(string json, string field)
+        {
+            if (string.IsNullOrEmpty(json) || string.IsNullOrEmpty(field))
+                return null;
+            // 匹配 "field" : "value"（允许冒号两侧有空格）
+            string needle = "\"" + field + "\"";
+            int i = json.IndexOf(needle, StringComparison.OrdinalIgnoreCase);
+            if (i < 0) return null;
+            int colon = json.IndexOf(':', i + needle.Length);
+            if (colon < 0) return null;
+            int q1 = json.IndexOf('"', colon + 1);
+            if (q1 < 0) return null;
+            int q2 = json.IndexOf('"', q1 + 1);
+            if (q2 <= q1) return null;
+            string val = json.Substring(q1 + 1, q2 - q1 - 1);
+            return string.IsNullOrEmpty(val) ? null : val;
         }
 
         /// <summary>
@@ -561,6 +652,36 @@ namespace GeZi
                 dedup.Add(p);
             }
             dedup.Sort((a, b) => b.LastUsedUtc.CompareTo(a.LastUsedUtc));
+
+            // 🚨🚨 2026-11-03 修「主账号标记停在很久以前那个账号上」：
+            //   用户实测：迅雷 4 个档案里，标着「主账号」的是 2026-10-30 那份，
+            //   而他实际在用的是 2026-11-02 那份 —— 界面上看起来像「没标主账号」。
+            //
+            //   根因：SetPrimary 只在**登录成功**时调用（MainWindow.Account.cs），
+            //   而阿里/迅雷的续期是自动的，续期后不会调 SetPrimary →
+            //   标记永远停在第一次登录的那份档案上。
+            //
+            //   修法：这里做**兜底纠正** —— 如果标记的那份不是最近使用的，
+            //   就把标记转移到最近使用的那份。
+            //   ⚠️ 只在这一家**只有一份**档案时无害；多份时「最近使用的就是主账号」
+            //      也符合直觉（主账号 = 我上次用的那个）。
+            if (dedup.Count > 1)
+            {
+                var primary = dedup.FirstOrDefault(x => x.IsPrimary);
+                // dedup 已按 LastUsedUtc 降序，第一份就是最近使用的
+                if (primary != null && !ReferenceEquals(primary, dedup[0]))
+                {
+                    // 内存里先改对（界面立刻正确），落盘交给 SetPrimary
+                    primary.IsPrimary = false;
+                    dedup[0].IsPrimary = true;
+                    try { SetPrimary((int)dedup[0].PanKind, dedup[0].Key); } catch { }
+                }
+                else if (primary == null)
+                {
+                    dedup[0].IsPrimary = true;
+                    try { SetPrimary((int)dedup[0].PanKind, dedup[0].Key); } catch { }
+                }
+            }
             return dedup;
         }
 

@@ -291,22 +291,32 @@ namespace GeZi
         /// <summary>点赞赏码 → 弹一个放大的窗口（和 Flet 版的「赞赏支持」弹窗同一个意思）。</summary>
         private void OnQrClick(object sender, RoutedEventArgs e)
         {
-            try { ShowReward(); } catch { }
+            try { ShowReward(this); } catch { }
         }
 
-        private void ShowReward()
+        /// <summary>
+        /// 只弹「赞赏码」小窗（**不打开整个关于窗口**）。
+        /// <para>
+        /// 🚨 2026-11-03 用户实测：「点赞赏支持为什么弹出旧版关于界面？」
+        /// 根因是主窗口的 <c>OnAboutReward</c> 直接 <c>new AboutWindow().ShowDialog()</c> ——
+        /// 把整个关于窗口（品牌区 + 功能特性 + 赞赏码）都弹出来了。
+        /// 赞赏入口只该给赞赏码，所以把这段逻辑抽成**静态方法**，主窗口直接调用。
+        /// </para>
+        /// </summary>
+        public static void ShowReward(Window owner)
         {
             var win = new Window
             {
-                Owner = this,
+                Owner = owner,
                 Title = "赞赏支持",
                 WindowStyle = WindowStyle.None,
                 ResizeMode = ResizeMode.NoResize,
                 SizeToContent = SizeToContent.WidthAndHeight,
                 ShowInTaskbar = false,
                 WindowStartupLocation = WindowStartupLocation.CenterOwner,
-                Background = (Brush)FindResource("SurfaceBrush"),
-                FontFamily = (FontFamily)FindResource("AppFontFamily"),
+                // ⚠️ 静态方法里没有实例 FindResource，统一走 Application.Current。
+                Background = (Brush)Application.Current.FindResource("SurfaceBrush"),
+                FontFamily = (FontFamily)Application.Current.FindResource("AppFontFamily"),
                 SnapsToDevicePixels = true,
                 UseLayoutRounding = true,
             };
@@ -337,7 +347,7 @@ namespace GeZi
                 MinWidth = 96,
                 HorizontalAlignment = HorizontalAlignment.Center,
                 Margin = new Thickness(0, 14, 0, 0),
-                Style = FindResource("PrimaryButton") as Style,
+                Style = Application.Current.FindResource("PrimaryButton") as Style,
             };
             close.Click += (s2, e2) => { try { win.Close(); } catch { } };
 
@@ -348,7 +358,7 @@ namespace GeZi
                 FontSize = 14,
                 FontWeight = FontWeights.SemiBold,
                 HorizontalAlignment = HorizontalAlignment.Center,
-                Foreground = (Brush)FindResource("TextPrimaryBrush"),
+                Foreground = (Brush)Application.Current.FindResource("TextPrimaryBrush"),
             });
             panel.Children.Add(new TextBlock
             {
@@ -356,14 +366,14 @@ namespace GeZi
                 FontSize = 11,
                 Margin = new Thickness(0, 4, 0, 10),
                 HorizontalAlignment = HorizontalAlignment.Center,
-                Foreground = (Brush)FindResource("TextTertiaryBrush"),
+                Foreground = (Brush)Application.Current.FindResource("TextTertiaryBrush"),
             });
             panel.Children.Add(img);
             panel.Children.Add(close);
 
             win.Content = new Border
             {
-                BorderBrush = (Brush)FindResource("BorderBrushSoft"),
+                BorderBrush = (Brush)Application.Current.FindResource("BorderBrushSoft"),
                 BorderThickness = new Thickness(1),
                 Child = panel,
             };

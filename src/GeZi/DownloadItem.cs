@@ -68,5 +68,20 @@ namespace GeZi
         /// 仅供重解析分享时逐级定位文件；本地路径仍看 <see cref="RelDir"/>。
         /// </summary>
         public string ShareRelDir;
+
+        /// <summary>
+        /// 原始分享链接（完整 URL）。
+        /// <para>
+        /// 🚨 2026-11-03：续传记录的「百分百兜底」—— PwdId / stoken 都会过期或丢失，
+        /// 但只要还有原始链接，就能重新解析分享拿全套新凭证。
+        /// 以前从来没存过，所以 PwdId 一丢这条任务就永久废了。
+        /// </para>
+        /// </summary>
+        public string ShareUrl;
+
+        /// <summary>
+        /// 转存后的文件 fid（走「转存→取直链」时文件已在自己网盘，取链要用这个）。
+        /// </summary>
+        public string SavedFid;
     }
 }

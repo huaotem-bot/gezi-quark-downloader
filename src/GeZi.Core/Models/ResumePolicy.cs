@@ -53,8 +53,64 @@ namespace GeZi.Core.Models
         public static bool CanResume(string dest, string fid, bool fromShare,
             string token, string pwdId, string stoken, int panKind = 0)
         {
-            if (string.IsNullOrEmpty(dest) || string.IsNullOrEmpty(fid))
-                return false;
+            return Check(dest, fid, fromShare, token, pwdId, stoken, panKind, null).Can;
+        }
+
+        /// <summary>
+        /// 续传可行性检查的**完整结果**：能不能 + 为什么 + 用户该怎么办。
+        /// <para>
+        /// 🚨 2026-11-03 新增。原来 <see cref="CanResume"/> 只返回 bool，
+        /// 界面上只能显示一句笼统的「需重新解析」，用户根本不知道到底缺什么、
+        /// 该做什么。现在把原因和下一步动作一起返回，界面直接展示。
+        /// </para>
+        /// </summary>
+        public sealed class ResumeCheckResult
+        {
+            /// <summary>能不能续传。</summary>
+            public bool Can;
+
+            /// <summary>不能续传时的**原因**（人话，直接显示给用户）。空 = 能续传。</summary>
+            public string Reason;
+
+            /// <summary>用户该做什么（人话）。空 = 无需操作。</summary>
+            public string NextAction;
+
+            /// <summary>简短徽章文字（界面右上角小标签），空 = 不显示。</summary>
+            public string Badge;
+        }
+
+        /// <summary>
+        /// 检查能否续传，并给出原因与下一步动作。
+        /// </summary>
+        /// <param name="shareUrl">
+        /// 原始分享链接。有它就能重新解析分享拿全套凭证 —— 这是「百分百能续传」的兜底。
+        /// 旧记录没有这个字段，传 null 即可。
+        /// </param>
+        public static ResumeCheckResult Check(string dest, string fid, bool fromShare,
+            string token, string pwdId, string stoken, int panKind = 0,
+            string shareUrl = null)
+        {
+            if (string.IsNullOrEmpty(dest))
+            {
+                return new ResumeCheckResult
+                {
+                    Can = false,
+                    Reason = "这条记录没存下载路径，不知道文件该写到哪。",
+                    NextAction = "回到「下载」页重新下载这个文件。",
+                    Badge = "缺下载路径",
+                };
+            }
+
+            if (string.IsNullOrEmpty(fid))
+            {
+                return new ResumeCheckResult
+                {
+                    Can = false,
+                    Reason = "这条记录没存文件 ID，没法向网盘要直链。",
+                    NextAction = "回到「下载」页重新解析并下载这个文件。",
+                    Badge = "缺文件信息",
+                };
+            }
 
             if (fromShare)
             {
@@ -70,15 +126,41 @@ namespace GeZi.Core.Models
                 //   「明明能下，为什么这条不能续传」。
                 //   ⇒ 阿里/迅雷只要有 fid + dest 就可续传（直链由 provider 重取）。
                 if (panKind == 2 || panKind == 3)
-                    return true;
+                {
+                    // 阿里/迅雷：provider 内部自己转存，有 fid 就能重取链。
+                    // ⚠️ 但有个真实失败场景：记录是 2026-11-02 之前建的，
+                    //    那时**没写 PwdId**，而阿里 provider 的 GetShareTokenAsync
+                    //    需要 share_id —— 不过它还有 TryOwnDriveDownloadUrlAsync 兜底
+                    //    （用 f.Fid 直接取自有网盘直链），所以有 fid 仍可一试。
+                    return new ResumeCheckResult { Can = true };
+                }
 
-                return !string.IsNullOrEmpty(token)
+                // 夸克 / UC 分享：必须有 pwd_id + stoken + share_fid_token 三件套。
+                // ⚠️ 但有**原始分享链接**时就能自愈：重新解析分享即可拿到全新三件套，
+                //    所以「三件套缺失」只在**链接也丢了**时才真正不可续传。
+                bool hasCred = !string.IsNullOrEmpty(token)
                     && !string.IsNullOrEmpty(pwdId)
                     && !string.IsNullOrEmpty(stoken);
+                if (hasCred)
+                    return new ResumeCheckResult { Can = true };
+
+                if (!string.IsNullOrEmpty(shareUrl))
+                {
+                    // 凭证过期但链接还在 → 续传时会自动重解析，用户无感。
+                    return new ResumeCheckResult { Can = true };
+                }
+
+                return new ResumeCheckResult
+                {
+                    Can = false,
+                    Reason = "这条记录缺分享信息（分享 ID / 凭证），也没存原始分享链接，没法重新取直链。",
+                    NextAction = "回到「下载」页把这个分享重新解析一次，再点下载 —— 分片都还在，会接着下，不会重下。",
+                    Badge = "需重新解析",
+                };
             }
 
             // 我的网盘：有 fid + dest 就够（直链可以重取）
-            return true;
+            return new ResumeCheckResult { Can = true };
         }
     }
 }

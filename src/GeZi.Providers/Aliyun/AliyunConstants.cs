@@ -127,6 +127,16 @@ namespace GeZi.Providers.Aliyun
         public const string FileCreatePath = "/adrive/v2/file/createWithFolders";
 
         /// <summary>
+        /// 转存用的**中转文件夹名**（网盘根目录下）。
+        /// <para>
+        /// 🚨 2026-11-03 统一：必须与夸克/UC（<c>QuarkConstants.DefaultFolder</c>）、
+        /// 迅雷（<c>XunleiConstants.TempFolderName</c>）保持**同一个名字**，
+        /// 否则用户在「我的网盘」里会看到三套不同名字的文件夹，根本分不清哪个是本软件的。
+        /// </para>
+        /// </summary>
+        public const string TransitFolderName = "GeZi";
+
+        /// <summary>
         /// 阿里批量操作网关。新版把转存（<see cref="FileCopyPath"/>）、改名等收在这里，
         /// 请求体形如 <c>{resource:"file", requests:[{id,method,url,headers,body}]}</c>，
         /// 响应 <c>{responses:[{id,status,body}]}</c>。

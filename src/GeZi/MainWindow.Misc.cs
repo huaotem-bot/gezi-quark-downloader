@@ -772,23 +772,25 @@ namespace GeZi
         }
 
 
-        /// <summary>关于页「赞赏支持」：打开赞赏码（复用旧关于窗口那张图）。</summary>
+        /// <summary>关于页「赞赏支持」：**只弹赞赏码**，不打开整个关于窗口。</summary>
         private void OnAboutReward(object sender, RoutedEventArgs e)
         {
+            // 🚨🚨 2026-11-03 修「点赞赏支持弹出了旧版关于界面」：
+            //   原来这里写的是 `new AboutWindow().ShowDialog()` ——
+            //   把整个关于窗口（品牌区 + 开源地址 + 8 个功能特性格子 + 赞赏码）都弹出来了。
+            //   用户只是要点赞赏码，不该看到一整页软件介绍。
+            //   ⇒ 改调 AboutWindow 里那个**静态的**只弹赞赏码的方法。
             try
             {
-                // AboutWindow 里集中放着赞赏码，直接打开它即可
-                //（新关于页只提供入口，图片资源不重复维护）。
-                var w = new AboutWindow { Owner = this };
-                w.ShowDialog();
+                AboutWindow.ShowReward(this);
             }
             catch (Exception ex)
             {
-                Log("打开赞赏页失败：" + ex.Message);
+                Log("打开赞赏码失败：" + ex.Message);
             }
         }
 
-        /// <summary>关于页「GitHub 开源地址」。</summary>
+        /// <summary>关于页「开源地址」（2026-11-03 按用户要求把「GitHub 开源地址」精简为「开源地址」）。</summary>
         private void OnAboutGithub(object sender, RoutedEventArgs e)
         {
             if (!ShellLaunch.OpenUrl(AboutRepoUrl))

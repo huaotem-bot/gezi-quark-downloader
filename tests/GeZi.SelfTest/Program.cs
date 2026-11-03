@@ -1688,6 +1688,42 @@ namespace GeZi.SelfTest
             Check("pending.uc_share_still_strict",
                 !ResumePolicy.CanResume(@"C:\x\u.pdf", "f10", true, null, null, null, 1),
                 "UC 分享缺凭证仍必须禁选");
+
+            // ============ 2026-11-03：ResumePolicy.Check（带原因）============
+            // 用户要求「真不能续传也要知道是什么原因」，所以 Check 必须给出 Reason/NextAction。
+
+            var ok = ResumePolicy.Check(@"C:\x\a.mp4", "f1", false, null, null, null);
+            Check("check.ok_has_no_reason", ok.Can && string.IsNullOrEmpty(ok.Reason),
+                "可续传时不该有原因文案");
+
+            var noDest = ResumePolicy.Check(null, "f2", false, null, null, null);
+            Check("check.no_dest", !noDest.Can && !string.IsNullOrEmpty(noDest.Reason)
+                && !string.IsNullOrEmpty(noDest.NextAction),
+                "缺下载路径：必须同时给出原因和下一步");
+
+            var noFid = ResumePolicy.Check(@"C:\x\c", "", false, null, null, null);
+            Check("check.no_fid", !noFid.Can && !string.IsNullOrEmpty(noFid.Reason)
+                && !string.IsNullOrEmpty(noFid.Badge),
+                "缺文件 ID：必须有原因与徽章文字");
+
+            // 夸克分享缺凭证且无原始链接 → 不可续传，且原因要说得清
+            var quarkNoLink = ResumePolicy.Check(@"C:\x\q.pdf", "f9", true, null, null, null, 0);
+            Check("check.quark_no_cred_no_link",
+                !quarkNoLink.Can && !string.IsNullOrEmpty(quarkNoLink.Reason)
+                && !string.IsNullOrEmpty(quarkNoLink.NextAction),
+                "夸克分享缺凭证且无链接：不可续传并说明怎么办");
+
+            // 🚨 关键：只要**有原始分享链接**，凭证缺失也能自愈 → 必须判为可续传
+            var quarkWithLink = ResumePolicy.Check(@"C:\x\q.pdf", "f9", true, null, null, null, 0,
+                "https://pan.quark.cn/s/abcdef");
+            Check("check.quark_has_link_ok", quarkWithLink.Can,
+                "有原始分享链接时，凭证过期也必须判为可续传（能自动重解析）");
+
+            // 阿里/迅雷：provider 内部转存，有 fid 就能续传
+            var ali = ResumePolicy.Check(@"C:\x\ali.pdf", "f7", true, null, null, null, 2);
+            Check("check.aliyun_ok", ali.Can, "阿里分享有 fid 即可续传");
+            var xl = ResumePolicy.Check(@"C:\x\xl.zip", "f8", true, null, null, null, 3);
+            Check("check.xunlei_ok", xl.Can, "迅雷分享有 fid 即可续传");
         }
 
 

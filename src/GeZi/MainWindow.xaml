@@ -759,6 +759,24 @@
                                                       StrokeLineJoin="Round"/>
                                             </MenuItem.Icon>
                                         </MenuItem>
+                                        <!-- 🚨 2026-11-03 用户要求：「我的网盘」右键菜单缺一个「删除文件」。
+                                             删除功能其实一直存在（MainWindow.Browse.cs 的删除实现），
+                                             只是**从来没挂到右键菜单上**，用户只能靠选中后按某个隐藏入口。
+                                             现在补成正式菜单项。
+                                             ⚠️ 阿里/迅雷的 provider 还没实现 DeleteAsync，
+                                                点击时会给「暂不支持」的明确提示（不是静默失败）。 -->
+                                        <Separator x:Name="DeleteFileSeparator" Visibility="Collapsed"/>
+                                        <MenuItem x:Name="DeleteFileMenuItem" Header="删除文件"
+                                                  Click="OnDeleteSelectedFiles"
+                                                  Visibility="Collapsed">
+                                            <MenuItem.Icon>
+                                                <Path Data="{StaticResource IconTrash}" Stretch="Uniform"
+                                                      Width="14" Height="14"
+                                                      Stroke="{DynamicResource DangerBrush}" StrokeThickness="1.7"
+                                                      StrokeStartLineCap="Round" StrokeEndLineCap="Round"
+                                                      StrokeLineJoin="Round"/>
+                                            </MenuItem.Icon>
+                                        </MenuItem>
                                     </ContextMenu>
                                 </ListBox.ContextMenu>
                                         <ListBox.ItemTemplate>
@@ -1729,7 +1747,17 @@
                                          这是本项目第 N 次栽在「Grid.Row 没有对应 RowDefinition」上
                                          （设置页第一版两列时也踩过一模一样的坑）。
                                          ⇒ 只要写了 Grid.Row，就必须数一遍 RowDefinitions 够不够。 -->
+                                    <!-- 🚨 2026-11-03 布局重排（用户指定）：
+                                         ① 「网络与下载」跨 Row 0-2 占满**整个左列**（红框范围）；
+                                         ② 「存储」从左边移到**右列**「窗口与后台」下方（绿框位置）；
+                                         ③ 「外观」顺延到右列第三行；
+                                         ④ 播放器仍在最底部横跨两列。
+                                         ⇒ 左列一张高卡、右列三张矮卡，两列高度自然接近，
+                                            彻底消除原来「左列两卡 710px vs 右列两卡 500px」的 210px 空洞。
+                                         ⚠️ 行数必须 ≥ 最大 Grid.Row+1：这里用了 Row 0/1/2 三行，
+                                            播放器在 Row 3 → **必须 4 个 RowDefinition**。 -->
                                     <Grid.RowDefinitions>
+                                        <RowDefinition Height="Auto"/>
                                         <RowDefinition Height="Auto"/>
                                         <RowDefinition Height="Auto"/>
                                         <RowDefinition Height="Auto"/>
@@ -1738,7 +1766,8 @@
                                     <!-- ==================== 左列 ==================== -->
 
                                     <!-- ① 网络与下载 -->
-                                    <Border Grid.Row="0" Grid.Column="0" Style="{StaticResource SettingsCard}"
+                                    <!-- ① 网络与下载：跨 Row 0-2 占满整个左列（用户指定的红框范围） -->
+                                    <Border Grid.Row="0" Grid.RowSpan="3" Grid.Column="0" Style="{StaticResource SettingsCard}"
                                             Margin="0,0,12,14" HorizontalAlignment="Stretch">
                                         <StackPanel>
                                             <Grid Style="{StaticResource SettingsCardHeader}">
@@ -1750,6 +1779,12 @@
                                                                Margin="10,0,0,0"/>
                                                 </StackPanel>
                                             </Grid>
+
+                                            <!-- ========== 子分区 ①：连接与并发 ==========
+                                                 2026-11-03 用户要求「网络与下载卡做分层」。
+                                                 原来四个字段平铺，看不出哪些是一类。
+                                                 现在按「连接 / 机械盘 / 网络」分成三块，各带小标题。 -->
+                                            <TextBlock Text="连接与并发" Style="{StaticResource SectionLabel}"/>
 
                                             <Grid Style="{StaticResource SettingsRow3}">
                                                 <Grid.ColumnDefinitions>
@@ -1782,6 +1817,13 @@
                                                                Text="迅雷最多 16、阿里最多 64、UC 最多 256 —— 超过会自动按网盘上限降下来。"/>
                                                 </StackPanel>
                                             </Grid>
+
+                                            <!-- ========== 子分区 ②：机械盘保护（独立成块） ==========
+                                                 用户要求：「为机械盘设置单独空间，但仍放在『网络与下载』卡片内部」。
+                                                 机械盘的限制和「网络」是两回事 —— 那是**落盘**约束，
+                                                 不是带宽约束，所以视觉上必须分开。 -->
+                                            <Border Style="{StaticResource SettingsDivider}" Margin="0,4,0,14"/>
+                                            <TextBlock Text="机械盘保护" Style="{StaticResource SectionLabel}"/>
 
                                             <Grid Style="{StaticResource SettingsRow3}">
                                                 <Grid.ColumnDefinitions>
@@ -1837,6 +1879,10 @@
                                                 </StackPanel>
                                             </Grid>
 
+                                            <!-- ========== 子分区 ③：网络 ========== -->
+                                            <Border Style="{StaticResource SettingsDivider}" Margin="0,4,0,14"/>
+                                            <TextBlock Text="网络" Style="{StaticResource SectionLabel}"/>
+
                                             <Grid Style="{StaticResource SettingsRow3}" Margin="0">
                                                 <Grid.ColumnDefinitions>
                                                     <ColumnDefinition Width="160"/>
@@ -1862,8 +1908,9 @@
                                     </Border>
 
                                     <!-- ② 存储（从左列第 2 张 → 仍是左列，与「网络与下载」同列配平） -->
-                                    <Border Grid.Row="1" Grid.Column="0" Style="{StaticResource SettingsCard}"
-                                            Margin="0,0,12,0" HorizontalAlignment="Stretch">
+                                    <!-- ② 存储：从左边移到**右列**「窗口与后台」下方（用户指定的绿框位置） -->
+                                    <Border Grid.Row="1" Grid.Column="1" Style="{StaticResource SettingsCard}"
+                                            Margin="0,0,0,14" HorizontalAlignment="Stretch">
                                         <StackPanel>
                                             <Grid Style="{StaticResource SettingsCardHeader}">
                                                 <StackPanel Orientation="Horizontal">
@@ -2006,7 +2053,8 @@
                                     </Border>
 
                                     <!-- ④ 外观 -->
-                                    <Border Grid.Row="1" Grid.Column="1" Style="{StaticResource SettingsCard}"
+                                    <!-- ③ 外观：顺延到右列第三行 -->
+                                    <Border Grid.Row="2" Grid.Column="1" Style="{StaticResource SettingsCard}"
                                             Margin="0,0,0,0" HorizontalAlignment="Stretch">
                                         <StackPanel>
                                             <Grid Style="{StaticResource SettingsCardHeader}">
@@ -2113,9 +2161,10 @@
                                     </Border>
 
                                     <!-- ⑤ 播放器（边下边播用）—— 横跨两列，压成一行横条 -->
-                                    <Border Grid.Row="2" Grid.Column="0" Grid.ColumnSpan="2"
+                                    <!-- ④ 播放器：最底部横跨两列（Row 3） -->
+                                    <Border Grid.Row="3" Grid.Column="0" Grid.ColumnSpan="2"
                                             Style="{StaticResource SettingsCard}"
-                                            Margin="0,14,0,0" Padding="22,16" HorizontalAlignment="Stretch">
+                                            Margin="0,0,0,0" Padding="22,16" HorizontalAlignment="Stretch">
                                         <Grid>
                                             <Grid.ColumnDefinitions>
                                                 <ColumnDefinition Width="Auto"/>
@@ -2612,22 +2661,32 @@
                                                    Foreground="{DynamicResource TextTertiaryBrush}"/>
                                     </StackPanel>
 
-                                    <!-- 操作按钮：主操作放右边，与品牌信息形成左右平衡 -->
-                                    <StackPanel Grid.Column="2" Orientation="Horizontal" VerticalAlignment="Center">
-                                        <Button Content="检查更新" Click="OnAboutCheckUpdate"
-                                                Style="{StaticResource SecondaryButton}" Margin="0,0,8,0"/>
-                                        <Button Content="赞赏支持" Click="OnAboutReward"
-                                                Style="{StaticResource SecondaryButton}"/>
+                                    <!-- 操作按钮 + 检查更新结果（右上角）。
+                                         🚨 2026-11-03 用户要求：状态文字原来在整张卡**左下方**，
+                                         点完「检查更新」要往左下角找才看得到。
+                                         现在紧贴按钮下方、右对齐 —— 视线不用离开按钮。
+                                         ⚠️ 预留 MinHeight，避免文字出现/消失导致品牌卡高度跳动。 -->
+                                    <StackPanel Grid.Column="2" VerticalAlignment="Center" MinWidth="230">
+                                        <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+                                            <Button Content="检查更新" Click="OnAboutCheckUpdate"
+                                                    Style="{StaticResource SecondaryButton}" Margin="0,0,8,0"/>
+                                            <Button Content="赞赏支持" Click="OnAboutReward"
+                                                    Style="{StaticResource SecondaryButton}"/>
+                                        </StackPanel>
+                                        <TextBlock x:Name="AboutUpdateStatusText"
+                                                   FontSize="11.5" Margin="0,8,0,0"
+                                                   MinHeight="16"
+                                                   HorizontalAlignment="Right" TextAlignment="Right"
+                                                   MaxWidth="260" TextWrapping="Wrap"
+                                                   Visibility="Collapsed"
+                                                   Foreground="{DynamicResource TextTertiaryBrush}"/>
                                     </StackPanel>
                                 </Grid>
                             </Border>
 
-                            <!-- 检查更新的**可见反馈**：原来结果只写进日志区（在「任务」页），
-                                 用户在这页点按钮屏幕上毫无变化 → 以为没反应。 -->
-                            <TextBlock x:Name="AboutUpdateStatusText"
-                                       FontSize="11.5" Margin="0,-6,0,14"
-                                       TextWrapping="Wrap" Visibility="Collapsed"
-                                       Foreground="{DynamicResource TextTertiaryBrush}"/>
+                            <!-- 检查更新的状态文字**已移进品牌区右上角**（2026-11-03）。
+                                 原来它放在品牌卡外面，渲染在整张卡下方最左边，
+                                 用户点完「检查更新」要往左下角找才看得到结果。 -->
 
                             <!-- ==================== ② 数据条（扫一眼就知道） ====================
                                  四个等宽小格子并排，替代原来「四行文字」的读法。
@@ -2900,7 +2959,7 @@
 
                                     <StackPanel Grid.Column="1" Orientation="Horizontal" Margin="20,0,0,0"
                                                 VerticalAlignment="Center">
-                                        <Button Content="GitHub 开源地址" Click="OnAboutGithub"
+                                        <Button Content="开源地址" Click="OnAboutGithub"
                                                 Style="{StaticResource SecondaryButton}" Margin="0,0,8,0"/>
                                         <Button Content="作者 B 站" Click="OnAboutBilibili"
                                                 Style="{StaticResource SecondaryButton}"/>

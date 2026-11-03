@@ -356,6 +356,13 @@ namespace GeZi
             if (!string.IsNullOrEmpty(info.Passcode) && PassBox.Text.Trim() != info.Passcode)
                 PassBox.Text = info.Passcode;
             _pwdId = info.PwdId;
+            // 🚨 2026-11-03：记下**原始分享链接**（续传的百分百兜底）。
+            //   PwdId 只是 12 位短码，丢了就再也找不回这个分享；
+            //   完整链接可以随时重新解析、重新拿 stoken + share_fid_token。
+            //   优先用规范化后的链接（去掉口令文本、补全协议），没有就退回输入框原文。
+            //   （ShareUrlInfo 没有规范化链接字段，直接用输入框原文 ——
+            //    它本来就是用户粘的那段，重新解析时原样喂回去即可。）
+            _shareUrl = LinkBox != null ? LinkBox.Text.Trim() : null;
             // 提取码留下字段副本：下载器回调（线程池线程）不能读 PassBox，
             // 而自动重解析分享（换新 stoken）必须带上它。
             _passcode = passcode;
@@ -487,6 +494,10 @@ namespace GeZi
             //   后果：这类记录被 ResumePolicy 判成「缺分享凭证」→ 永远不可续传。
             //   分享 ID 本来就是现成的（shareRef.ShareId），没有理由不存。
             _pwdId = shareRef.ShareId ?? "";
+            // 🚨 2026-11-03：同样记下原始链接（续传兜底）。
+            //   阿里/迅雷的 PwdId 尤其重要 —— 它们的 provider 内部要先转存，
+            //   而转存需要 share_id；丢了 share_id 就只能靠原始链接重解析。
+            _shareUrl = LinkBox != null ? LinkBox.Text.Trim() : null;
             _stoken = "";   // 阿里/迅雷不走 stoken 那套（provider 内部自己处理）
             _linkCache.Clear();
             _dirCache.Clear();
@@ -972,6 +983,19 @@ namespace GeZi
                     ShareMode && !UsesProvider ? Visibility.Visible : Visibility.Collapsed;
             }
 
+            // 🚨 2026-11-03：新增「删除文件」的可见性。
+            //   只在**我的网盘**模式 + 有选中项时出现：
+            //   · 分享模式里的 fid 属于分享者，删不得（删了也是别人的文件）；
+            //   · 没选中任何东西时删谁？直接不显示，避免误点。
+            bool canDelete = !ShareMode
+                && FileList != null
+                && FileList.SelectedItems != null
+                && FileList.SelectedItems.Count > 0;
+            if (DeleteFileMenuItem != null)
+                DeleteFileMenuItem.Visibility = canDelete ? Visibility.Visible : Visibility.Collapsed;
+            if (DeleteFileSeparator != null)
+                DeleteFileSeparator.Visibility = canDelete ? Visibility.Visible : Visibility.Collapsed;
+
             // 🚨 2026-11-02 空菜单兜底（用户报「右键只剩一个白点」）：
             //   原来这个菜单只有「免转存下载」一项，我的网盘模式下它被折叠 →
             //   弹出的是**完全空白的菜单**，视觉上就是一个白色小点。
@@ -1024,6 +1048,21 @@ namespace GeZi
         /// 限制为「我的网盘」模式：分享模式里的 fid 属于分享者，删不得；
         /// 若用户是在分享模式下转存后又想删中转文件，请用设置里的自动清理或网盘端操作。
         /// </summary>
+        /// <summary>
+        /// 右键菜单「删除文件」的入口。
+        /// <para>
+        /// 🚨 2026-11-03：删除实现一直存在（<see cref="OnDeleteCloudSelected"/>），
+        /// 但**从来没挂到右键菜单上** —— 用户只能靠某个隐藏入口触发，
+        /// 于是在「我的网盘」里找不到删除按钮。现在补成正式菜单项，
+        /// 这里只做一次转发，避免把删除逻辑复制成两份。
+        /// </para>
+        /// </summary>
+        private void OnDeleteSelectedFiles(object sender, RoutedEventArgs e)
+        {
+            OnDeleteCloudSelected(sender, e);
+        }
+
+
         private async void OnDeleteCloudSelected(object sender, RoutedEventArgs e)
         {
             if (!IsLoggedInAny) { Log("请先登录"); return; }

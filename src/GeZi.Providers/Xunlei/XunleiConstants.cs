@@ -113,10 +113,19 @@ namespace GeZi.Providers.Xunlei
         public const string BatchDeletePath = "/drive/v1/files:batchDelete";
 
         /// <summary>
-        /// 转存用的临时文件夹名。取完直链立刻删，正常情况下用户看不到它；
-        /// 若程序异常退出，它会留在根目录（名字带「临时」便于用户自己识别清理）。
+        /// 转存用的临时文件夹名。
+        /// <para>
+        /// 🚨 2026-11-03 统一命名：原来四家网盘用了三套名字 ——
+        /// 夸克/UC 是 <c>GeZi</c>、迅雷是 <c>GeZi临时转存</c>、
+        /// 阿里是 <c>GeZi临时转存_&lt;16位随机&gt;</c>，用户在自己的网盘里看到一堆
+        /// 名字不一样的文件夹，根本分不清哪个是本软件的。现在统一成 <c>GeZi</c>。
+        /// </para>
+        /// <para>
+        /// ⚠️ 迅雷这边是**复用**同一个文件夹（见 XunleiClient 的 FindRootFolderAsync），
+        /// 不是每次新建，所以改名不会造成垃圾堆积。
+        /// </para>
         /// </summary>
-        public const string TempFolderName = "GeZi临时转存";
+        public const string TempFolderName = "GeZi";
 
         /// <summary>
         /// 设备标识参数名。

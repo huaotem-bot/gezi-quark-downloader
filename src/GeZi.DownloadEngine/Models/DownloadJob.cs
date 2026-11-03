@@ -188,16 +188,34 @@ namespace GeZi.DownloadEngine
         public string Sha1 { get; set; }
         public string Sha256 { get; set; }
 
-        /// <summary>是否具备重取链所需的全部信息。</summary>
+        /// <summary>
+        /// 原始分享链接（完整 URL）。
+        /// <para>
+        /// 🚨 2026-11-03：续传的「百分百兜底」—— PwdId / stoken 都会过期或丢失，
+        /// 但只要还有原始链接，就能重新解析分享拿全套新凭证。
+        /// </para>
+        /// </summary>
+        public string ShareUrl { get; set; }
+
+        /// <summary>转存后的文件 fid（「转存→取直链」时取链要用这个）。</summary>
+        public string SavedFid { get; set; }
+
+        /// <summary>
+        /// 是否具备重取链所需的全部信息。
+        /// <para>
+        /// 🚨 2026-11-03：改成**委托给 ResumePolicy**，不再自己写一份。
+        /// 原来这里和 <c>HistoryStore.PendingTask.CanResume</c> 各有一份判据，
+        /// 而这份**没算阿里/迅雷**（它们的分享任务天然没有 PwdId/Stoken）→
+        /// 同一个任务在引擎侧判「不可续传」、在界面侧判「可续传」，自相矛盾。
+        /// 判据只许有一份实现。
+        /// </para>
+        /// </summary>
         public bool CanResume
         {
             get
             {
-                if (string.IsNullOrEmpty(Dest) || string.IsNullOrEmpty(Fid)) return false;
-                if (!FromShare) return true;                       // 我的网盘：只需 fid
-                return !string.IsNullOrEmpty(Token)
-                    && !string.IsNullOrEmpty(PwdId)
-                    && !string.IsNullOrEmpty(Stoken);
+                return GeZi.Core.Models.ResumePolicy.CanResume(
+                    Dest, Fid, FromShare, Token, PwdId, Stoken, PanKind);
             }
         }
     }

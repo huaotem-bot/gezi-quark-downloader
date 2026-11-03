@@ -245,6 +245,17 @@ namespace GeZi
 
         private string _stoken;
 
+        /// <summary>
+        /// 当前解析的**原始分享链接**（完整 URL，含提取码若有）。
+        /// <para>
+        /// 🚨 2026-11-03：续传的「百分百兜底」。
+        /// PwdId 只有 12 位短码，丢了就再也找不回这个分享；
+        /// 而完整链接可以随时重新解析，重新拿到 stoken + share_fid_token。
+        /// 所以每次解析成功都要记下来，并随任务一起落盘。
+        /// </para>
+        /// </summary>
+        private string _shareUrl;
+
 
         /// <summary>
         /// 当前解析的分享属于哪个网盘。默认夸克 —— 也就是说，
@@ -1465,9 +1476,11 @@ namespace GeZi
             /// <summary>副文本：文件大小。</summary>
             public string SubText { get; }
 
-            /// <summary>右侧状态标记：不可续传时显示「需重新解析」，否则空串。</summary>
+            /// <summary>右侧状态标记：不可续传时显示 ResumePolicy 给的徽章文字，否则空串。</summary>
             public string BadgeText { get; }
-            public bool CanResume => Task != null && Task.CanResume;
+
+            /// <summary>能否续传。委托给 <see cref="CanResumeValue"/>（ResumePolicy 的结论）。</summary>
+            public bool CanResume => CanResumeValue;
 
             public PendingRow(PendingTask t)
             {
@@ -1495,13 +1508,26 @@ namespace GeZi
                 //   否则会出现「徽章说需重新解析、复选框却是可勾的」这种自相矛盾的界面。
                 //   阿里/迅雷（PanKind 2/3）的分享任务不需要 stoken，
                 //   所以它们**不该**出现这个徽章。
-                bool providerShare = t != null && t.FromShare
-                    && (t.PanKindValue == 2 || t.PanKindValue == 3);
-                bool lackShareCred = t != null && t.FromShare && !providerShare
-                    && (string.IsNullOrEmpty(t.Token) || string.IsNullOrEmpty(t.PwdId)
-                        || string.IsNullOrEmpty(t.Stoken));
-                BadgeText = lackShareCred ? "需重新解析" : "";
+                // 🚨 2026-11-03：判据**统一委托给 ResumePolicy.Check**，不再自己写一份。
+                //   原来这里自己拼了一套 `providerShare / lackShareCred` 逻辑，
+                //   与 ResumePolicy 各算各的 —— 结果就是用户截图里那种
+                //   「徽章不显示、但实际根本续传不了」的自相矛盾界面。
+                //   判据只许有一份实现，界面只负责展示它给的结论。
+                var chk = t != null ? t.Check() : null;
+                CanResumeValue = chk == null || chk.Can;
+                BadgeText = chk != null && !chk.Can ? (chk.Badge ?? "不可续传") : "";
+                // 悬停看完整原因 + 下一步动作（行内放不下长文案）
+                TipText = chk != null && !chk.Can
+                    ? ((chk.Reason ?? "") + (string.IsNullOrEmpty(chk.NextAction) ? "" : "\n\n" + chk.NextAction))
+                    : null;
+                Display = FileName + size + (CanResumeValue ? "" : "   （" + (chk?.Badge ?? "不可续传") + "）");
             }
+
+            /// <summary>这条任务到底能不能续传（由 ResumePolicy 判定，界面只展示）。</summary>
+            public bool CanResumeValue { get; private set; }
+
+            /// <summary>不可续传时的完整原因 + 下一步（鼠标悬停显示）。</summary>
+            public string TipText { get; private set; }
 
             public event PropertyChangedEventHandler PropertyChanged;
 

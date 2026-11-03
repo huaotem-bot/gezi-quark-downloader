@@ -954,6 +954,11 @@ namespace GeZi
                     {
                         PwdId = _pwdId, Stoken = _stoken, Passcode = item.Passcode,
                         Fid = item.Fid, Token = item.Token, FromShare = item.FromShare,
+                        // 🚨 2026-11-03：把「原始分享链接」和「转存后 fid」也带进续传记录。
+                        //   链接是百分百兜底（PwdId 丢了还能重解析），
+                        //   SavedFid 决定取链该用哪个 fid（转存后文件在网盘里）。
+                        ShareUrl = item.ShareUrl ?? _shareUrl,
+                        SavedFid = item.SavedFid,
                         RelDir = item.RelDir ?? "", Dest = dest, Size = item.Size,
                         Md5 = item.Md5, Sha1 = item.Sha1, Sha256 = item.Sha256,
                         // 自动重解析分享的上下文（stoken 过期时换新凭证用）
@@ -1626,6 +1631,9 @@ namespace GeZi
                         // 自动重解析分享的上下文（stoken 过期时换新凭证用）
                         StartFid = item.StartFid, ShareRelDir = item.ShareRelDir,
                         PanKind = (int)srcKind,
+                        // 🚨 2026-11-03：同第一处 —— 链接与转存 fid 都要落进续传记录。
+                        ShareUrl = item.ShareUrl ?? _shareUrl,
+                        SavedFid = item.SavedFid,
                     },
                 });
                 TrackItemForDest(dest, item);

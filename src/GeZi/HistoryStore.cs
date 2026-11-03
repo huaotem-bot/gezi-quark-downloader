@@ -602,6 +602,41 @@ namespace GeZi
     /// 新增字段一律用 <c>Order &gt; 9</c>，且旧文件没有这些字段时反序列化为默认值
     /// （DataContractJsonSerializer 允许缺字段），保证向后兼容。
     /// </summary>
+    /// <summary>
+    /// 一条未完成任务的**来源类型** —— 决定续传时该怎么重新取直链。
+    /// <para>
+    /// 🚨 2026-11-03 新增：原来只有 FromShare 一个 bool，却要表达三种语义，
+    /// 结果阿里/迅雷分享被当成「需要分享凭证」，续传必然失败（用户实测）。
+    /// 拆成枚举后，每个分支的取链方式一目了然。
+    /// </para>
+    /// </summary>
+    public enum PendingSource
+    {
+        /// <summary>我的网盘里的自有文件：按 Fid 走 OwnDownloadLinks，不需要任何分享凭证。</summary>
+        OwnDrive = 0,
+
+        /// <summary>
+        /// 分享免转存（不写入网盘，直接从分享取链）。
+        /// <para>夸克/UC 需要 pwd_id + stoken + share_fid_token 三件套。</para>
+        /// </summary>
+        ShareNoSave = 1,
+
+        /// <summary>
+        /// 分享已转存到自己网盘（夸克/UC 的「转存→取直链」）。
+        /// <para>文件在网盘里，取链用 SavedFid（没有则退回 Fid），不需要 stoken。</para>
+        /// </summary>
+        ShareSaved = 2,
+
+        /// <summary>
+        /// 阿里/迅雷分享：provider 内部自己完成「转存→取直链」。
+        /// <para>
+        /// 🚨 这一类的记录里 PwdId/Stoken **天然为空**，
+        /// 所以判据**绝不能**要求它们 —— 这是 2026-11-02 那批续传失败的根因。
+        /// </para>
+        /// </summary>
+        ShareProvider = 3,
+    }
+
     [DataContract]
     public class PendingTask
     {
@@ -658,6 +693,83 @@ namespace GeZi
         /// </summary>
         [DataMember(Order = 20)] public int PanKindValue { get; set; }
 
+        // ==================== 2026-11-03：续传信息补全（Order > 20） ====================
+        // 🚨 为什么必须加这几项：原来只有 FromShare 一个 bool，却要表达**三种**语义 ——
+        //    ① 夸克/UC 免转存分享（要 pwd_id + stoken + share_fid_token）；
+        //    ② 夸克/UC 转存后取链（按新 fid 取，不需要 stoken）；
+        //    ③ 阿里/迅雷分享（provider 内部自己转存，**不需要 share_id**）。
+        //    一个 bool 分不清，续传就会判错分支 → 必然失败。
+        //    而且**原始分享链接从来没存过**，PwdId 一丢就永远找不回来。
+        // ⚠️ 全部 Order > 20 且旧文件缺这些字段时反序列化为默认值，向后兼容。
+        // ⚠️ FromShare 必须**继续正确赋值**：它同时是「旧代码读新记录」的兼容桥梁。
+
+        /// <summary>
+        /// 这条任务的**来源类型**（见 <see cref="PendingSource"/>）。
+        /// <para>
+        /// 旧记录没有这个字段 → 反序列化得 0（OwnDrive）。
+        /// 所以读取时**必须**走 <see cref="ResolveSource"/>，它会结合 FromShare/PanKindValue 推导，
+        /// 不能直接用这个字段。
+        /// </para>
+        /// </summary>
+        [DataMember(Order = 21)] public int Source { get; set; }
+
+        /// <summary>
+        /// 原始分享链接（完整 URL，含提取码若有）。
+        /// <para>
+        /// 🚨 这是「百分百能续传」的关键兜底：PwdId / stoken 都会过期或丢失，
+        /// 但只要还有**原始链接**，就能重新解析分享、重新拿全套凭证。
+        /// 旧记录里没有 → 空串，此时只能靠 PwdId。
+        /// </para>
+        /// </summary>
+        [DataMember(Order = 22)] public string ShareUrl { get; set; }
+
+        /// <summary>
+        /// 转存后的文件 fid（分享已转存到自己网盘时才有值）。
+        /// <para>
+        /// 夸克/UC 走「转存→取直链」时，真正的文件在用户网盘里，
+        /// 取链要用**这个** fid 而不是分享里的原 fid。
+        /// </para>
+        /// </summary>
+        [DataMember(Order = 23)] public string SavedFid { get; set; }
+
+        /// <summary>
+        /// 上一次续传失败的真实原因（人话，直接显示在界面上）。
+        /// <para>
+        /// 原来失败原因只在日志里闪一下，用户重开软件后什么都看不到，
+        /// 只知道「这条不能续传」却不知道为什么。落盘后界面能直接告诉他。
+        /// </para>
+        /// </summary>
+        [DataMember(Order = 24)] public string ResumeHint { get; set; }
+
+        /// <summary>
+        /// 解析出**真正**的来源类型（兼容旧记录）。
+        /// <para>
+        /// 旧记录 <see cref="Source"/> 恒为 0，必须从 FromShare + PanKindValue 推导：
+        /// <list type="bullet">
+        /// <item>FromShare=false → 我的网盘（自有文件）；</item>
+        /// <item>FromShare=true + 阿里/迅雷 → provider 自己转存；</item>
+        /// <item>FromShare=true + 夸克/UC + 有 SavedFid → 已转存；</item>
+        /// <item>FromShare=true + 夸克/UC + 无 SavedFid → 免转存。</item>
+        /// </list>
+        /// </para>
+        /// </summary>
+        public PendingSource ResolveSource()
+        {
+            // 新记录直接采信（>0 说明是明确写过的）
+            if (Source > 0)
+                return (PendingSource)Source;
+
+            if (!FromShare)
+                return PendingSource.OwnDrive;
+
+            if (PanKindValue == 2 || PanKindValue == 3)
+                return PendingSource.ShareProvider;
+
+            return string.IsNullOrEmpty(SavedFid)
+                ? PendingSource.ShareNoSave
+                : PendingSource.ShareSaved;
+        }
+
         /// <summary>
         /// 是否具备"可自动重取链"的完整信息。
         /// 免转存（游客直链）任务缺 stoken/token，重启后无法重取 → 不可续传。
@@ -676,9 +788,18 @@ namespace GeZi
                 //      于是被挡住、标「需重新解析」，用户以为续传坏了，实际是被我拦了。
                 // 必须把 PanKindValue 一起传进去：阿里/迅雷的分享任务不需要 stoken
                 //（取链在 provider 内部完成），用统一判据会把它们误判成不可续传。
-                return GeZi.Core.Models.ResumePolicy.CanResume(
-                    Dest, Fid, FromShare, Token, PwdId, Stoken, PanKindValue);
+                return Check().Can;
             }
+        }
+
+        /// <summary>
+        /// 续传可行性**完整检查**（能不能 + 为什么 + 怎么办）。
+        /// <para>界面直接用它拿到「原因」和「下一步」，不用再自己拼文案。</para>
+        /// </summary>
+        public GeZi.Core.Models.ResumePolicy.ResumeCheckResult Check()
+        {
+            return GeZi.Core.Models.ResumePolicy.Check(
+                Dest, Fid, FromShare, Token, PwdId, Stoken, PanKindValue, ShareUrl);
         }
     }
 }

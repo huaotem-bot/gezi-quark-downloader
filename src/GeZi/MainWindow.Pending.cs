@@ -182,6 +182,16 @@ namespace GeZi
                             Sha256 = pi?.Sha256,
                             // 来源网盘：0=夸克。续传时据此选客户端，不能丢。
                             PanKindValue = pi?.PanKind ?? 0,
+                            // ==================== 2026-11-03：续传信息补全 ====================
+                            // 这三个字段是「百分百能续传」的核心：
+                            //   Source   —— 明确是「我的网盘 / 免转存 / 已转存 / provider 分享」，
+                            //               取代 FromShare 一个 bool 表达三种语义的旧做法；
+                            //   ShareUrl —— 原始分享链接，PwdId/stoken 都失效时的**唯一兜底**；
+                            //   SavedFid —— 转存后的 fid（取链要用它，不是分享里的原 fid）。
+                            // ⚠️ FromShare 仍然照常赋值（上面已有），它是「旧代码读新记录」的桥梁。
+                            Source = (int)ResolvePendingSource(pi),
+                            ShareUrl = pi?.ShareUrl,
+                            SavedFid = pi?.SavedFid,
                         });
                         if (!string.IsNullOrEmpty(t.Job.Dest))
                             seen.Add(t.Job.Dest);
@@ -439,8 +449,15 @@ namespace GeZi
                 // 按钮文案带上数量，用户一眼知道"我这一下会续几个"
                 resumeBtn.Content = picked > 0 ? "继续下载 (" + picked + ")" : "继续下载";
                 // 统计条：共 / 可续传 / 已勾选
-                statText.Text = string.Format("共 {0} 个任务 · 可续传 {1} 个 · 已勾选 {2} 个",
-                    wrappers.Count, wrappers.Count(w => w.CanResume), picked);
+                // 🚨 2026-11-03：不可续传的数量也点出来，用户一眼知道「有几条需要处理」。
+                int total = wrappers.Count;
+                int okCnt = wrappers.Count(w => w.CanResume);
+                int badCnt = total - okCnt;
+                statText.Text = badCnt > 0
+                    ? string.Format("共 {0} 个任务 · 可续传 {1} 个 · 需处理 {2} 个 · 已勾选 {3} 个",
+                        total, okCnt, badCnt, picked)
+                    : string.Format("共 {0} 个任务 · 可续传 {1} 个 · 已勾选 {2} 个",
+                        total, okCnt, picked);
             };
             foreach (var w in wrappers)
             {
@@ -709,9 +726,16 @@ namespace GeZi
             var subTb = new FrameworkElementFactory(typeof(TextBlock));
             subTb.SetValue(TextBlock.FontSizeProperty, 11.0);
             subTb.SetValue(TextBlock.MarginProperty, new Thickness(0, 3, 0, 0));
+            subTb.SetValue(TextBlock.TextWrappingProperty, TextWrapping.NoWrap);
+            subTb.SetValue(TextBlock.TextTrimmingProperty, TextTrimming.CharacterEllipsis);
             subTb.SetBinding(TextBlock.TextProperty, new Binding("SubText"));
             subTb.SetResourceReference(TextBlock.ForegroundProperty, "TextTertiaryBrush");
             textCol.AppendChild(subTb);
+
+            // 🚨 2026-11-03：整行挂 ToolTip，鼠标停上去就能看到**完整原因 + 下一步**。
+            //   原来只有一句「需重新解析」，用户根本不知道到底缺什么、该做什么。
+            //   行内放不下长文案，用 ToolTip 是唯一不破坏布局的做法。
+            root.SetBinding(FrameworkElement.ToolTipProperty, new Binding("TipText"));
 
             root.AppendChild(textCol);
 
@@ -1030,6 +1054,28 @@ namespace GeZi
         }
 
 
+        /// <summary>
+        /// 从 <see cref="PendingInfo"/> 推导出「来源类型」（写进续传记录用）。
+        /// <para>
+        /// 判据与 <c>PendingTask.ResolveSource()</c> 保持一致 —— 一个写、一个读，
+        /// 两边必须用同一套规则，否则新旧记录会互相打架。
+        /// </para>
+        /// </summary>
+        private static PendingSource ResolvePendingSource(PendingInfo pi)
+        {
+            if (pi == null || !pi.FromShare)
+                return PendingSource.OwnDrive;
+
+            int kind = pi.PanKind;
+            if (kind == 2 || kind == 3)
+                return PendingSource.ShareProvider;
+
+            return string.IsNullOrEmpty(pi.SavedFid)
+                ? PendingSource.ShareNoSave
+                : PendingSource.ShareSaved;
+        }
+
+
         private async Task ResumePendingBatchAsync(List<PendingTask> tasks)
         {
             // 「弹出续传窗口时我点继续下载，但左下角的账号卡
@@ -1107,7 +1153,13 @@ namespace GeZi
                         // 这条续传任务来自哪家网盘（记录里存的，不是当前登录账号）。
                         PanKind kind = (PanKind)p.PanKindValue;
 
-                        if (p.PanKindValue != 0 && p.FromShare)
+                        // 🚨 2026-11-03：改用**明确的来源枚举**分流，不再靠 FromShare 猜。
+                        //   原来 `PanKindValue != 0 && FromShare` 这一句把阿里/迅雷分享
+                        //   当成「需要分享凭证」，于是缺 PwdId 时直接判死 ——
+                        //   但阿里/迅雷的 provider 内部自己转存，本来就不需要 stoken。
+                        PendingSource src = p.ResolveSource();
+
+                        if (src == PendingSource.ShareProvider)
                         {
                             // 非夸克网盘的**分享**任务：用 provider 的分享取链接口。
                             //
@@ -1128,11 +1180,39 @@ namespace GeZi
                                     LogDetail("[" + (p.Name ?? "?") + "] 记录里缺分享 ID，已从分享历史恢复。");
                                 }
                             }
+                            // 🚨 2026-11-03：缺分享 ID 时**先试原始链接兜底**。
+                            //   原来这里直接判死并打印「这条记录是旧版本建的」——
+                            //   那句话是错的：阿里/迅雷的两条取链路径**从来没写过 PwdId**
+                            //   （见 MainWindow.Settings.cs 的 NoSaveGetItemsAsync / SaveAndGetItemsAsync），
+                            //   不是「旧版本」的问题，是当前代码就有的缺陷。
+                            if (string.IsNullOrEmpty(p.PwdId) && !string.IsNullOrEmpty(p.ShareUrl))
+                            {
+                                LogDetail("[" + (p.Name ?? "?") + "] 记录里缺分享 ID，正用原始分享链接重新解析…");
+                                try
+                                {
+                                    var info = ShareUrlParser.Parse(p.ShareUrl);
+                                    if (info != null && !string.IsNullOrEmpty(info.PwdId))
+                                    {
+                                        p.PwdId = info.PwdId;
+                                        if (string.IsNullOrEmpty(p.Passcode))
+                                            p.Passcode = info.Passcode;
+                                        if (string.IsNullOrEmpty(p.StartFid))
+                                            p.StartFid = info.StartFid;
+                                        LogDetail("[" + (p.Name ?? "?") + "] 已从原始链接重新解析出分享 ID。");
+                                    }
+                                }
+                                catch (Exception ex)
+                                {
+                                    LogDetail("[" + (p.Name ?? "?") + "] 重新解析分享链接失败: " + ex.Message);
+                                }
+                            }
+
                             if (string.IsNullOrEmpty(p.PwdId))
                             {
-                                // 缺分享 ID → 这条路**注定取不到链**，直接记「需要重新解析」，
-                                // 不去发那个必然失败的请求（省一次网络往返，也让日志更准）。
-                                LogDetail("[" + (p.Name ?? "?") + "] 这条记录是旧版本建的，缺分享信息，需要重新解析分享才能续传。");
+                                // 链接也没有 → 这条确实没法自动恢复，如实告知并说清怎么办。
+                                p.ResumeHint = "缺分享 ID 与原始分享链接，无法自动重取直链";
+                                LogDetail("[" + (p.Name ?? "?") + "] 这条记录既没有分享 ID、也没有原始分享链接，"
+                                    + "无法自动恢复。回「下载」页重新解析这个分享即可接着下（不会重下）。");
                                 needReparse.Add(p.Name ?? "?");
                                 continue;
                             }
@@ -1147,7 +1227,8 @@ namespace GeZi
                                 knownSizes[p] = shr.Size;
                             }
                         }
-                        else if (p.PanKindValue == 2 || p.PanKindValue == 3)
+                        else if (src == PendingSource.OwnDrive
+                            && (p.PanKindValue == 2 || p.PanKindValue == 3))
                         {
                             // 阿里 / 迅雷的**自有网盘**任务：走 provider 的 GetOwnDownloadLinksAsync。
                             //
@@ -1175,7 +1256,7 @@ namespace GeZi
                                 knownSizes[p] = own.Size;
                             }
                         }
-                        else if (p.FromShare)
+                        else if (src == PendingSource.ShareNoSave || src == PendingSource.ShareSaved)
                         {
                             // 分享续传必须要夸克登录态（换 stoken / 取直链都靠它）。
                             // 全局客户端可能是 null（登录失败、或当前登录的是阿里/迅雷），

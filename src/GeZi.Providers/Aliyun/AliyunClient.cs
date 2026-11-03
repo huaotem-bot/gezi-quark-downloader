@@ -954,6 +954,87 @@ namespace GeZi.Providers.Aliyun
         /// 等**下载结束**再删：提前删会让 CDN 回源失败（503 洪泛 + 速度崩）。
         /// </para>
         /// </summary>
+        /// <summary>
+        /// 确保网盘根目录下存在名为 <paramref name="name"/> 的文件夹，返回它的 file_id。
+        /// <para>
+        /// 🚨 2026-11-03：原来阿里每次下载都在**根目录**建一个 `GeZi临时转存_<随机>`，
+        /// 清理失败就会堆一堆垃圾，而且名字和夸克/UC 的 `GeZi` 完全不一样。
+        /// 现在统一成一个固定的 `GeZi`，每次任务在它**下面**建子目录。
+        /// </para>
+        /// <para>
+        /// 实现顺序：先按名字在根目录找 → 找到直接复用；没有才创建。
+        /// ⚠️ 创建用 <c>check_name_mode=refuse</c>，若并发下已被别的线程建好，
+        /// 会返回冲突错误 —— 此时**再找一次**即可（不要当失败）。
+        /// </para>
+        /// </summary>
+        private async Task<string> EnsureRootFolderAsync(string name, CancellationToken cancel)
+        {
+            if (string.IsNullOrEmpty(name)) return null;
+            try
+            {
+                string found = await FindRootFolderAsync(name, cancel).ConfigureAwait(false);
+                if (!string.IsNullOrEmpty(found))
+                    return found;
+
+                var mkBody = new Dictionary<string, object>
+                {
+                    { "drive_id", RequireOwnDriveId() },
+                    { "parent_file_id", "root" },
+                    { "name", name },
+                    { "type", "folder" },
+                    { "check_name_mode", "refuse" },
+                };
+                var mkRes = await PostJsonAsync(_apiBase + AliyunConstants.FileCreatePath, mkBody,
+                    _accessToken, cancel, null, _deviceId, _deviceSignature).ConfigureAwait(false);
+                string fid = PanJson.AsString(PanJson.Get(mkRes, "file_id"));
+                if (!string.IsNullOrEmpty(fid))
+                    return fid;
+
+                // 创建失败可能是「同名已存在」（并发）→ 再找一次。
+                return await FindRootFolderAsync(name, cancel).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                _lastSaveError = "阿里创建中转文件夹失败：" + ex.Message;
+                return null;
+            }
+        }
+
+        /// <summary>在网盘根目录按名字找文件夹，找不到返回 null。</summary>
+        private async Task<string> FindRootFolderAsync(string name, CancellationToken cancel)
+        {
+            try
+            {
+                var body = new Dictionary<string, object>
+                {
+                    { "drive_id", RequireOwnDriveId() },
+                    { "parent_file_id", "root" },
+                    { "limit", 100 },
+                    { "order_by", "name" },
+                    { "order_direction", "ASC" },
+                };
+                var res = await PostJsonAsync(_apiBase + "/adrive/v3/file/list", body,
+                    _accessToken, cancel, null, _deviceId, _deviceSignature).ConfigureAwait(false);
+                var items = PanJson.AsArray(PanJson.Get(res, "items"));
+                if (items == null) return null;
+                foreach (var it in items)
+                {
+                    string n = PanJson.AsString(PanJson.Get(it, "name"));
+                    string t = PanJson.AsString(PanJson.Get(it, "type"));
+                    if (string.Equals(n, name, StringComparison.Ordinal)
+                        && string.Equals(t, "folder", StringComparison.OrdinalIgnoreCase))
+                    {
+                        return PanJson.AsString(PanJson.Get(it, "file_id"));
+                    }
+                }
+            }
+            catch
+            {
+                // 找不到就当没有，交给创建逻辑
+            }
+            return null;
+        }
+
         /// <returns>失败返回 <c>(null, null)</c> 或 <c>(null, folderId)</c>，不抛异常 —— 它只是兜底路径。</returns>
         private async Task<(string url, string folderId)> SaveShareFileAsync(
             PanShareRef shareRef, PanFileEntry file, string shareToken, CancellationToken cancel)
@@ -980,12 +1061,30 @@ namespace GeZi.Providers.Aliyun
                     return (null, null);
                 }
 
-                // ① 建本次下载专用的临时目录（名字带 guid，避免并发下载互相覆盖）
-                string folderName = "GeZi临时转存_" + Guid.NewGuid().ToString("N").Substring(0, 16);
+                // ① 建临时目录。
+                //
+                // 🚨 2026-11-03 改成分两层（用户要求「转存文件夹名统一为 GeZi」）：
+                //   原来每次下载都建一个 `GeZi临时转存_<16位随机>` 在**根目录**，
+                //   好处是并发不冲突，坏处是**清理一旦失败就在根目录堆垃圾**，
+                //   而且和夸克/UC 的 `GeZi` 名字完全不一样，用户认不出是本软件的。
+                //
+                //   现在：先复用/创建固定的 `GeZi`（与夸克/UC 同名），
+                //        再在它下面建一个带随机后缀的子目录做本次任务的实际容器。
+                //   ⇒ 用户网盘根目录永远只有一个 `GeZi`；
+                //     清理只删子目录，`GeZi` 本身保留（下次继续用）。
+                string parentFid = await EnsureRootFolderAsync(AliyunConstants.TransitFolderName, cancel)
+                    .ConfigureAwait(false);
+                if (string.IsNullOrEmpty(parentFid))
+                {
+                    _lastSaveError = "阿里无法创建 GeZi 中转文件夹（根目录无写权限？）";
+                    return (null, null);
+                }
+
+                string folderName = "t_" + Guid.NewGuid().ToString("N").Substring(0, 12);
                 var mkBody = new Dictionary<string, object>
                 {
                     { "drive_id", RequireOwnDriveId() },
-                    { "parent_file_id", "root" },
+                    { "parent_file_id", parentFid },
                     { "name", folderName },
                     { "type", "folder" },
                     { "check_name_mode", "refuse" },
