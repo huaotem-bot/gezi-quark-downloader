@@ -1081,23 +1081,34 @@ namespace GeZi
             var fids = selected.Select(f => f.Fid).Where(f => !string.IsNullOrEmpty(f)).ToList();
             if (fids.Count == 0) return;
 
-            // 阿里/迅雷的客户端目前只实现了"浏览 + 取直链"，没有删除接口。
-            // 与其让它抛一个晦涩的异常，不如直接说清楚。
-            if (!OwnIsQuarkLike)
-            {
-                AppDialog.Show(this,
-                    ActivePanDisplayName + " 目前只支持浏览与下载，暂不支持在软件内删除文件。\n\n"
-                    + "需要删除的话，请到网页版操作。",
-                    "暂不支持", MessageBoxButton.OK, MessageBoxImage.Information);
-                return;
-            }
-
+            // 🚨🚨 2026-11-04 修「阿里/迅雷不能删除」：
+            //   原来这里写死 `if (!OwnIsQuarkLike) 提示暂不支持` —— **那是错的**。
+            //   实测查证：两家的删除能力**早就实现了**，只是没有公开入口：
+            //     · 阿里：POST /v2/recyclebin/trash（AliyunClient.CleanupStoredAsync 用的就是它）
+            //             refs/wenxi/lib/data/providers/aliyun.dart:1205 delete()
+            //     · 迅雷：POST /drive/v1/files:batchDelete（XunleiClient.CleanupStoredAsync 内部就是它）
+            //             refs/YunX/.../XunleiApi.kt:625 batchDelete()
+            //   现在给 IPanProvider 加了 DeleteFilesAsync，四家统一走它。
             SetBusy(true);
             try
             {
                 LogDetail("正在删除网盘文件 " + fids.Count + " 项…");
-                await _client.DeleteAsync(fids);
-                try { await _client.PurgeRecycleAsync(fids); } catch { }
+
+                if (OwnIsQuarkLike)
+                {
+                    // 夸克 / UC：走当前登录账号的 QuarkClient（带 keepalive，令牌最新）
+                    await _client.DeleteAsync(fids);
+                    try { await _client.PurgeRecycleAsync(fids); } catch { }
+                }
+                else
+                {
+                    // 阿里 / 迅雷：走 provider 的 DeleteFilesAsync
+                    var provider = _ownProvider ?? CreateProviderFor(_activeKind);
+                    if (provider == null)
+                        throw new InvalidOperationException("这家网盘的客户端未就绪，请重新登录后再试。");
+                    await provider.DeleteFilesAsync(fids);
+                }
+
                 Log("已从网盘删除 " + fids.Count + " 项。");
                 await LoadDirAsync(_curFid);   // 刷新列表
                 // 删文件会改变已用空间 —— 顺手把账号卡的容量也刷一下（用户要求）
@@ -1106,6 +1117,11 @@ namespace GeZi
             catch (Exception ex)
             {
                 Log("删除网盘文件失败: " + ex.Message);
+                // 用户主动发起的删除，失败必须看得见（不能只写日志）
+                AppDialog.Show(this,
+                    "删除没能完成：" + ex.Message + "\n\n"
+                    + "已删掉的部分不会恢复。可以刷新列表看看实际结果，或稍后重试。",
+                    "删除失败", MessageBoxButton.OK, MessageBoxImage.Warning);
             }
             finally
             {

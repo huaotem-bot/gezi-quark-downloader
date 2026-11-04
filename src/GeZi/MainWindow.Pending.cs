@@ -227,12 +227,20 @@ namespace GeZi
                 // 🚨 2026-11-03：**新的未完成任务**出现时，自动取消静音 ——
                 //   静音只针对「用户已经看过并选择稍后再说」的那一批，
                 //   新问题该重新提醒，不能一直哑着。
+                // 🚨 2026-11-04 修正：原来只要 list.Count>0 就清静音，
+                //   而「稍后再说」故意保留记录 → 静音刚设就被清、图标又冒出来。
+                //   现在比对**指纹**：只有记录集合真的变了（出现新任务）才重置。
                 try
                 {
-                    if (list.Count > 0 && _settings != null && _settings.PendingReminderMuted)
+                    if (_settings != null && _settings.PendingReminderMuted)
                     {
-                        _settings.PendingReminderMuted = false;
-                        SettingsStore.Save(_settings);
+                        string nowSig = PendingSignature(list);
+                        if (nowSig != (_settings.PendingMutedSignature ?? ""))
+                        {
+                            _settings.PendingReminderMuted = false;
+                            _settings.PendingMutedSignature = null;
+                            SettingsStore.Save(_settings);
+                        }
                     }
                 }
                 catch { }
@@ -588,6 +596,9 @@ namespace GeZi
                     if (_settings != null)
                     {
                         _settings.PendingReminderMuted = true;
+                        // 🚨 同时记下**当前指纹** —— SyncPending 靠它判断
+                        //   「这批记录没变，别重置静音」，否则下一秒就会被清掉。
+                        _settings.PendingMutedSignature = PendingSignature(all);
                         SettingsStore.Save(_settings);
                     }
                 }
@@ -1110,6 +1121,27 @@ namespace GeZi
             return string.IsNullOrEmpty(pi.SavedFid)
                 ? PendingSource.ShareNoSave
                 : PendingSource.ShareSaved;
+        }
+
+
+        /// <summary>
+        /// 一组待续传记录的**指纹**（用于判断「集合是否真的变了」）。
+        /// <para>
+        /// 只取 <c>Dest</c> 排序后拼接 —— 那是每条记录的唯一标识（同一路径不会重复），
+        /// 且不会因为状态/大小变化而抖动（那些变化不该算「新任务」）。
+        /// </para>
+        /// </summary>
+        private static string PendingSignature(List<PendingTask> list)
+        {
+            if (list == null || list.Count == 0) return "";
+            var dests = new List<string>(list.Count);
+            foreach (var p in list)
+            {
+                if (p == null || string.IsNullOrEmpty(p.Dest)) continue;
+                dests.Add(p.Dest);
+            }
+            dests.Sort(StringComparer.OrdinalIgnoreCase);
+            return string.Join("\n", dests.ToArray());
         }
 
 

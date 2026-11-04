@@ -655,6 +655,26 @@ namespace GeZi.Providers.Xunlei
         /// 删不掉只是网盘里留个残留文件，不该因此把任务标成失败。
         /// </para>
         /// </summary>
+        /// <summary>
+        /// 把文件从用户网盘删除（进回收站）。
+        /// <para>
+        /// 🚨 2026-11-04：能力一直有（<see cref="CleanupStoredAsync"/> 内部就是 batchDelete），
+        /// 只是没暴露给界面 —— 界面上那句「迅雷暂不支持删除」是错的。
+        /// </para>
+        /// <para>
+        /// 与 refs/YunX 对齐：<c>XunleiApi.kt:625 batchDelete()</c> 走
+        /// <c>POST /drive/v1/files:batchDelete</c>，body 是 <c>{ids, space:""}</c>。
+        /// 这里是**用户主动删除**，所以失败必须抛异常（不能像清理那样吞掉）。
+        /// </para>
+        /// </summary>
+        public async Task DeleteFilesAsync(IList<string> fileIds, CancellationToken cancel = default)
+        {
+            if (fileIds == null || fileIds.Count == 0)
+                return;
+            await BatchDeleteAsync(fileIds, cancel).ConfigureAwait(false);
+        }
+
+
         public async Task CleanupStoredAsync(IList<string> storedIds, CancellationToken cancel = default)
         {
             if (storedIds == null || storedIds.Count == 0)

@@ -86,6 +86,17 @@ namespace GeZi
         public bool PendingReminderMuted { get; set; }
 
         /// <summary>
+        /// 用户点「稍后再说」那一刻的**记录指纹**（2026-11-04）。
+        /// <para>
+        /// 🚨 修「点稍后再说后图标立刻又冒出来」：
+        /// 原来 <c>SyncPending</c> 只要看到有记录就把静音清掉，
+        /// 而「稍后再说」是**故意保留记录**的 → 静音刚设就被清，图标又出现。
+        /// 现在比对指纹：只有**记录集合真的变了**（出现了新任务）才重置静音。
+        /// </para>
+        /// </summary>
+        public string PendingMutedSignature { get; set; }
+
+        /// <summary>
         /// 是否跟随 Windows 系统代理（2026-10-11 新增）。默认 **false = 直连**。
         /// 程序历来强制直连（理由见 <see cref="NetworkOptions"/>：
         /// 本机代理软件会把夸克接口劫持到 127.0.0.1；代理会改变 TLS ClientHello

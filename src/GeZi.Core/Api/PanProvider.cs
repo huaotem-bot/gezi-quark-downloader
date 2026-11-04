@@ -202,6 +202,26 @@ namespace GeZi.Core.Api
         /// <param name="storedIds">取自 <see cref="DownloadLink.StoredId"/> 的 id 列表。</param>
         Task CleanupStoredAsync(IList<string> storedIds, CancellationToken cancel = default);
 
+        /// <summary>
+        /// 把文件**从用户网盘删除**（进回收站）。
+        /// <para>
+        /// 🚨🚨 2026-11-04 新增。此前界面层写死了「阿里/迅雷暂不支持删除」，
+        /// 那是**错的** —— 两家的删除能力其实早就实现了（见下），只是没有公开入口：
+        /// <list type="bullet">
+        /// <item>阿里：<c>POST /v2/recyclebin/trash</c>（{drive_id, file_id}，单个删，循环调用）
+        ///       —— 与 refs/wenxi 的 <c>aliyun.dart:1205 delete()</c> 完全一致。</item>
+        /// <item>迅雷：<c>POST /drive/v1/files:batchTrash</c>（{ids, space}）
+        ///       或 <c>files:batchDelete</c> —— 与 refs/YunX 的
+        ///       <c>XunleiApi.kt:776 deleteFiles()</c> / <c>:625 batchDelete()</c> 一致。</item>
+        /// </list>
+        /// </para>
+        /// <para>
+        /// ⚠️ 与 <see cref="CleanupStoredAsync"/> 的区别：那个是「删自己转存的临时副本」，
+        /// 失败只记日志；这个是**用户主动删自己的文件**，失败必须抛异常让界面提示。
+        /// </para>
+        /// </summary>
+        Task DeleteFilesAsync(IList<string> fileIds, CancellationToken cancel = default);
+
         // ---------------- 自有网盘浏览 ----------------
         // 下面三个是"登录后能看到自己的东西"所需：校验登录态、列目录、查容量。
         // 没有它们，用户登录完只会看到一句"登录成功"，却看不到网盘里有什么

@@ -843,6 +843,23 @@ namespace GeZi.Providers.Uc
             return Task.FromResult(0);
         }
 
+        /// <summary>
+        /// 删除用户网盘里的文件。UC 与夸克同源，复用同一套 recycle/remove 接口。
+        /// <para>⚠️ 主窗口的 UC 路径走的是 QuarkClient（不走这里），
+        /// 这个方法只在「按 PanKind 创建 provider」的场景被调到。</para>
+        /// </summary>
+        public async Task DeleteFilesAsync(IList<string> fileIds, CancellationToken cancel = default(CancellationToken))
+        {
+            if (fileIds == null || fileIds.Count == 0)
+                return;
+            // 与 ListOwnDirAsync 同一个做法：临时建一个 QuarkClient(Kind=Uc) 干活，用完即弃。
+            using (var q = new QuarkClient(CookieStr, PanKind.Uc))
+            {
+                await q.DeleteAsync(fileIds).ConfigureAwait(false);
+                try { await q.PurgeRecycleAsync(fileIds).ConfigureAwait(false); } catch { }
+            }
+        }
+
         public void Dispose()
         {
             if (_disposed)

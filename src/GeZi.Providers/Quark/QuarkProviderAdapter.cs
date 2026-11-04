@@ -238,6 +238,17 @@ namespace GeZi.Providers.Quark
             return Task.FromResult(0);
         }
 
+        /// <summary>删除用户网盘里的文件（委托给内部的 QuarkClient）。</summary>
+        public async Task DeleteFilesAsync(IList<string> fileIds, CancellationToken cancel = default(CancellationToken))
+        {
+            if (fileIds == null || fileIds.Count == 0)
+                return;
+            if (_client == null)
+                throw new QuarkApiException("夸克客户端未就绪，无法删除。");
+            await _client.DeleteAsync(fileIds).ConfigureAwait(false);
+            try { await _client.PurgeRecycleAsync(fileIds).ConfigureAwait(false); } catch { }
+        }
+
         public void Dispose()
         {
             if (_ownsClient && _client != null)

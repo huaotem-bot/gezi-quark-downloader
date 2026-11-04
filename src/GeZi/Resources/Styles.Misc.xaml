@@ -335,7 +335,8 @@
         <Setter Property="BorderBrush" Value="{DynamicResource BorderBrushSoft}"/>
         <Setter Property="BorderThickness" Value="1"/>
         <Setter Property="CornerRadius" Value="10"/>
-        <Setter Property="Padding" Value="18,16"/>
+        <!-- 2026-11-04：18,16 → 16,14，配合「设置页一屏显示」。 -->
+        <Setter Property="Padding" Value="16,14"/>
         <Setter Property="SnapsToDevicePixels" Value="True"/>
     </Style>
 
@@ -362,7 +363,9 @@
             那个 120 是照 160 宽标签算的，标签一改就全歪。
     -->
     <Style x:Key="SettingsRow3" TargetType="Grid">
-        <Setter Property="Margin" Value="0,0,0,14"/>
+        <!-- 2026-11-04：14 → 10。用户要求设置页「一整页直接包含所有设置，不要滚动条」。
+             行距是垂直空间的最大消耗项（10 行 × 4px = 40px），压这里收益最高。 -->
+        <Setter Property="Margin" Value="0,0,0,10"/>
     </Style>
 
     <!-- 标签：三栏布局专用（与 FieldLabel 的区别是垂直居中 + 不加底边距） -->
@@ -431,7 +434,8 @@
 
     <!-- 分区卡片的标题行（图标 + 标题 + 右上角附加内容） -->
     <Style x:Key="SettingsCardHeader" TargetType="Grid">
-        <Setter Property="Margin" Value="0,0,0,16"/>
+        <!-- 2026-11-04：16 → 12，配合设置页「一屏显示」的压缩。 -->
+        <Setter Property="Margin" Value="0,0,0,12"/>
     </Style>
 
 </ResourceDictionary>

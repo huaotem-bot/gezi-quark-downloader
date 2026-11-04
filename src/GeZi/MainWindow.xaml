@@ -1223,9 +1223,16 @@
                                                 <RowDefinition Height="Auto"/>
                                                 <RowDefinition Height="Auto"/>
                                             </Grid.RowDefinitions>
+                                            <!-- 🚨 2026-11-04 重排（用户要求「进度条太短，速度移到进度条右上方」）：
+                                                 第一排：状态点 + 文件名 | 说明 | **速度** | 暂停 | 播放 | 定位
+                                                 第二排：车道 | 进度条（吃满整行） | 已完成+百分比
+                                                 速度从第二排挪到第一排后，第二排只剩三样东西，
+                                                 进度条能多吃 100+px。 -->
                                             <Grid Grid.Row="0">
                                                 <Grid.ColumnDefinitions>
                                                     <ColumnDefinition Width="*"/>
+                                                    <ColumnDefinition Width="Auto"/>
+                                                    <!-- 速度（新增位置：进度条右上方） -->
                                                     <ColumnDefinition Width="Auto"/>
                                                     <ColumnDefinition Width="Auto"/>
                                                     <ColumnDefinition Width="Auto"/>
@@ -1277,7 +1284,15 @@
                                                 <!-- 行内「播放/暂停」切换按钮（纯图标，图标随状态互换）。
                                                      控制的是**这个下载任务**的暂停/恢复，
                                                      不是控制外部播放器（那做不到）。 -->
-                                                <Button Grid.Column="2" Click="OnTaskTogglePause"
+                                                <!-- 🚨 2026-11-04：速度移到这里（进度条右上方）。
+                                                     原来在第二排占一列，把进度条挤短了 100+px。 -->
+                                                <TextBlock Grid.Column="2" Text="{Binding SpeedText}"
+                                                           Margin="0,0,14,0" FontWeight="SemiBold"
+                                                           VerticalAlignment="Center" MinWidth="96"
+                                                           TextAlignment="Right"
+                                                           Foreground="{DynamicResource TextPrimaryBrush}"
+                                                           Style="{StaticResource NumericText}"/>
+                                                <Button Grid.Column="3" Click="OnTaskTogglePause"
                                                         Tag="{Binding}" Style="{StaticResource TaskPauseButton}"
                                                         Margin="6,0,0,0" VerticalAlignment="Center"/>
                                                 <!-- 「播放」= 交给系统默认程序打开（装了 VLC 就用 VLC）。
@@ -1287,7 +1302,7 @@
                                                        · 共写同一文件 → 预分配的满尺寸空洞文件，播放器打不开 ✗
                                                        · 已完成 → 文件完整，两种模式都能播 ✓
                                                      不能播时整个按钮收起（Collapsed），不留一个点了没用的入口。 -->
-                                                <Button Grid.Column="3" Content="播放" Click="OnOpenTaskFile"
+                                                <Button Grid.Column="4" Content="播放" Click="OnOpenTaskFile"
                                                         Tag="{Binding}" Margin="4,0,0,0" VerticalAlignment="Center"
                                                         >
                                                     <Button.Style>
@@ -1300,7 +1315,7 @@
                                                         </Style>
                                                     </Button.Style>
                                                 </Button>
-                                                <Button Grid.Column="4" Content="定位" Click="OnLocateTaskFile"
+                                                <Button Grid.Column="5" Content="定位" Click="OnLocateTaskFile"
                                                         Tag="{Binding}" Style="{StaticResource GhostButton}"
                                                         Margin="2,0,0,0" VerticalAlignment="Center"
                                                         />
@@ -1312,14 +1327,11 @@
                                                  数据由 OnDiagnostics 从 DiagnosticsSnapshot 喂入（未改下载器内核）。 -->
                                             <Grid Grid.Row="1" Margin="16,8,0,0">
                                                 <Grid.ColumnDefinitions>
-                                                    <!-- 2026-11-02 修「任务条很长但进度条很短」：
-                                                         原来 5 个 Auto 列把 * 列（进度条）挤到只剩一小段，
-                                                         且 Auto 列按实际内容撑开、不受 MinWidth 约束
-                                                         （27.33 MB / 27.33 MB 实际要 180px 而非 150）。
-                                                         现在合并「已完成 + 百分比」为一列，省出一列给进度条。 -->
-                                                    <ColumnDefinition Width="Auto"/>   <!-- 车道 + 连接数（固定容器） -->
-                                                    <ColumnDefinition Width="*" MinWidth="320"/>   <!-- 进度条（保底 320） -->
-                                                    <ColumnDefinition Width="Auto"/>   <!-- 速度 -->
+                                                    <!-- 🚨 2026-11-04 重排（用户要求「进度条太短」）：
+                                                         速度已移到第一排，这里只剩三列 ——
+                                                         进度条因此能多吃原来速度列的 100+px。 -->
+                                                    <ColumnDefinition Width="Auto"/>   <!-- 车道 + 连接数（固定 200） -->
+                                                    <ColumnDefinition Width="*"/>      <!-- 进度条（吃满剩余，不设 MinWidth） -->
                                                     <ColumnDefinition Width="Auto"/>   <!-- 已完成 + 百分比（合并） -->
                                                 </Grid.ColumnDefinitions>
                                                 <!-- 🚨🚨 2026-11-01（用户报「每个任务左侧应显示车道线程」）：
@@ -1356,13 +1368,8 @@
                                                              Style="{StaticResource SlimProgressBar}"
                                                              Value="{Binding Percent}"
                                                              VerticalAlignment="Center"/>
-                                                <TextBlock Grid.Column="2" Text="{Binding SpeedText}"
-                                                           Margin="12,0,0,0" FontWeight="SemiBold"
-                                                           VerticalAlignment="Center" MinWidth="104"
-                                                           TextAlignment="Right"
-                                                           Foreground="{DynamicResource TextPrimaryBrush}"
-                                                           Style="{StaticResource NumericText}"/>
-                                                <StackPanel Grid.Column="3" Orientation="Horizontal"
+                                                <!-- 速度已移到第一排（见上方），这里不再占位 -->
+                                                <StackPanel Grid.Column="2" Orientation="Horizontal"
                                                             Margin="12,0,0,0" VerticalAlignment="Center"
                                                             MinWidth="210" HorizontalAlignment="Right">
                                                     <TextBlock Text="{Binding DoneText}"
@@ -1653,8 +1660,9 @@
                          必须显式 Stretch；内层去掉 MaxWidth 才能真正撑满。 -->
                     <ScrollViewer VerticalScrollBarVisibility="Auto" Padding="0,0,10,0"
                                   HorizontalContentAlignment="Stretch">
-                        <!-- 外边距统一 24px（与下载页/任务页一致） -->
-                        <StackPanel Margin="24,24,24,24" HorizontalAlignment="Stretch">
+                        <!-- 2026-11-04：外边距 24 → 16,14，副标题间距 18 → 12，
+                             配合用户要求「一整页直接包含所有设置，不要滚动条」。 -->
+                        <StackPanel Margin="16,14,16,12" HorizontalAlignment="Stretch">
 
                             <TextBlock Text="设置" Style="{StaticResource PageTitleText}" Margin="0,0,0,4"/>
                             <TextBlock Text="所有改动即时生效，无需保存"
@@ -1784,11 +1792,20 @@
                                                 </StackPanel>
                                             </Grid>
 
-                                            <!-- ========== 子分区 ①：连接与并发 ==========
-                                                 2026-11-03 用户要求「网络与下载卡做分层」。
-                                                 原来四个字段平铺，看不出哪些是一类。
-                                                 现在按「连接 / 机械盘 / 网络」分成三块，各带小标题。 -->
-                                            <TextBlock Text="连接与并发" Style="{StaticResource SectionLabel}"/>
+                                            <!-- ============ 分区 ①：连接 ============
+                                                 2026-11-04 重排（用户要求）：
+                                                   · 「同时下载任务数」从「机械盘保护」移到这里 ——
+                                                     它是**全局调度器参数**（new DownloadScheduler(ConcurrentTasks)），
+                                                     与磁盘类型完全无关，放机械盘里是错的；
+                                                   · 每行下面的小字说明全部删掉/收进 ToolTip ——
+                                                     用户原话「用户不是傻子不需要这么多字」。 -->
+                                            <StackPanel Orientation="Horizontal" Margin="0,0,0,10">
+                                                <Border Width="3" CornerRadius="1.5" Margin="0,1,8,1"
+                                                        Background="{DynamicResource TextPrimaryBrush}" Opacity="0.25"/>
+                                                <TextBlock Text="连接" FontSize="12.5" FontWeight="SemiBold"
+                                                           VerticalAlignment="Center"
+                                                           Foreground="{DynamicResource TextSecondaryBrush}"/>
+                                            </StackPanel>
 
                                             <Grid Style="{StaticResource SettingsRow3}">
                                                 <Grid.ColumnDefinitions>
@@ -1802,7 +1819,8 @@
                                                               HorizontalAlignment="Left"
                                                               Style="{StaticResource AppComboBox}"
                                                               ItemContainerStyle="{StaticResource AppComboBoxItem}"
-                                                              SelectionChanged="OnSettingChanged">
+                                                              SelectionChanged="OnSettingChanged"
+                                                              ToolTip="迅雷最多 16、阿里最多 64、UC 最多 256 —— 超过会自动按网盘上限降下来。">
                                                         <ComboBoxItem Content="16  — 省网保守"/>
                                                         <ComboBoxItem Content="32  — 保守，够用"/>
                                                         <ComboBoxItem Content="64  — 省网，速度一般"/>
@@ -1810,80 +1828,10 @@
                                                         <ComboBoxItem Content="256 — 默认，实测最快"/>
                                                         <ComboBoxItem Content="512 — 上限，可能会更快"/>
                                                     </ComboBox>
-                                                    <!-- 2026-11-02：把**按网盘的隐形上限**告诉用户。
-                                                         原来界面上完全没提示，用户选了 256 却发现迅雷只开 16 条，
-                                                         看起来像"设置没生效"。这个上限有实测依据
-                                                         （见 MainWindow.Log.cs 的 MaxParallelFor），不能去掉，
-                                                         但必须让用户看得见。 -->
-                                                    <TextBlock Style="{StaticResource SettingsRowHint}"
-                                                               Margin="0,7,0,0" MaxWidth="300"
-                                                               HorizontalAlignment="Left"
-                                                               Text="迅雷最多 16、阿里最多 64、UC 最多 256 —— 超过会自动按网盘上限降下来。"/>
                                                 </StackPanel>
                                             </Grid>
 
-                                            <!-- ========== 子分区 ②：机械盘保护（独立成块） ==========
-                                                 用户要求：「为机械盘设置单独空间，但仍放在『网络与下载』卡片内部」。
-                                                 机械盘的限制和「网络」是两回事 —— 那是**落盘**约束，
-                                                 不是带宽约束，所以视觉上必须分开。 -->
-                                            <Border Style="{StaticResource SettingsDivider}" Margin="0,4,0,14"/>
-                                            <TextBlock Text="机械盘保护" Style="{StaticResource SectionLabel}"/>
-
-                                            <Grid Style="{StaticResource SettingsRow3}">
-                                                <Grid.ColumnDefinitions>
-                                                    <ColumnDefinition Width="160"/>
-                                                    <ColumnDefinition Width="*"/>
-                                                </Grid.ColumnDefinitions>
-                                                <TextBlock Grid.Column="0" Text="机械盘连接上限"
-                                                           Style="{StaticResource SettingsRowLabel}"/>
-                                                <StackPanel Grid.Column="1">
-                                                    <ComboBox x:Name="HddThreadsBox" Width="260" Height="34"
-                                                              HorizontalAlignment="Left"
-                                                              Style="{StaticResource AppComboBox}"
-                                                              ItemContainerStyle="{StaticResource AppComboBoxItem}"
-                                                              SelectionChanged="OnSettingChanged">
-                                                        <ComboBoxItem Content="32  — 最护盘，速度较慢"/>
-                                                        <ComboBoxItem Content="64  — 保守"/>
-                                                        <ComboBoxItem Content="96  — 折中"/>
-                                                        <ComboBoxItem Content="128 — 默认，推荐"/>
-                                                        <ComboBoxItem Content="192 — 较快"/>
-                                                        <ComboBoxItem Content="256 — 最快，寻道压力大"/>
-                                                    </ComboBox>
-                                                    <TextBlock Style="{StaticResource SettingsRowHint}"
-                                                               Margin="0,7,0,0" MaxWidth="300"
-                                                               HorizontalAlignment="Left"
-                                                               Text="目标文件在机械盘时自动降到这个数，避免磁头频繁寻道。"/>
-                                                </StackPanel>
-                                            </Grid>
-
-                                            <!-- 🚨 2026-11-03 新增：落盘方式（用户要求恢复选择权）
-                                                 共写 = 预分配 + 多连接各写最终偏移（固态盘推荐，默认）
-                                                 顺序写 = 乱序数据先重排再严格顺序刷盘（机械盘推荐） -->
                                             <Grid Style="{StaticResource SettingsRow3}" Margin="0">
-                                                <Grid.ColumnDefinitions>
-                                                    <ColumnDefinition Width="160"/>
-                                                    <ColumnDefinition Width="*"/>
-                                                </Grid.ColumnDefinitions>
-                                                <TextBlock Grid.Column="0" Text="落盘方式"
-                                                           Style="{StaticResource SettingsRowLabel}"/>
-                                                <StackPanel Grid.Column="1">
-                                                    <RadioButton x:Name="StorageSharedRadio" GroupName="StorageMode"
-                                                                 Content="共写（默认）"
-                                                                 Style="{StaticResource AppRadioButton}"
-                                                                 Checked="OnSettingChanged"
-                                                                 Margin="0,0,0,6"/>
-                                                    <RadioButton x:Name="StorageSequentialRadio" GroupName="StorageMode"
-                                                                 Content="顺序写（机械盘推荐）"
-                                                                 Style="{StaticResource AppRadioButton}"
-                                                                 Checked="OnSettingChanged"/>
-                                                    <TextBlock Style="{StaticResource SettingsRowHint}"
-                                                               Margin="0,7,0,0" MaxWidth="320"
-                                                               HorizontalAlignment="Left"
-                                                               Text="共写内存占用低；顺序写全程顺序 I/O，机械盘不来回寻道。改完重新开始下载才生效。"/>
-                                                </StackPanel>
-                                            </Grid>
-
-                                            <Grid Style="{StaticResource SettingsRow3}">
                                                 <Grid.ColumnDefinitions>
                                                     <ColumnDefinition Width="160"/>
                                                     <ColumnDefinition Width="*"/>
@@ -1895,7 +1843,8 @@
                                                               HorizontalAlignment="Left"
                                                               Style="{StaticResource AppComboBox}"
                                                               ItemContainerStyle="{StaticResource AppComboBoxItem}"
-                                                              SelectionChanged="OnSettingChanged">
+                                                              SelectionChanged="OnSettingChanged"
+                                                              ToolTip="同时跑几个任务。连接数按文件大小比例分配，小的少分但有下限。">
                                                         <ComboBoxItem Content="1  — 只跑一个，最稳"/>
                                                         <ComboBoxItem Content="2  — 两个并行"/>
                                                         <ComboBoxItem Content="3  — 默认，均衡"/>
@@ -1903,16 +1852,71 @@
                                                         <ComboBoxItem Content="5  — 很快"/>
                                                         <ComboBoxItem Content="6  — 上限，带宽吃满"/>
                                                     </ComboBox>
-                                                    <TextBlock Style="{StaticResource SettingsRowHint}"
-                                                               Margin="0,7,0,0" MaxWidth="300"
-                                                               HorizontalAlignment="Left"
-                                                               Text="连接数按文件大小比例分配，小的少分但有下限。"/>
                                                 </StackPanel>
                                             </Grid>
 
-                                            <!-- ========== 子分区 ③：网络 ========== -->
-                                            <Border Style="{StaticResource SettingsDivider}" Margin="0,4,0,14"/>
-                                            <TextBlock Text="网络" Style="{StaticResource SectionLabel}"/>
+                                            <!-- ============ 分区 ②：磁盘 ============ -->
+                                            <Border Style="{StaticResource SettingsDivider}" Margin="0,6,0,10"/>
+                                            <StackPanel Orientation="Horizontal" Margin="0,0,0,10">
+                                                <Border Width="3" CornerRadius="1.5" Margin="0,1,8,1"
+                                                        Background="{DynamicResource TextPrimaryBrush}" Opacity="0.25"/>
+                                                <TextBlock Text="磁盘" FontSize="12.5" FontWeight="SemiBold"
+                                                           VerticalAlignment="Center"
+                                                           Foreground="{DynamicResource TextSecondaryBrush}"/>
+                                            </StackPanel>
+
+                                            <Grid Style="{StaticResource SettingsRow3}">
+                                                <Grid.ColumnDefinitions>
+                                                    <ColumnDefinition Width="160"/>
+                                                    <ColumnDefinition Width="*"/>
+                                                </Grid.ColumnDefinitions>
+                                                <TextBlock Grid.Column="0" Text="机械盘连接上限"
+                                                           Style="{StaticResource SettingsRowLabel}"/>
+                                                <ComboBox x:Name="HddThreadsBox" Grid.Column="1" Width="260" Height="34"
+                                                          HorizontalAlignment="Left"
+                                                          Style="{StaticResource AppComboBox}"
+                                                          ItemContainerStyle="{StaticResource AppComboBoxItem}"
+                                                          SelectionChanged="OnSettingChanged"
+                                                          ToolTip="目标文件在机械盘时自动降到这个数，避免磁头频繁寻道。固态盘不受影响。">
+                                                    <ComboBoxItem Content="32  — 最护盘，速度较慢"/>
+                                                    <ComboBoxItem Content="64  — 保守"/>
+                                                    <ComboBoxItem Content="96  — 折中"/>
+                                                    <ComboBoxItem Content="128 — 默认，推荐"/>
+                                                    <ComboBoxItem Content="192 — 较快"/>
+                                                    <ComboBoxItem Content="256 — 最快，寻道压力大"/>
+                                                </ComboBox>
+                                            </Grid>
+
+                                            <Grid Style="{StaticResource SettingsRow3}" Margin="0">
+                                                <Grid.ColumnDefinitions>
+                                                    <ColumnDefinition Width="160"/>
+                                                    <ColumnDefinition Width="*"/>
+                                                </Grid.ColumnDefinitions>
+                                                <TextBlock Grid.Column="0" Text="落盘方式"
+                                                           Style="{StaticResource SettingsRowLabel}"/>
+                                                <StackPanel Grid.Column="1"
+                                                            ToolTip="共写：预分配 + 多连接各写最终偏移，内存占用低，固态盘推荐。&#10;顺序写：乱序数据先重排再严格顺序刷盘，机械盘不来回寻道。&#10;改完重新开始下载才生效。">
+                                                    <RadioButton x:Name="StorageSharedRadio" GroupName="StorageMode"
+                                                                 Content="共写（默认）"
+                                                                 Style="{StaticResource AppRadioButton}"
+                                                                 Checked="OnSettingChanged"
+                                                                 Margin="0,0,0,6"/>
+                                                    <RadioButton x:Name="StorageSequentialRadio" GroupName="StorageMode"
+                                                                 Content="顺序写（机械盘推荐）"
+                                                                 Style="{StaticResource AppRadioButton}"
+                                                                 Checked="OnSettingChanged"/>
+                                                </StackPanel>
+                                            </Grid>
+
+                                            <!-- ============ 分区 ③：网络 ============ -->
+                                            <Border Style="{StaticResource SettingsDivider}" Margin="0,6,0,10"/>
+                                            <StackPanel Orientation="Horizontal" Margin="0,0,0,10">
+                                                <Border Width="3" CornerRadius="1.5" Margin="0,1,8,1"
+                                                        Background="{DynamicResource TextPrimaryBrush}" Opacity="0.25"/>
+                                                <TextBlock Text="网络" FontSize="12.5" FontWeight="SemiBold"
+                                                           VerticalAlignment="Center"
+                                                           Foreground="{DynamicResource TextSecondaryBrush}"/>
+                                            </StackPanel>
 
                                             <Grid Style="{StaticResource SettingsRow3}" Margin="0">
                                                 <Grid.ColumnDefinitions>
@@ -1921,19 +1925,13 @@
                                                 </Grid.ColumnDefinitions>
                                                 <TextBlock Grid.Column="0" Text="代理"
                                                            Style="{StaticResource SettingsRowLabel}"/>
-                                                <StackPanel Grid.Column="1">
-                                                    <CheckBox x:Name="UseSystemProxyCheck"
-                                                              Content="跟随 Windows 系统代理"
-                                                              Style="{StaticResource AppCheckBox}"
-                                                              VerticalAlignment="Center"
-                                                              Click="OnUseSystemProxyChanged"
-                                                              AutomationProperties.Name="跟随系统代理"
-                                                              ToolTip="默认关闭（直连）。公司网络 / 必须经代理才能上网时打开。本机装有代理软件（VPN、抓包、加速器）时建议保持关闭。"/>
-                                                    <TextBlock Style="{StaticResource SettingsRowHint}"
-                                                               Margin="0,7,0,0" MaxWidth="300"
-                                                               HorizontalAlignment="Left"
-                                                               Text="默认直连。仅必须经代理才能上网时打开。"/>
-                                                </StackPanel>
+                                                <CheckBox x:Name="UseSystemProxyCheck" Grid.Column="1"
+                                                          Content="跟随 Windows 系统代理"
+                                                          Style="{StaticResource AppCheckBox}"
+                                                          VerticalAlignment="Center"
+                                                          Click="OnUseSystemProxyChanged"
+                                                          AutomationProperties.Name="跟随系统代理"
+                                                          ToolTip="默认关闭（直连）。公司网络 / 必须经代理才能上网时打开。本机装有代理软件（VPN、抓包、加速器）时建议保持关闭。"/>
                                             </Grid>
                                         </StackPanel>
                                     </Border>
@@ -2242,13 +2240,14 @@
                 <TabItem Style="{StaticResource HeadlessTabItem}">
                     <ScrollViewer VerticalScrollBarVisibility="Auto" Padding="0,0,10,0"
                                   HorizontalContentAlignment="Stretch">
-                        <StackPanel Margin="24,24,24,24" HorizontalAlignment="Stretch">
+                        <!-- 2026-11-04：外边距 24 → 16,14，配合「登录页不要滚动条」。 -->
+                        <StackPanel Margin="16,14,16,12" HorizontalAlignment="Stretch">
 
                             <TextBlock Text="登录" Style="{StaticResource PageTitleText}" Margin="0,0,0,4"/>
                             <TextBlock Text="登录后可浏览「我的网盘」、转存分享文件；不登录也能用直链下载"
                                        Style="{StaticResource TertiaryText}" Margin="0,0,0,18"/>
 
-                            <Border Style="{StaticResource SettingsCard}" HorizontalAlignment="Stretch" Margin="0,0,0,14">
+                            <Border Style="{StaticResource SettingsCard}" HorizontalAlignment="Stretch" Margin="0,0,0,10">
                                 <StackPanel>
                                     <Grid Style="{StaticResource SettingsRow}">
                                         <Grid.ColumnDefinitions>
@@ -2272,7 +2271,7 @@
                                     </Grid>
                                     <TextBlock Style="{StaticResource TertiaryText}" FontSize="11"
                                                TextWrapping="Wrap" Margin="0,0,0,14"
-                                               Text="四家可同时登录。拿不到凭证时用「手动粘贴」。凭证只存在本机（DPAPI 加密），不外传。"/>
+                                               Text="四家可同时登录。登录失败可以重试，或点「登录账号」换一种方式。凭证只加密存在本机，不外传。"/>
 
                                     <Grid>
                                         <Grid.ColumnDefinitions>
@@ -2537,7 +2536,7 @@
 
                             <!-- 当前状态（四家网盘各自的登录/容量，2026-11-01 重建）
                                  每行由 C# 的 BuildPanStateRow() 动态生成，这里只放容器。 -->
-                            <Border Style="{StaticResource SettingsCard}" HorizontalAlignment="Stretch" Margin="0,0,0,14">
+                            <Border Style="{StaticResource SettingsCard}" HorizontalAlignment="Stretch" Margin="0,0,0,10">
                                 <StackPanel>
                                     <Grid Margin="0,0,0,10">
                                         <Grid.ColumnDefinitions>
@@ -2603,10 +2602,12 @@
                                     </StackPanel>
                                     <TextBlock Style="{StaticResource ProseText}" TextWrapping="Wrap"
                                                Text="· 登录信息经系统加密后存在本地配置里，不会上传到任何服务器。"/>
+                                    <!-- 2026-11-04：原文案过旧 —— 「点夸克卡上的『扫码登录』」
+                                         按钮早已改名「登录账号」，且现在四家都支持内嵌登录，不止扫码。 -->
                                     <TextBlock Style="{StaticResource ProseText}" Margin="0,4,0,0" TextWrapping="Wrap"
-                                               Text="· 登录状态过期时可以重新扫码：点夸克卡上的「扫码登录」获取新二维码。"/>
+                                               Text="· 登录过期时点对应网盘卡的「登录账号」重新登录即可。"/>
                                     <TextBlock Style="{StaticResource ProseText}" Margin="0,4,0,0" TextWrapping="Wrap"
-                                               Text="· 扫码得到的是网页版登录态，和手机 App 端互不影响、可同时使用。"/>
+                                               Text="· 网页登录态与手机 App 互不影响，可以同时使用。"/>
                                 </StackPanel>
                             </Border>
                         </StackPanel>
@@ -2695,21 +2696,36 @@
                                          点完「检查更新」要往左下角找才看得到。
                                          现在紧贴按钮下方、右对齐 —— 视线不用离开按钮。
                                          ⚠️ 预留 MinHeight，避免文字出现/消失导致品牌卡高度跳动。 -->
-                                    <StackPanel Grid.Column="2" VerticalAlignment="Center" MinWidth="230">
+                                    <!-- 🚨🚨 2026-11-04 修「点检查更新后按钮被顶移位」：
+                                         原来状态文字和按钮在**同一个 StackPanel** 里，
+                                         VerticalAlignment=Center 让整块居中 —— 文字一出现，
+                                         整块变高，按钮就被往上顶。用户截图里那个绿框就是这个。
+                                         ⇒ 现在把状态文字**移出**该 StackPanel，
+                                            用 Grid.Row 叠在按钮下方（绝对定位），
+                                            它不参与上面按钮的布局，按钮位置永远不动。 -->
+                                    <StackPanel Grid.Column="2" VerticalAlignment="Center">
                                         <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
                                             <Button Content="检查更新" Click="OnAboutCheckUpdate"
                                                     Style="{StaticResource SecondaryButton}" Margin="0,0,8,0"/>
                                             <Button Content="赞赏支持" Click="OnAboutReward"
                                                     Style="{StaticResource SecondaryButton}"/>
                                         </StackPanel>
-                                        <TextBlock x:Name="AboutUpdateStatusText"
-                                                   FontSize="11.5" Margin="0,8,0,0"
-                                                   MinHeight="16"
-                                                   HorizontalAlignment="Right" TextAlignment="Right"
-                                                   MaxWidth="260" TextWrapping="Wrap"
-                                                   Visibility="Collapsed"
-                                                   Foreground="{DynamicResource TextTertiaryBrush}"/>
+                                        <!-- 固定占位：保证文字出现时不会改变父容器高度 -->
+                                        <Border Height="22" Margin="0,6,0,0"/>
                                     </StackPanel>
+
+                                    <!-- 🚨 2026-11-04：状态文字**绝对定位**在按钮下方，
+                                         用 Grid 单元格叠加（同 Grid.Column=2，靠 Margin 下移），
+                                         完全不参与上面 StackPanel 的布局 ——
+                                         文字出现/消失时按钮位置永远不动。 -->
+                                    <TextBlock x:Name="AboutUpdateStatusText" Grid.Column="2"
+                                               FontSize="11.5"
+                                               VerticalAlignment="Center"
+                                               HorizontalAlignment="Right" TextAlignment="Right"
+                                               Margin="0,60,0,0"
+                                               MaxWidth="240" TextWrapping="Wrap"
+                                               Visibility="Collapsed"
+                                               Foreground="{DynamicResource TextTertiaryBrush}"/>
                                 </Grid>
                             </Border>
 
@@ -2951,6 +2967,67 @@
                                             </TextBlock>
                                         </Grid>
 
+                                        <!-- 2026-11-04：用户要求「卡片下方大片空白，多写有用的字，不要水」。
+                                             下面四条全部来自 AGENTS.md 的实测记录与代码实际行为，
+                                             每条都能解释用户真实会遇到的疑惑。 -->
+                                        <Grid Margin="0,0,0,10">
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="Auto"/>
+                                                <ColumnDefinition Width="*"/>
+                                            </Grid.ColumnDefinitions>
+                                            <Ellipse Grid.Column="0" Width="5" Height="5" Margin="0,7,0,0"
+                                                     VerticalAlignment="Top"
+                                                     Fill="{DynamicResource TextTertiaryBrush}"/>
+                                            <TextBlock Grid.Column="1" Margin="10,0,0,0"
+                                                       Style="{StaticResource ProseText}" TextWrapping="Wrap">
+                                                <Run Text="下载速度取决于网盘对单 IP 的限速，与软件本身关系不大。"/>
+                                                <Run Text="夸克实测最快，迅雷单 IP 上限 16 连接。" FontWeight="SemiBold"/>
+                                            </TextBlock>
+                                        </Grid>
+
+                                        <Grid Margin="0,0,0,10">
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="Auto"/>
+                                                <ColumnDefinition Width="*"/>
+                                            </Grid.ColumnDefinitions>
+                                            <Ellipse Grid.Column="0" Width="5" Height="5" Margin="0,7,0,0"
+                                                     VerticalAlignment="Top"
+                                                     Fill="{DynamicResource TextTertiaryBrush}"/>
+                                            <TextBlock Grid.Column="1" Margin="10,0,0,0"
+                                                       Style="{StaticResource ProseText}" TextWrapping="Wrap">
+                                                <Run Text="暂停或重启后进度不会丢：分片记录在本地，会从断点继续，已下载的部分不会重下。"/>
+                                            </TextBlock>
+                                        </Grid>
+
+                                        <Grid Margin="0,0,0,10">
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="Auto"/>
+                                                <ColumnDefinition Width="*"/>
+                                            </Grid.ColumnDefinitions>
+                                            <Ellipse Grid.Column="0" Width="5" Height="5" Margin="0,7,0,0"
+                                                     VerticalAlignment="Top"
+                                                     Fill="{DynamicResource TextTertiaryBrush}"/>
+                                            <TextBlock Grid.Column="1" Margin="10,0,0,0"
+                                                       Style="{StaticResource ProseText}" TextWrapping="Wrap">
+                                                <Run Text="机械硬盘建议在设置里把「落盘方式」改成顺序写，可显著减少磁头寻道、提升吞吐。"/>
+                                            </TextBlock>
+                                        </Grid>
+
+                                        <Grid Margin="0,0,0,10">
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="Auto"/>
+                                                <ColumnDefinition Width="*"/>
+                                            </Grid.ColumnDefinitions>
+                                            <Ellipse Grid.Column="0" Width="5" Height="5" Margin="0,7,0,0"
+                                                     VerticalAlignment="Top"
+                                                     Fill="{DynamicResource TextTertiaryBrush}"/>
+                                            <TextBlock Grid.Column="1" Margin="10,0,0,0"
+                                                       Style="{StaticResource ProseText}" TextWrapping="Wrap">
+                                                <Run Text="迅雷取直链需要验证码，程序会自动申请；偶尔失败可稍后重试，不影响已下载的部分。"/>
+                                            </TextBlock>
+                                        </Grid>
+
+                                        <!-- 收尾一条：放在最后，与上面几条保持同样的圆点样式 -->
                                         <Grid>
                                             <Grid.ColumnDefinitions>
                                                 <ColumnDefinition Width="Auto"/>
@@ -2964,6 +3041,7 @@
                                                 <Run Text="本软件仅供个人学习与备份使用，请遵守各网盘的服务条款与当地法律法规。"/>
                                             </TextBlock>
                                         </Grid>
+
                                     </StackPanel>
                                 </Border>
                             </Grid>

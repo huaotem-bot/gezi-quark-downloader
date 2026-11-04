@@ -1333,6 +1333,59 @@ namespace GeZi.Providers.Aliyun
         /// 删不掉只是留个残留，不该因此把任务标成失败。
         /// </para>
         /// </summary>
+        /// <summary>
+        /// 把文件从用户网盘删除（进回收站）。
+        /// <para>
+        /// 🚨 2026-11-04：能力其实一直有（<see cref="CleanupStoredAsync"/> 用的就是同一个接口），
+        /// 只是没暴露给界面 —— 界面上那句「阿里暂不支持删除」是错的。
+        /// </para>
+        /// <para>
+        /// ⚠️ 阿里是**单个删除**接口，批量必须循环调用（refs/wenxi 也是这么做的）。
+        /// </para>
+        /// </summary>
+        public async Task DeleteFilesAsync(IList<string> fileIds, CancellationToken cancel = default)
+        {
+            if (fileIds == null || fileIds.Count == 0)
+                return;
+
+            await EnsureAccessTokenAsync(cancel).ConfigureAwait(false);
+
+            // 先删一遍；失败的收集起来，最后统一抛 —— 不能删一半就静默返回。
+            var failed = new List<string>();
+            string firstError = null;
+            foreach (string id in fileIds)
+            {
+                if (string.IsNullOrEmpty(id) || id == "root")
+                    continue;
+                try
+                {
+                    var body = new Dictionary<string, object>
+                    {
+                        { "drive_id", RequireOwnDriveId() },
+                        { "file_id", id },
+                    };
+                    await PostJsonAsync(_apiBase + AliyunConstants.RecyclebinTrashPath, body,
+                        _accessToken, cancel, null, _deviceId, _deviceSignature).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    failed.Add(id);
+                    if (firstError == null) firstError = ex.Message;
+                }
+            }
+
+            if (failed.Count > 0)
+            {
+                throw new QuarkApiException("删除失败 " + failed.Count + "/" + fileIds.Count
+                    + " 项：" + (firstError ?? "未知原因"));
+            }
+        }
+
+
         public async Task CleanupStoredAsync(IList<string> storedIds, CancellationToken cancel = default)
         {
             if (storedIds == null || storedIds.Count == 0)
