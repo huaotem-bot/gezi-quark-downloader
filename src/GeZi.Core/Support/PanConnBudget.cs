@@ -32,9 +32,9 @@ namespace GeZi.Core.Support
     ///
     /// <para>
     /// ⚠️ 上面四条是**正常态**的实测值，也是安全默认。
-    /// 🚨 2026-11-07 用户要求「四家全部放开，最高 2048」做实测，
+    /// 🚨 2026-11-07 用户要求「四家全部放开，最高 3000」做实测，
     /// 所以 <see cref="Quark"/> / <see cref="Uc"/> / <see cref="Aliyun"/> / <see cref="Xunlei"/>
-    /// 现在**统一是 2048**（= <c>ChunkSplitter.MaxRealConcurrency</c>），
+    /// 现在**统一是 3000**（= <c>ChunkSplitter.MaxRealConcurrency</c>），
     /// 各家服务端真实限额交给运行时自己去撞，日志里「在飞 vs 目标」就是撞出来的结果。
     /// 这是**测试期取值**，不是新的实测结论；要恢复安全默认就把四个常量改回
     /// 512 / 256 / 64 / 16（原始依据见 AGENTS.md 第四节、记忆/59-整体限速与慢启动、
@@ -44,19 +44,19 @@ namespace GeZi.Core.Support
     public static class PanConnBudget
     {
         /// <summary>
-        /// 夸克：测试期全放开到 2048（与 <c>ChunkSplitter.MaxRealConcurrency</c>、
+        /// 夸克：测试期全放开到 3000（与 <c>ChunkSplitter.MaxRealConcurrency</c>、
         /// <c>ThreadAllocator.DefaultBudget</c> 同步）。正常态实测值是 512。
         /// </summary>
-        public const int Quark = 2048;
+        public const int Quark = 3000;
 
-        /// <summary>UC：测试期全放开到 2048。正常态实测值是 256（单 IP 7~8 MB/s）。</summary>
-        public const int Uc = 2048;
+        /// <summary>UC：测试期全放开到 3000。正常态实测值是 256（单 IP 7~8 MB/s）。</summary>
+        public const int Uc = 3000;
 
-        /// <summary>阿里云盘：测试期全放开到 2048。正常态实测值是 64（单 IP 2.5~2.7 MB/s）。</summary>
-        public const int Aliyun = 2048;
+        /// <summary>阿里云盘：测试期全放开到 3000。正常态实测值是 64（单 IP 2.5~2.7 MB/s）。</summary>
+        public const int Aliyun = 3000;
 
-        /// <summary>迅雷云盘：测试期全放开到 2048。正常态实测值是 16（单 IP 封 16 条，再多 503）。</summary>
-        public const int Xunlei = 2048;
+        /// <summary>迅雷云盘：测试期全放开到 3000。正常态实测值是 16（单 IP 封 16 条，再多 503）。</summary>
+        public const int Xunlei = 3000;
 
         /// <summary>支持的网盘数量（PanKind: Quark=0 / Uc=1 / Aliyun=2 / Xunlei=3）。</summary>
         public const int PanCount = 4;
