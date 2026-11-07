@@ -131,6 +131,7 @@ namespace GeZi.SelfTest
     Run("storage_mode_shared_only", TestStorageModeSharedOnly);
     Run("planned_concurrency", TestPlannedConcurrency);
     Run("pan_bucket_budget", TestPanBucketBudget);
+    Run("pan_conn_budget", TestPanConnBudget);
     Run("bandwidth_smoothing", TestBandwidthSmoothing);
     Run("log_redactor", TestLogRedactor);
         Run("pending_canresume", TestPendingCanResume);
@@ -2247,6 +2248,85 @@ namespace GeZi.SelfTest
             Check("bucket.clamp",
                 GeZi.Core.Support.DownloadSizing.PanBucketBudget(512, 99, 8, 4) == 512,
                 "桶内数超过总数时夹取，绝不超额");
+        }
+
+        /// <summary>
+        /// 2026-11-07：按网盘独立的连接预算（多网盘同时下载不再互相侵占）。
+        ///
+        /// <para>
+        /// 钉死四件事：①四家的预算数字就是既有实测值（夸克 512 / UC 256 / 阿里 64 / 迅雷 16），
+        /// 不许因为「看起来该更大」被改掉；②单任务软上限 = 份额×2 且不超本网盘预算；
+        /// ③**阻塞下限必须能降下来**——迅雷两个任务同跑时若双方都坚持阻塞拿 16 条，
+        /// 第二个会一直等到第一个整体下完（界面 = 假死），这条断言就是防这个回归；
+        /// ④非法入参不抛异常（这段在调度热路径上，抛异常会让整批任务失败）。
+        /// </para>
+        /// </summary>
+        private static void TestPanConnBudget()
+        {
+            // ---- 四家预算（既有实测值，改动必须同步 AGENTS.md 与记忆）----
+            Check("pan.budget_quark",
+                GeZi.Core.Support.PanConnBudget.BudgetFor(0) == 512,
+                "夸克 = 512（按账号限连接，512 条跑满带宽的实测拐点）");
+            Check("pan.budget_uc",
+                GeZi.Core.Support.PanConnBudget.BudgetFor(1) == 256,
+                "UC = 256（单 IP 7~8 MB/s，超过 256 每条掉到 13 KB/s 跌破看门狗）");
+            Check("pan.budget_aliyun",
+                GeZi.Core.Support.PanConnBudget.BudgetFor(2) == 64,
+                "阿里 = 64（单 IP 2.5~2.7 MB/s，128 只多 11% 却更容易触发限流）");
+            Check("pan.budget_xunlei",
+                GeZi.Core.Support.PanConnBudget.BudgetFor(3) == 16,
+                "迅雷 = 16（137 片全开时 CDN 大面积 503）");
+
+            // ---- 非法网盘号一律当夸克，绝不抛异常 ----
+            Check("pan.normalize_negative",
+                GeZi.Core.Support.PanConnBudget.NormalizePanKind(-1) == 0,
+                "负数网盘号归一成夸克");
+            Check("pan.normalize_overflow",
+                GeZi.Core.Support.PanConnBudget.NormalizePanKind(99) == 0,
+                "越界网盘号归一成夸克");
+            Check("pan.budget_unknown",
+                GeZi.Core.Support.PanConnBudget.BudgetFor(42) == 512,
+                "未知网盘号按夸克预算，不抛异常");
+
+            // ---- 单任务软上限 = 份额 × 2，且永不超过本网盘预算 ----
+            Check("pan.soft_single",
+                GeZi.Core.Support.PanConnBudget.SoftCap(512, 1) == 512,
+                "单任务时软上限就是全预算（与改造前逐字等价）");
+            Check("pan.soft_two",
+                GeZi.Core.Support.PanConnBudget.SoftCap(512, 2) == 512,
+                "两个任务时份额 256、×2 顶到 512，大文件仍可吃满");
+            Check("pan.soft_four",
+                GeZi.Core.Support.PanConnBudget.SoftCap(512, 4) == 256,
+                "四个任务时软上限 256，防单个超大文件吃光整批");
+            Check("pan.soft_xunlei_two",
+                GeZi.Core.Support.PanConnBudget.SoftCap(16, 2) == 16,
+                "迅雷两任务时软上限仍被夹在本网盘预算 16，不超额");
+            Check("pan.soft_aliyun_six",
+                GeZi.Core.Support.PanConnBudget.SoftCap(64, 6) == 20,
+                "阿里六任务时份额 10、×2 = 20");
+            Check("pan.soft_zero_budget",
+                GeZi.Core.Support.PanConnBudget.SoftCap(0, 1) == 1,
+                "预算为 0 时返回 1，不返回 0（0 会让租约死锁）");
+
+            // ---- 阻塞下限：平时 16，只有「任务数 × 16 > 本网盘预算」时才降 ----
+            Check("pan.block_xunlei_one",
+                GeZi.Core.Support.PanConnBudget.BlockingMinimum(16, 1) == 16,
+                "迅雷单任务阻塞拿满 16 条");
+            Check("pan.block_xunlei_two",
+                GeZi.Core.Support.PanConnBudget.BlockingMinimum(16, 2) == 8,
+                "🚨 迅雷两个任务必须各拿 8 —— 都坚持 16 会让第二个假死排队");
+            Check("pan.block_xunlei_four",
+                GeZi.Core.Support.PanConnBudget.BlockingMinimum(16, 4) == 4,
+                "迅雷四个任务各拿 4，仍然不会低于 1");
+            Check("pan.block_quark_never_capped",
+                GeZi.Core.Support.PanConnBudget.BlockingMinimum(512, 1) == 16,
+                "夸克单任务阻塞下限就是 16，不会被放大（对既有行为零影响）");
+            Check("pan.block_quark_many",
+                GeZi.Core.Support.PanConnBudget.BlockingMinimum(512, 6) == 16,
+                "夸克六任务份额 85 仍大于 16，阻塞下限保持 16");
+            Check("pan.block_running_zero",
+                GeZi.Core.Support.PanConnBudget.BlockingMinimum(16, 0) == 16,
+                "在跑任务数为 0 时按 1 处理，不除零");
         }
 
         /// <summary>

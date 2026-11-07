@@ -77,11 +77,64 @@ namespace GeZi.DownloadEngine
         /// 全局连接预算租约。UI 的「按文件大小分配」只是每个任务的**期望值**，
         /// 这里才是**硬上限**：多个批次（续传批次 + 新下载批次）、甚至多个
         /// <see cref="DownloadScheduler"/> 实例同时存在时，所有在飞任务的连接额度
-        /// 合计也不会超过 <see cref="ThreadAllocator.DefaultBudget"/>。
-        /// 刻意做成静态：目标是账号级总连接数，不是某个调度器实例的局部预算。
+        /// 合计也不会超过各自的网盘预算。
+        /// 刻意做成静态：目标是账号/IP 级总连接数，不是某个调度器实例的局部预算。
+        ///
+        /// <para>
+        /// 🚨🚨 2026-11-07 改造：原来是**一个** <c>SemaphoreSlim(512)</c>，四家网盘共用。
+        /// 但四家的服务端配额是各自独立结算的（夸克按账号、UC/阿里/迅雷按单 IP），
+        /// 共用一份预算只会让它们互相侵占 —— 典型症状：
+        /// 「夸克设 512 + 迅雷设 16 同时下载」时迅雷先占住额度，
+        /// 夸克再被「不超过平均份额 2 倍」夹一道，**永远拿不到 512**。
+        /// 现在拆成四个独立信号量，各拿各的上限，互不影响。
+        /// </para>
+        /// <para>
+        /// 各家的数字与 UI 层 <c>MainWindow.MaxParallelFor</c> 逐字一致
+        /// （见 <see cref="GeZi.Core.Support.PanConnBudget"/>）：夸克 512 / UC 256 / 阿里 64 / 迅雷 16。
+        /// </para>
         /// </summary>
-        private static readonly SemaphoreSlim GlobalConnLease =
-            new SemaphoreSlim(ThreadAllocator.DefaultBudget, ThreadAllocator.DefaultBudget);
+        private static readonly SemaphoreSlim[] PanConnLease = new SemaphoreSlim[]
+        {
+            new SemaphoreSlim(GeZi.Core.Support.PanConnBudget.Quark, GeZi.Core.Support.PanConnBudget.Quark),
+            new SemaphoreSlim(GeZi.Core.Support.PanConnBudget.Uc, GeZi.Core.Support.PanConnBudget.Uc),
+            new SemaphoreSlim(GeZi.Core.Support.PanConnBudget.Aliyun, GeZi.Core.Support.PanConnBudget.Aliyun),
+            new SemaphoreSlim(GeZi.Core.Support.PanConnBudget.Xunlei, GeZi.Core.Support.PanConnBudget.Xunlei),
+        };
+
+        /// <summary>
+        /// 每个网盘当前**正在跑**的任务数（用于算单任务平均份额与阻塞下限）。
+        /// 只统计真正进了 <see cref="RunOneAsync"/> 主体、已经拿到并发槽的任务。
+        /// </summary>
+        private static readonly int[] PanRunning = new int[GeZi.Core.Support.PanConnBudget.PanCount];
+
+        /// <summary>取该网盘的租约信号量（越界按夸克）。</summary>
+        private static SemaphoreSlim LeaseOf(int panKind)
+        {
+            return PanConnLease[GeZi.Core.Support.PanConnBudget.NormalizePanKind(panKind)];
+        }
+
+        /// <summary>登记一个任务进入本网盘（返回进入后的在跑数，供算份额）。</summary>
+        private static int EnterPan(int panKind)
+        {
+            int idx = GeZi.Core.Support.PanConnBudget.NormalizePanKind(panKind);
+            return System.Threading.Interlocked.Increment(ref PanRunning[idx]);
+        }
+
+        /// <summary>登记一个任务离开本网盘。</summary>
+        private static void LeavePan(int panKind)
+        {
+            int idx = GeZi.Core.Support.PanConnBudget.NormalizePanKind(panKind);
+            int v = System.Threading.Interlocked.Decrement(ref PanRunning[idx]);
+            if (v < 0) System.Threading.Interlocked.Exchange(ref PanRunning[idx], 0);
+        }
+
+        /// <summary>本网盘当前在跑几个任务（至少 1）。</summary>
+        private static int RunningInPan(int panKind)
+        {
+            int idx = GeZi.Core.Support.PanConnBudget.NormalizePanKind(panKind);
+            int v = Volatile.Read(ref PanRunning[idx]);
+            return v < 1 ? 1 : v;
+        }
 
         /// <summary>诊断日志出口（转给融合引擎）。</summary>
         public Action<string> Log { get; set; }
@@ -152,8 +205,23 @@ namespace GeZi.DownloadEngine
         /// <summary>全局连接预算上限。仅供诊断/日志。</summary>
         public int ConnectionBudget => ThreadAllocator.DefaultBudget;
 
-        /// <summary>当前已被在飞任务占用的连接额度（跨实例）。仅供诊断/日志。</summary>
-        public int LeasedConnections => ThreadAllocator.DefaultBudget - GlobalConnLease.CurrentCount;
+        /// <summary>
+        /// 当前已被在飞任务占用的连接额度（跨实例、四网盘合计）。仅供诊断/日志。
+        /// <para>2026-11-07：由「单个全局预算」改为四网盘分别统计后求和。</para>
+        /// </summary>
+        public int LeasedConnections
+        {
+            get
+            {
+                int sum = 0;
+                for (int i = 0; i < PanConnLease.Length; i++)
+                {
+                    int cap = GeZi.Core.Support.PanConnBudget.BudgetFor(i);
+                    sum += cap - PanConnLease[i].CurrentCount;
+                }
+                return sum;
+            }
+        }
 
         public async Task RunAllAsync(IReadOnlyList<DownloadJob> jobs, IProgress<JobUpdate> progress, CancellationToken globalCancel)
         {
@@ -261,6 +329,11 @@ namespace GeZi.DownloadEngine
             string destKey = DestKey(job.Dest);
             bool owned = false;
             int leased = 0;
+            // 进/出本网盘的「在跑任务数」必须成对：进入时在并发槽之后立刻登记，
+            // 离开时无论如何都要减回去，否则该网盘的在跑数只增不减，
+            // 后续任务的份额会被越摊越小（假死在跑数）。
+            // ⚠️ 用 try/finally 而不是在 if 分支里登记：路径互斥失败时也必须减。
+            bool panEntered = false;
             try
             {
                 if (!_activeDests.TryAdd(destKey, 0))
@@ -270,10 +343,20 @@ namespace GeZi.DownloadEngine
                 }
                 owned = true;
 
-                // ---- 全局连接预算租约 ----
+                // 登记本网盘「在跑任务数」：必须在自己算份额**之前**登记，
+                // 这样 share 里算的就是真实同网盘并发数（含自己）。
+                EnterPan(job.PanKind);
+                panEntered = true;
+
+                // ---- 本网盘连接预算租约 ----
                 // 申请“期望值”个额度；额度不足就在这里等前一个任务释放，
                 // 而不是让三个任务各开 256 路把账号连接数顶穿。
                 int want = job.Threads > 0 ? job.Threads : QuarkConstants.DownloadThreads;
+                // 夹到「本网盘」的物理天花板（夸克 512 / UC 256 / 阿里 64 / 迅雷 16）。
+                // 原来夹的是全局 512，对夸克等价，但会让「迅雷要 100」这种非法值
+                // 一路走到下面的 MaxParallelCount 才被夹——日志里就会出现假的申请值。
+                int panCap = GeZi.Core.Support.PanConnBudget.BudgetFor(job.PanKind);
+                if (want > panCap) want = panCap;
                 if (want > ThreadAllocator.DefaultBudget) want = ThreadAllocator.DefaultBudget;
 
                 // 🚨 机械盘限制并发（2026-10-24 补的缺口）。
@@ -313,15 +396,15 @@ namespace GeZi.DownloadEngine
                 // 🚨 这里原来还有一个 `const int RecommendedMaxThreads = 256`，
                 // 会把「设置页填 512」永远压回 256 —— 用户看到任务显示 256/256 连接，
                 // 以为自己的设置根本没生效（实测就是这么报的）。
-                // 预算均分本身已经保证总量不超 DefaultBudget：
-                //   1 个任务 → 512、2 个任务 → 256、3 个任务 → 170
-                // 所以不需要再额外夹一刀；用户填多少，单任务就该拿多少（受总预算约束）。
-                const int MinPerFileThreads = 16;
-                int budget = ThreadAllocator.DefaultBudget;
-                int running = plannedConcurrency;
-                if (running < 1) running = 1;
-                int share = budget / running;
-                if (share < MinPerFileThreads) share = MinPerFileThreads;
+                //
+                // 🚨🚨 2026-11-07 改造：预算由「全局 512 按批均分」改为**按网盘独立结算**。
+                //   原因：四家网盘的服务端配额各算各的（夸克按账号、UC/阿里/迅雷按单 IP），
+                //   共用一份 512 只会互相侵占 —— 夸克设 512 + 迅雷设 16 同跑时，
+                //   迅雷先占额度、夸克再被 softCap 夹一道，夸克永远拿不到 512。
+                //   现在：budget = 本网盘预算（512/256/64/16），
+                //         running = **本网盘**同时在跑的任务数（不再是全批任务数）。
+                int panBudget = GeZi.Core.Support.PanConnBudget.BudgetFor(job.PanKind);
+                int running = RunningInPan(job.PanKind);
 
                 // 🚨 2026-10-25 修正：这里原来把 want **硬压到 share**（= budget / 同时任务数），
                 // 会把 ThreadAllocator 按「大小比例 + waves 放大」算好的结果拍平，造成预算闲置。
@@ -335,14 +418,12 @@ namespace GeZi.DownloadEngine
                 //
                 // 现在改成**软上限**：允许单任务超过平均份额，最多到 2× 平均份额
                 // （防止一个超大文件把整批吃光）；真正的硬上限仍然是
-                // GlobalConnLease 的 512 条静态租约，所以不会超配额。
-                // 等大文件场景（7×3.2GB, planned=3）实测总量 510→512，基本无变化，
-                // 所以这个放宽不会让「等大文件」变差。
-                int softCap = share * 2;
-                if (softCap > budget) softCap = budget;
+                // 本网盘信号量的固定租约，所以不会超配额。
+                int softCap = GeZi.Core.Support.PanConnBudget.SoftCap(panBudget, running);
                 if (want > softCap)
                 {
-                    Log("[并发] " + running + " 个任务共享 " + budget + " 条连接，本任务 " + want + " -> " + softCap);
+                    Log("[并发] 本网盘 " + running + " 个任务共享 " + panBudget + " 条连接，本任务 "
+                        + want + " -> " + softCap);
                     want = softCap;
                 }
 
@@ -350,25 +431,33 @@ namespace GeZi.DownloadEngine
                 //    用户问「吃不满线程」时，这条能直接区分：
                 //      · leased ≈ want → 客户端开满了，慢是服务端配额；
                 //      · leased ≪ want → 客户端被预算/分母卡住，需查这里。
-                // 保底 16 条阻塞拿（保证任务能开始）；超出部分只拿空闲额度，绝不空等。
+                // 保底若干条阻塞拿（保证任务能开始）；超出部分只拿空闲额度，绝不空等。
                 // 否则又会出现「第 3 个任务永远轮不到」的情况。
+                //
+                // 🚨 blockingFloor 由「本网盘预算 ÷ 本网盘在跑任务数」夹取：
+                //   迅雷预算只有 16，两个迅雷任务同时开始时若双方都阻塞要 16 条，
+                //   第二个会一直等第一个整体下完（界面表现为「排队中 / 0 B/s」假死）。
+                //   其余网盘（512/256/64 配 ≤6 个任务）算出来都 ≥16，与改造前逐字等价。
+                int blockingFloor = GeZi.Core.Support.PanConnBudget.BlockingMinimum(panBudget, running);
+                SemaphoreSlim lease = LeaseOf(job.PanKind);
                 int wantedLease = want;
                 for (int i = 0; i < want; i++)
                 {
-                    if (i < MinPerFileThreads)
+                    if (i < blockingFloor)
                     {
-                        await GlobalConnLease.WaitAsync(globalCancel).ConfigureAwait(false);
+                        await lease.WaitAsync(globalCancel).ConfigureAwait(false);
                         leased++;
                         continue;
                     }
-                    if (!await GlobalConnLease.WaitAsync(0, globalCancel).ConfigureAwait(false))
+                    if (!await lease.WaitAsync(0, globalCancel).ConfigureAwait(false))
                         break;
                     leased++;
                 }
 
                 if (Log != null)
                     Log("[并发] 连接租约：申请 " + wantedLease + "，实得 " + leased
-                        + "（总预算 " + ThreadAllocator.DefaultBudget + "，同批计划 " + plannedConcurrency + " 个任务）");
+                        + "（本网盘预算 " + panBudget + "，本网盘在跑 " + running
+                        + " 个任务，同批计划 " + plannedConcurrency + " 个任务）");
 
                 using (var linked = CancellationTokenSource.CreateLinkedTokenSource(globalCancel, job.Cancel.Token))
                 {
@@ -412,7 +501,12 @@ namespace GeZi.DownloadEngine
             {
                 // 先还连接额度，再放并发槽：下一个任务一进来就能拿到刚释放的额度。
                 if (leased > 0)
-                    GlobalConnLease.Release(leased);
+                    LeaseOf(job.PanKind).Release(leased);
+                // 退出本网盘的「在跑任务数」。必须在算份额的信号量归还之后再减，
+                // 否则新任务可能在旧任务还没归还额度时就按「少一个任务」算份额，
+                // 拿到过大的 want 却抢不到额度（无害，但日志会对不上）。
+                if (panEntered)
+                    LeavePan(job.PanKind);
                 // 下载结束（含成功/失败/取消/异常）必然走到这里，
                 // 立即释放目标路径，供"删除后重下"继续。
                 if (owned)
