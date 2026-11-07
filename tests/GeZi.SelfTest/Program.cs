@@ -133,6 +133,7 @@ namespace GeZi.SelfTest
     Run("pan_bucket_budget", TestPanBucketBudget);
     Run("pan_conn_budget", TestPanConnBudget);
     Run("chunk_splitter", TestChunkSplitter);
+    Run("slow_watchdog", TestSlowWatchdog);
     Run("bandwidth_smoothing", TestBandwidthSmoothing);
     Run("log_redactor", TestLogRedactor);
         Run("pending_canresume", TestPendingCanResume);
@@ -2544,6 +2545,95 @@ namespace GeZi.SelfTest
                 r5.IndexOf("abcdef1234567890", StringComparison.Ordinal) < 0
                 && r5.IndexOf("xyz9876543210", StringComparison.Ordinal) < 0,
                 "Cookie 头整段必须打码");
+        }
+
+        /// <summary>
+        /// 2026-11-07：慢连接看门狗改「中位数相对判据」。
+        ///
+        /// <para>
+        /// 钉死三件事：
+        /// ① 中位数不受少数极快连接影响（平均值会被拉高，把大批正常连接判慢）；
+        /// ② 动态线有效时**绝不**把按网盘分档的绝对下限 max 进来（否则全员 13.5KB/s 还是全判慢）；
+        /// ③ 真死掉的连接（低于 4KB/s 死亡底线）无论同伴多慢都要被抓出来。
+        /// </para>
+        /// </summary>
+        private static void TestSlowWatchdog()
+        {
+            // ① 中位数基本正确性
+            Check("watch.median_odd",
+                Math.Abs(SlowWatchdog.Median(new List<double> { 3, 1, 2 }) - 2) < 0.001,
+                "奇数样本中位数 = 中间那个");
+            Check("watch.median_even",
+                Math.Abs(SlowWatchdog.Median(new List<double> { 4, 1, 3, 2 }) - 2.5) < 0.001,
+                "偶数样本中位数 = 中间两个的平均");
+
+            // ② 核心场景：170 路 12~14KB/s + 少数 33KB/s 的快连接。
+            //    平均值会被拉到 33 附近（判慢线 16.5，把 170 路全判慢）；
+            //    中位数应稳定在 13~14 附近（判慢线 ~6.75，全员合格）。
+            var mixed = new List<double>();
+            for (int i = 0; i < 170; i++) mixed.Add(13.0 * 1024);
+            for (int i = 0; i < 8; i++) mixed.Add(500.0 * 1024);
+            double med = SlowWatchdog.Median(mixed);
+            double avg = 0;
+            foreach (var v in mixed) avg += v;
+            avg /= mixed.Count;
+            Check("watch.median_ignores_fast_outliers",
+                Math.Abs(med - 13.0 * 1024) < 1
+                && avg > 30.0 * 1024,
+                "少数快连接必须只抬高平均值、不抬高中位数（中位数=" + (med / 1024).ToString("F1") + "KB/s，平均值=" + (avg / 1024).ToString("F1") + "KB/s）");
+
+            // ③ 动态线 = 中位数 × 0.5
+            long dyn = SlowWatchdog.DynamicFloorFromMedian(13.0 * 1024, 0.5);
+            Check("watch.dynamic_from_median",
+                dyn == (long)(13.0 * 1024 * 0.5),
+                "动态判慢线 = 中位数 × 比例");
+            Check("watch.dynamic_null_when_no_sample",
+                SlowWatchdog.DynamicFloorFromMedian(0, 0.5) == 0
+                && SlowWatchdog.DynamicFloorFromMedian(1000, 0) == 0,
+                "没有样本或比例为 0 时必须返回 0（调用方保留上一轮值）");
+
+            // ④ 🚨 要害：动态线有效时，绝对下限不许参与判定
+            long eff = SlowWatchdog.EffectiveFloor((long)(6.75 * 1024), 16 * 1024, SlowWatchdog.DeathFloorBps);
+            Check("watch.absolute_floor_not_maxed",
+                eff == (long)(6.75 * 1024) && eff < 16 * 1024,
+                "动态线 6.75KB/s 生效时，绝对下限 16KB/s 必须被忽略（否则全员 13.5KB/s 仍被全判慢）");
+
+            // ⑤ 还没测出中位数时才用绝对下限兜底
+            long effFallback = SlowWatchdog.EffectiveFloor(0, 16 * 1024, SlowWatchdog.DeathFloorBps);
+            Check("watch.absolute_floor_fallback",
+                effFallback == 16 * 1024,
+                "没有动态线时退回按网盘分档的绝对下限");
+
+            // ⑥ 死亡底线：真死掉的连接必须被抓，哪怕全员都很慢
+            long effDead = SlowWatchdog.EffectiveFloor(1 * 1024, 8 * 1024, SlowWatchdog.DeathFloorBps);
+            Check("watch.death_floor_wins",
+                effDead == SlowWatchdog.DeathFloorBps,
+                "动态线与绝对线都低于 4KB/s 时，死亡底线必须顶上去（否则 0.5KB/s 的死连接永远抓不到）");
+
+            // ⑦ 全员 13.5KB/s 的场景：判慢线必须让所有人都合格
+            long crowd = SlowWatchdog.EffectiveFloor(
+                SlowWatchdog.DynamicFloorFromMedian(13.5 * 1024, 0.5), 16 * 1024, SlowWatchdog.DeathFloorBps);
+            Check("watch.crowd_slow_not_flagged",
+                crowd < 13.5 * 1024,
+                "全员 13.5KB/s 时判慢线必须低于 13.5KB/s，不能让所有连接一起重连");
+
+            // ⑧ 个别掉队：9 条 4KB/s + 160 条 14KB/s，只抓那 9 条
+            var tail = new List<double>();
+            for (int i = 0; i < 160; i++) tail.Add(14.0 * 1024);
+            for (int i = 0; i < 9; i++) tail.Add(4.0 * 1024);
+            long tailLine = SlowWatchdog.EffectiveFloor(
+                SlowWatchdog.DynamicFloorFromMedian(SlowWatchdog.Median(tail), 0.5),
+                16 * 1024, SlowWatchdog.DeathFloorBps);
+            Check("watch.outlier_caught",
+                tailLine > 4.0 * 1024 && tailLine < 14.0 * 1024,
+                "掉队连接（4KB/s）必须落在判慢线以下，而主力连接（14KB/s）在线上");
+
+            // ⑨ 空集合与负数安全
+            Check("watch.empty_safe",
+                SlowWatchdog.Median(null) == 0
+                && SlowWatchdog.Median(new List<double>()) == 0
+                && SlowWatchdog.Median(new List<double> { -100, -200 }) == 0,
+                "空集合 / null / 全负数都返回 0，不抛异常");
         }
 
         /// <summary>最小落盘替身：只用来验证 EffectiveReceivedBytes 的分流判据。</summary>

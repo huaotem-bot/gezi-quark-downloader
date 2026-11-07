@@ -1835,10 +1835,6 @@ public class DownloadService : AbstractDownloadService
         {
             var lastPos = new Dictionary<string, long>();
             var lastTick = new Dictionary<string, int>();
-            // 2026-11-05：动态慢阈值用的采样状态。
-            // 语义 = 「本任务平均每条连接的速度」：总字节增量 / 时间增量 / 活跃连接数。
-            long dynLastBytes = 0;
-            int dynLastTick = Environment.TickCount;
 
             while (!stopMonitor.IsCancellationRequested && !cancel.IsCancellationRequested)
             {
@@ -1855,42 +1851,14 @@ public class DownloadService : AbstractDownloadService
                     // 成本只有一次 List 扫描，不含 I/O。
                     ApplyPriorityWindowToQueue(queue);
 
-                    // ---- 2026-11-05 新增：更新动态慢阈值 ----
-                    // 目的：并发开得很高时（256/512），带宽摊到每条连接必然远低于
-                    // 固定阈值 16KB/s，会让**几乎所有连接同时被判慢**并触发重连风暴。
-                    // 这里按「本任务平均单连接速度 × DynamicSlowRatio」算出相对阈值，
-                    // 由 ChunkDownloader 取 max(绝对下限, 本值) 使用。
-                    //
-                    // 为什么用「平均单连接速度」而不是「总速度」：
-                    //   总速度高不代表每条连接都快（可能只是并发多）。要判断「某条连接是否掉队」，
-                    //   参照系必须是**同伴的平均水平**，这正是 refs/YunX 的 avgPerConn 思路。
-                    try
-                    {
-                        int dynNow = Environment.TickCount;
-                        long dynBytes = Package.ReceivedBytesSize;
-                        int dynDt = dynNow - dynLastTick;
-                        // ⚠️ 采样基准只在**真正算完之后**才更新：
-                        //   如果放在 if 外面，每次监控轮询（默认 2 秒）都会重置基准，
-                        //   而窗口是 1 秒 —— 等于每次都从头算，增量永远接近 0，
-                        //   动态阈值会一直停在 0（退化成只有绝对下限，白改一场）。
-                        if (dynDt >= 1000)
-                        {
-                            double totalBps = (dynBytes - dynLastBytes) * 1000.0 / dynDt;
-                            if (totalBps < 0) totalBps = 0;
-                            int live = Volatile.Read(ref _liveWorkers);
-                            if (live < 1) live = 1;
-                            double avgPerConn = totalBps / live;
-                            double ratio = Options.DynamicSlowRatio;
-                            long floor = ratio > 0 ? (long)(avgPerConn * ratio) : 0;
-                            Options.DynamicSlowThresholdBps = floor;
-                            dynLastBytes = dynBytes;
-                            dynLastTick = dynNow;
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        _logger?.LogDebug($"更新动态慢阈值失败: {ex.Message}");
-                    }
+                    // ---- 2026-11-07：动态慢阈值改由 PreemptRound 用**中位数**更新 ----
+                    // 这里原来按「总速度 ÷ 在飞连接数」算平均值，有两个致命缺陷：
+                    //   ① 平均值会被少数快连接拉高。用户日志实测「170/254 路低于 12KB/s，
+                    //      但平均单连接 33.0 KB/s」—— 平均值 33 时判慢线 16.5，
+                    //      那 170 路全部落在判慢线以下，于是全部重连；
+                    //   ② `_liveWorkers` 是「领过活的 worker 数」，不是「正在跑连接的数」，
+                    //      空闲 worker 也会被算进分母，平均值被稀释得更低。
+                    // 中位数没有这两个毛病，且已经由 PreemptRound 里的逐片采样算好了。
 
                     PreemptRound(active, queue, lastPos, lastTick, cancel);
                 }
@@ -2268,20 +2236,43 @@ public class DownloadService : AbstractDownloadService
         if (speeds.Count < 2)
             return;
 
-        // 2) 平均速度（每连接）
-        double sum = 0;
-        foreach (var s in speeds) sum += s.Value;
-        double avg = sum / speeds.Count;
-        if (avg <= 0)
+        // 2) 中位数（每连接）—— **不是平均值**。
+        //
+        // 🚨🚨 2026-11-07 改（用户日志坐实）：原来用平均值，被少数快连接拉高以后
+        //   判慢线跟着抬高，把大批正常连接一起判成慢。实测日志原文：
+        //     「170/254 路都低于阈值 12.0 KB/s（本轮实测平均单连接 33.0 KB/s）」
+        //   —— 平均值 33 KB/s 时判慢线 = 33×0.5 = 16.5 KB/s，那 170 路（大多 12~14 KB/s）
+        //   全部落在线下 → 全部重连 → 握手烧掉带宽 → 下一轮平均值更低 → 更糟。
+        //   中位数不受少数极快/极慢连接影响，代表「典型同伴」的速度，
+        //   这才是判断「某条连接是否掉队」该用的参照系。
+        //
+        // ⚠️ 中位数只在样本 ≥ 2 时才有意义（已在上面早退），且这里**不做任何平滑** ——
+        //   平滑会让阈值滞后于真实变化，而采样窗口本身就是 2 秒一轮，已经足够稳。
+        // 计算逻辑已抽到 GeZi.Core.Support.SlowWatchdog.Median（有自检）。
+        var speedValues = new List<double>(speeds.Count);
+        foreach (var s in speeds) speedValues.Add(s.Value);
+        double median = GeZi.Core.Support.SlowWatchdog.Median(speedValues);
+        if (median <= 0)
             return;
 
-        // 3) 慢的判定阈值 = max(绝对下限, 平均单连接速度 × 比例)。
+        // 把中位数写进动态阈值，供 ChunkDownloader 的看门狗使用。
+        // 语义：判慢线 = 中位数 × DynamicSlowRatio（默认 0.5）。
+        // 全员 13.5 KB/s → 6.75 KB/s，谁都不算慢；个别掉到 4 KB/s 才被抓。
+        Options.DynamicSlowThresholdBps = GeZi.Core.Support.SlowWatchdog.DynamicFloorFromMedian(
+            median, Options.DynamicSlowRatio);
+
+        // 3) 慢的判定阈值 = max(绝对下限, 中位数 × 比例)。
         //
         // 🚨 绝对下限 PreemptMinBps(12KB/s) 不是可选项：
-        //    收尾阶段只剩一两路时，平均值就是那一两路自己，
-        //    「低于平均值 × 0.34」永远成立不了，谁都不会被判慢 —— 阈值会自己塌掉。
+        //    收尾阶段只剩一两路时，中位数就是那一两路自己，
+        //    「低于自己 × 0.34」永远成立不了，谁都不会被判慢 —— 阈值会自己塌掉。
         //    加了下限后，收尾那几路只要真的慢就会被抓出来换掉。
-        double threshold = Math.Max((double)Options.PreemptMinBps, avg * Options.PreemptSpeedRatio);
+        //
+        // ⚠️ 2026-11-07：这里仍然是「选哪几路去抢」的判据，不是「看门狗判慢」的判据。
+        //    看门狗用的是 Options.DynamicSlowThresholdBps（= 中位数 × 0.5，无绝对下限），
+        //    两者故意分开：抢占要保守（宁可少抢，抢错会打断正常连接），
+        //    看门狗要宽松（全员慢时绝不能全部重连）。
+        double threshold = Math.Max((double)Options.PreemptMinBps, median * Options.PreemptSpeedRatio);
 
         // 4) 整体限速判定（规则见 OverallSlowGate，收尾期自动豁免）
         int slowCount = 0;
@@ -2307,10 +2298,10 @@ public class DownloadService : AbstractDownloadService
             int targetConn = Options.ParallelCount;
             if (targetConn < 1) targetConn = 1;
             _logger?.LogInfo(string.Format(
-                "整体限速中：{0}/{1} 路都低于阈值 {2}/s（本轮实测平均单连接 {3}/s）；"
+                "整体限速中：{0}/{1} 路都低于阈值 {2}/s（本轮实测单连接中位数 {3}/s）；"
                 + "目标并发 {4} 路，当前在飞 {5} 路。这属于服务端整体配额低、"
                 + "而非个别慢节点，已暂停抢占以免无谓重连。",
-                slowCount, speeds.Count, FmtBps(threshold), FmtBps(avg),
+                slowCount, speeds.Count, FmtBps(threshold), FmtBps(median),
                 targetConn, active.Count));
         }
 

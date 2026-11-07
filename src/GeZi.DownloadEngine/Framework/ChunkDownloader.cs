@@ -377,25 +377,29 @@ internal class ChunkDownloader
                         if (elapsedMs >= lowestSpeedSeconds * 1000L)
                         {
                             double bps = speedWindowBytes * 1000.0 / elapsedMs;
-                            // 每轮重算有效阈值：max(绝对下限, 动态相对阈值)。
-                            // 动态值由 DownloadService 的监控任务按实时平均速度更新，
-                            // 这里现读现用，保证「并发高时阈值自动降下来」。
+                            // 每轮重算有效阈值：**相对判据优先**，绝对只有一个「彻底死了」的底线。
+                            //
+                            // 🚨🚨 2026-11-07 重做（用户实测日志坐实）：旧逻辑会自伤。
+                            //   连接速度 13.5 KB/s < 绝对下限 16 KB/s → 全部判慢；
+                            //   而「整体限速」要求全员低于 12 KB/s 才触发 —— 13.5 又刚好不够低，
+                            //   所以 OverallSlowActive 一直是 false、绝对下限 16 KB/s 全程生效，
+                            //   → 每一轮上千次断开重连 → 握手 200~600ms 占 3~5% → 平均更低。
+                            //   用户日志里 747 次「连接被强制关闭」就是它。
+                            //
+                            // 新判据：**只跟同伴比**。
+                            //   动态阈值 = 同时在飞连接速度的**中位数** × DynamicSlowRatio（默认 0.5）。
+                            //   · 全员 13.5 KB/s → 阈值 6.75 KB/s → 全员合格，零重连 ✓
+                            //   · 9 条 4 KB/s + 160 条 14 KB/s → 中位数 14 → 阈值 7 → 只抓那 9 条 ✓
+                            //   · 真死掉的（0.5 KB/s）无论中位数多少都低于 4 KB/s 死亡底线 → 抓 ✓
+                            //   · 收尾只剩一两路时中位数就是它自己，会把自己判慢 ——
+                            //     所以中位数在样本 < 2 时**不更新**，保留上一轮的值。
                             long dynamicFloor = _configuration.DynamicSlowThresholdBps;
                             long absoluteFloor = _configuration.LowestSpeedLimit;
-                            // 🚨🚨 2026-11-05：整体限速期间**丢掉绝对下限**，只按相对阈值判。
-                            //
-                            // 为什么：绝对下限 16KB/s 是为了抓「半死连接」。但当服务端按 IP
-                            // 整体限速时（实测阿里/UC 约 2.5MB/s 摊到 256 路 ≈ 10KB/s），
-                            // 每条连接都稳定低于 16KB/s —— 绝对下限会把**全部连接**判成慢，
-                            // 于是 151 次重连全打在同一件事上，换回来的还是 10KB/s，
-                            // 纯属把带宽烧在 TCP 握手和 HTTP 请求头上。
-                            //
-                            // 整体限速下唯一有意义的判据是「相对同伴是否掉队」：
-                            // 大家都 10KB/s 时，10KB/s 不算慢；某条掉到 2KB/s 才算慢。
-                            // 而整体限速结束（OverallSlowActive 变 false）后，绝对下限立刻回来兜底。
-                            long lowestSpeed = _configuration.OverallSlowActive && dynamicFloor > 0
-                                ? dynamicFloor
-                                : Math.Max(absoluteFloor, dynamicFloor);
+                            // 判慢线计算已抽成纯函数（GeZi.Core.Support.SlowWatchdog），
+                            // 那边有完整的自检与「为什么用中位数、为什么不 max 绝对线」的长注释。
+                            // 这里只负责把本分片的实测速度喂进去。
+                            long lowestSpeed = GeZi.Core.Support.SlowWatchdog.EffectiveFloor(
+                                dynamicFloor, absoluteFloor, GeZi.Core.Support.SlowWatchdog.DeathFloorBps);
                             // 剩余量太少就不值得重连：重连要付 TCP+TLS 握手和
                             // 重发请求头的代价（实测 200~600ms）。
                             // 🚨 判据必须按「时间」而不是「字节数」：
