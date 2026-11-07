@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  解决方案级的公共编译属性（2026-11-04 新增）。
+
+  🚨 为什么要这个文件：
+  PDB 会把「源码所在的绝对路径」写进 documents 表。
+  原来只有 src/GeZi/GeZi.csproj 配了 PathMap，于是：
+    · GeZi.pdb 里是 /_/src/...（已脱敏）
+    · GeZi.Core.pdb / GeZi.DownloadEngine.pdb / GeZi.Providers.pdb /
+      GeZi.Application.pdb 里仍是 C:\Users\<用户名>\Desktop\...\repo\*（**泄漏**）
+  实测打包后审计发现的正是这个问题。
+
+  把 PathMap 提到这里，五个项目全部生效，PDB 里只留 /_/ 前缀。
+  ⚠️ PathMap 只改**二进制里记录的路径**，不改实际文件位置 ——
+     本机调试照常，别人看到的是占位前缀。
+-->
+<Project>
+  <PropertyGroup>
+    <!-- 整个解决方案根目录 → /_/ -->
+    <PathMap>$(MSBuildThisFileDirectory)=/_/</PathMap>
+  </PropertyGroup>
+</Project>

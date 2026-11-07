@@ -46,8 +46,31 @@ namespace GeZi
         /// 夸克 CDN **按连接限速**（单连接 ~64KB/s），所以加连接线性有效；
         /// 但 256 以上开始出现争抢（TCP 慢启动叠加 + 服务端反制），**不是越高越好**。
         /// ⚠️ 默认值只影响新用户；老配置里已有的值不会被覆盖。
+        /// <para>
+        /// 🚨 2026-11-07 语义降级：设置页的**全局并发下拉已删除**，本字段不再是
+        /// "当前生效并发数"，而是「四家网盘都没有单独配置时的**回落基准**」。
+        /// 唯一读取点是 <c>MainWindow.DefaultThreadsFor(PanKind)</c>，
+        /// 各网盘真正生效的值走 <c>MainWindow.ThreadsFor(PanKind)</c>
+        /// （per-pan 覆盖值 → 回落本字段 → 再与各家服务端上限取 min）。
+        /// </para>
+        /// <para>
+        /// ⚠️ **字段必须保留，不能删**：老 <c>GeZi.config.xml</c> 已存过该值，
+        /// 物理删除会让 <c>XmlSerializer</c> 反序列化抛异常 → 用户设置与登录态全丢。
+        /// 同理 <c>MainWindow.ApplySettings</c> 里**不许再回写本字段**
+        /// （回写会把"当前生效值"固化成基准，导致 per-pan 调高永远被压回）。
+        /// </para>
         /// </summary>
         public int Threads { get; set; } = 256;
+
+        // ---- 2026-11-05：四网盘各自的并发连接数 ----
+        // 0 = 未单独配置 → 回落 Threads（上面的回落基准）。这样老配置里没有这四个字段时
+        // 反序列化得 0，行为与升级前**完全一致**，不会一升级就变慢。
+        // 非 0 时由 MainWindow.ThreadsFor(kind) 取用，并且仍会与服务端硬上限取 min
+        // （迅雷 16 / 阿里 64 / UC 256 是实测阈值，不让用户配到自毁）。
+        public int ThreadsQuark { get; set; } = 0;
+        public int ThreadsUc { get; set; } = 0;
+        public int ThreadsAliyun { get; set; } = 0;
+        public int ThreadsXunlei { get; set; } = 0;
 
         /// <summary>
         /// 目标在<b>机械盘</b>时的连接数上限（= 同时进行的 Range 请求数）。
@@ -71,29 +94,30 @@ namespace GeZi
         public bool AutoClean { get; set; } = true;
 
         /// <summary>
-        /// 「未完成」入口是否已被用户静音（2026-11-03）。
+        /// 【已废弃，仅保留字段兼容旧配置】「未完成」入口静音标志（2026-11-03 引入，2026-11-04 废弃）。
         /// <para>
-        /// 🚨 修「我明明选了放弃续传，未完成图标还一直挂着」：
-        /// 原来 <c>RefreshPendingEntry</c> 只看记录条数，而「稍后再说」/右上角 ×
-        /// **会保留记录**（这是设计如此，记录留着方便下次续传）→
-        /// 图标自然一直亮着，用户以为「放弃」没生效。
+        /// 🚨🚨 2026-11-04 用户第二次报同一个问题：
+        /// 「当我在续传界面点击稍后再说，我在任务界面的右边没有显示未完成」。
+        /// 根因就是这两个字段 —— 我 11-03 为了修「点了稍后再说图标还挂着」，
+        /// 加了「静音」把入口整个藏起来；11-04 又加了指纹比对想让它「有新任务才恢复」，
+        /// 结果变成 **只要记录没变，入口永远不显示**，用户再也回不到续传界面。
         /// </para>
         /// <para>
-        /// 现在：用户点「稍后再说」时把这里置 true，图标隐藏；
-        /// 一旦**产生新的未完成任务**就自动重置为 false（新问题该提醒）。
+        /// ⇒ 正确语义（用户明确要求）：**「稍后再说」= 这次先不续，但入口必须留着**，
+        ///   随时能点回去续。所以静音机制整体废弃，<c>RefreshPendingEntry</c>
+        ///   恢复成「有条数就显示」。
+        /// </para>
+        /// <para>
+        /// ⚠️ **字段不能物理删除**：旧 <c>GeZi.config.xml</c> 里可能已经存了
+        /// <c>true</c>，<c>XmlSerializer</c> 遇到不认识的成员会直接忽略（不会抛异常），
+        /// 但留着字段更保险 —— 万一以后有人想「恢复静音」，知道它为什么被废弃。
         /// </para>
         /// </summary>
+        [System.Obsolete("2026-11-04 废弃：静音会让「未完成」入口永久消失，改用「有条数就显示」。", false)]
         public bool PendingReminderMuted { get; set; }
 
-        /// <summary>
-        /// 用户点「稍后再说」那一刻的**记录指纹**（2026-11-04）。
-        /// <para>
-        /// 🚨 修「点稍后再说后图标立刻又冒出来」：
-        /// 原来 <c>SyncPending</c> 只要看到有记录就把静音清掉，
-        /// 而「稍后再说」是**故意保留记录**的 → 静音刚设就被清，图标又出现。
-        /// 现在比对指纹：只有**记录集合真的变了**（出现了新任务）才重置静音。
-        /// </para>
-        /// </summary>
+        /// <summary>【已废弃，仅保留字段兼容旧配置】见 <see cref="PendingReminderMuted"/>。</summary>
+        [System.Obsolete("2026-11-04 废弃，同 PendingReminderMuted。", false)]
         public string PendingMutedSignature { get; set; }
 
         /// <summary>
@@ -164,23 +188,10 @@ namespace GeZi
         /// </summary>
         private static int ParseStorageMode(string raw)
         {
-            if (string.IsNullOrWhiteSpace(raw))
-                return 1;
-            string v = raw.Trim();
-            int n;
-            if (int.TryParse(v, System.Globalization.NumberStyles.Integer,
-                    System.Globalization.CultureInfo.InvariantCulture, out n))
-                return n;
-            // 老枚举名（枚举本身已删除，这里只做字符串识别，不引用任何类型）
-            if (string.Equals(v, "Sequential", StringComparison.OrdinalIgnoreCase)
-                || string.Equals(v, "Ordered", StringComparison.OrdinalIgnoreCase)
-                || string.Equals(v, "SequentialFile", StringComparison.OrdinalIgnoreCase))
-                return 0;
-            if (string.Equals(v, "Auto", StringComparison.OrdinalIgnoreCase)
-                || string.Equals(v, "Default", StringComparison.OrdinalIgnoreCase))
-                return -1;
-            // SharedFile / Shared / Merge / Random / Concurrent … 以及任何未知值
-            return 1;
+            // 🚨 2026-11-07：用户明确「不要顺序写了」。
+            //    归一逻辑抽到 Core 的纯函数（可自检）：所有旧值（0 / -1 / Sequential / Auto / 未知）
+            //    一律落到共写(1)，绝不抛异常 —— 这个函数就是为了防止一份老配置毁掉其他字段。
+            return GeZi.Core.Support.DownloadSizing.NormalizeStorageMode(raw);
         }
 
         /// <summary>
@@ -221,6 +232,29 @@ namespace GeZi
         /// </para>
         /// </summary>
         public int ActivePanKind { get; set; } = 0;
+
+        /// <summary>
+        /// **上次浏览的是哪家网盘**（只影响启动时先打开哪一家）。
+        /// <para>
+        /// 🚨🚨 与 <see cref="ActivePanKind"/> 是两件事，别合并：
+        /// <list type="bullet">
+        /// <item><see cref="ActivePanKind"/> = 「我是以谁的身份登录的」，只由**登录动作**写入；</item>
+        /// <item><see cref="LastBrowsePanKind"/> = 「我最后在看哪一家」，由**浏览/切换页签**写入。</item>
+        /// </list>
+        /// 合并回去就会重演 2026-10-25 用户骂过的问题
+        /// （「每次在我的网盘里选择不同的网盘为什么会影响我的账号登录」）。
+        /// </para>
+        /// <para>
+        /// 为什么必须单独加这个字段：原来启动只读 <see cref="ActivePanKind"/>，
+        /// 而用户在「我的网盘」里点页签走的是**浏览快路径**，压根不写配置，
+        /// 于是「选回夸克 → 重启又跳迅雷」反复出现 —— 记忆从来没被更新过。
+        /// </para>
+        /// <para>
+        /// 默认 -1 = 还没记过（首次升级的用户），此时退回按
+        /// <see cref="ActivePanKind"/> 的旧逻辑走，保证升级行为不变。
+        /// </para>
+        /// </summary>
+        public int LastBrowsePanKind { get; set; } = -1;
 
         /// <summary>阿里云盘 refresh_token。</summary>
         public string AliyunRefreshToken { get; set; } = "";
@@ -404,6 +438,14 @@ namespace GeZi
 
         /// <summary>用户点过「忽略此版本」的版本号。与 <see cref="UpdateLatestVersion"/> 相同则不再提示。</summary>
         public string UpdateIgnoredVersion { get; set; }
+
+        /// <summary>
+        /// 🚨 2026-11-07：上次「阿里自动续期失败」的时刻（UTC Ticks），0 = 从未失败。
+        /// 阿里凭证长期失效时，原来每次启动都会白开一次 WebView2 内嵌登录（50 秒超时），
+        /// 与启动期的登录验证/目录加载抢 UI 线程 → 启动与切换卡顿。
+        /// 失败后把冷却期持久化，重启后仍在冷却期内就直接跳过；续期成功清零。
+        /// </summary>
+        public long AliyunRenewFailedTicks { get; set; }
     }
 
     /// <summary>主窗口「关闭」按钮的行为。</summary>
@@ -544,8 +586,10 @@ namespace GeZi
             // 阿里设备私钥等同于「这台机器的设备身份」，能签出有效设备会话，同样加密保存。
             s.AliyunDevicePrivateKey = SecretProtector.Unprotect(s.AliyunDevicePrivateKey);
             // 并发上限与核心层的 MaxRealConcurrency 保持一致。
-            // 旧配置里可能存着 512/8192 这类超出范围的值，读进来时夹到有效范围，
-            // 免得 UI 上落不到任何一个合法档位。上限取自核心层常量，避免两处失配。
+            // 旧配置里可能存着 512/8192 这类超出范围的值，读进来时夹到有效范围。
+            // 🚨 2026-11-07：本字段已降级为「per-pan 都没配置时的回落基准」，
+            //    不再直接等于"当前生效并发数"（设置页的全局下拉已删）。
+            //    夹取范围仍保留，因为 ThreadsFor → DefaultThreadsFor 会读它。
             if (s.Threads <= 0) s.Threads = 256;   // 与上面 Threads 的默认值保持一致
             if (s.Threads > GeZi.DownloadEngine.Planning.ChunkSplitter.MaxRealConcurrency)
                 s.Threads = GeZi.DownloadEngine.Planning.ChunkSplitter.MaxRealConcurrency;

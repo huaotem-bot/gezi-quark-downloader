@@ -208,6 +208,8 @@ namespace GeZi.DownloadEngine
                                 Done = e.ReceivedBytesSize,
                                 Total = e.TotalBytesToReceive,
                                 Speed = e.BytesPerSecondSpeed,
+                                // 🚨 2026-11-07：界面显示用 5 秒平滑值，调度仍用 Speed。
+                                DisplaySpeed = e.DisplaySpeed > 0 ? e.DisplaySpeed : e.BytesPerSecondSpeed,
                                 // 收尾/校验阶段没有网络流量，速度必然是 0；
                                 // 带上 Phase 让界面显示「正在校验文件完整性…」而不是卡在「下载中」。
                                 Phase = e.Phase,
@@ -329,6 +331,16 @@ namespace GeZi.DownloadEngine
                     //    几十字节的错误页，框架会当它正常下完，只有长度能看出来。
                     //    这种情况必须也走重新取链，否则用户看到「完成」但文件打不开。
                     long actualLen = TryFileLength(job.Dest);
+                    // 🚨 2026-11-06（S0 观测）：收尾时把「应有长度 / 磁盘实际长度」一起记下来。
+                    //    纯日志、零行为变化；用途是让「假完成 / 进度与磁盘背离」在现场可被直接读出来，
+                    //    而不是等到用户打开文件才发现。判定逻辑一行未动。
+                    if (log != null && package.TotalFileSize > 0)
+                    {
+                        log(string.Format(
+                            "收尾长度核对：应有 {0} 字节，实际 {1} 字节{2}",
+                            package.TotalFileSize, actualLen,
+                            actualLen == package.TotalFileSize ? "（一致）" : "（不一致，走长度硬校验）"));
+                    }
                     if (package.TotalFileSize > 0 && actualLen >= 0 && actualLen != package.TotalFileSize)
                     {
                         failure = new LinkLengthMismatchException(string.Format(
@@ -514,7 +526,44 @@ namespace GeZi.DownloadEngine
             // Accept 是 WebHeaderCollection 的受限头，只能走强类型属性，
             // 直接 Headers["Accept"] = ... 会抛「必须使用适当的属性或方法修改"Accept"标头」。
             request.Accept = "*/*";
+
+            // 🚨 2026-11-05：把该网盘的客户端额外头透传到数据面。
+            // 原来下载层只有 UA / Referer / Origin / Cookie 四个头，取链层却带完整
+            // 浏览器头 —— 身份自相矛盾。这些头经 ChunkDownloader.BuildChunkRequest
+            // 的 ExtraHeaders 原样发出，无需改动下载引擎。
+            if (job.ExtraHeaders != null)
+            {
+                foreach (var kv in job.ExtraHeaders)
+                {
+                    if (string.IsNullOrEmpty(kv.Key)) continue;
+                    if (string.Equals(kv.Key, "Cookie", StringComparison.OrdinalIgnoreCase)) continue;
+                    if (string.Equals(kv.Key, "User-Agent", StringComparison.OrdinalIgnoreCase)) continue;
+                    if (string.Equals(kv.Key, "Referer", StringComparison.OrdinalIgnoreCase)) continue;
+                    if (string.Equals(kv.Key, "Origin", StringComparison.OrdinalIgnoreCase)) continue;
+                    if (string.Equals(kv.Key, "Accept", StringComparison.OrdinalIgnoreCase)) continue;
+                    request.Headers[kv.Key] = kv.Value;
+                }
+            }
             request.Timeout = 15000;
+
+            // 🚨🚨 2026-11-05：顺序写的重排窗口按并发数自适应。
+            //
+            // 默认 32 MB 在 256/512 路并发下太小：每条连接一个 64 KB 缓冲，
+            // 256 路两轮就能把窗口塞满；一旦头部某片慢，全员背压 →
+            // 用户看到「下了几兆突然卡着不动」。窗口放大到至少「并发 × 512 KB」
+            // （上限 128 MB），给慢片留出足够的等待余量。
+            //
+            // ⚠️ 只在**顺序写**且调用方没显式指定（0）时生效；
+            //    共写完全不走 SequentialWindowBytes，不受影响。
+            // ⚠️ 这是内存上限而非预分配：顺序写本来就永不预分配文件长度，
+            //    放大窗口不会占用磁盘，只在乱序数据堆积时多用内存。
+            long effWindow = sequentialWindowBytes;
+            if (storageMode == StorageMode.Sequential && effWindow <= 0)
+            {
+                effWindow = (long)eff * 512L * 1024L;
+                if (effWindow < 32L * 1024 * 1024) effWindow = 32L * 1024 * 1024;
+                if (effWindow > 128L * 1024 * 1024) effWindow = 128L * 1024 * 1024;
+            }
 
             // 🚨 机械盘必须放大写合并批次（2026-10-24 补的缺口）。
             // 批次上限 64 时，512 条连接每批只能凑到 64 个来自不同位置的孤立包，
@@ -542,7 +591,7 @@ namespace GeZi.DownloadEngine
                     ? (IChunkTransport)OpenSslChunkTransport.Instance
                     : HttpChunkTransport.Instance,
                 StorageMode = storageMode,
-                SequentialWindowBytes = sequentialWindowBytes,
+                SequentialWindowBytes = effWindow,
                 // 🚨 必须预分配（2026-10-24 修的真 bug，直接决定「边下边看」能不能用）。
                 // 不预分配时目标文件长度 = 已写入的最大偏移，于是：
                 //   · 播放器打开时看到的是一截不完整文件，读不到末尾的 moov 索引；
@@ -565,17 +614,39 @@ namespace GeZi.DownloadEngine
                 //   关闭 → 126.6 秒；开启 → 22.5 秒，快 5.6 倍。
                 // 全部连接都正常时（60 KB/s 均速）开关前后 17.5s vs 17.4s，无误伤。
                 // 设 LowestSpeedLimit = 0 即完全关闭。
-                LowestSpeedLimit = 16L * 1024,
+                //
+                // 🚨🚨 2026-11-05：这个绝对下限**按网盘分档**，不再写死 16KB/s。
+                //   理由见 DownloadJob.SlowFloorBps 的注释 —— 阿里/UC 是「单 IP 总配额」
+                //   限流，256 路摊下来每路只有 10 KB/s，用 16KB/s 会把全部连接判成慢，
+                //   151 次重连全打在同一件事上（用户实测日志）。
+                //   job.SlowFloorBps = 0（自检/老路径）时退回引擎默认 16 KB/s。
+                LowestSpeedLimit = job.SlowFloorBps > 0 ? job.SlowFloorBps : 16L * 1024,
                 LowestSpeedLimitSeconds = 10,
                 MaxSpeedReconnects = 3,
+                // 整体限速判定（2026-11-05 恢复老引擎的机制）：
+                // 大多数连接同时低于阈值 → 是服务端按 IP 的整体配额低，抢占无用。
+                OverallSlowMinSamples = 4,
+                OverallSlowHoldMs = 30_000,
+                PreemptEndgameInflight = 3,
+                PreemptMinBps = 12L * 1024,
                 ResumeStore = FileResumeStore.Instance,
                 Validator = IfRangeValidator.Instance,
+                // 2026-11-04：把「源文件指纹」传进下载服务，写入 .geziresume 的 sourcekey 行。
+                // 续传加载时与本次任务比对 —— 不一致说明同一路径换了另一个源文件，
+                // 必须整份作废重下（否则拼出「长度对、内容坏」的成品）。
+                // 空串 = 调用方没提供 → 不做这项校验，退回按 TotalBytes 判。
+                SourceKey = job.SourceKey ?? "",
                 ExpectedMd5 = expectedMd5 ?? job.Md5,
                 ExpectedSha1 = expectedSha1 ?? job.Sha1,
                 ExpectedSha256 = expectedSha256 ?? job.Sha256,
                 // 机械盘：512 个包 / 64 MB 一批（见上面 hdd 的说明）；固态盘用默认 0 = 64 / 16 MB。
-                BatchMaxCount = hdd ? 512 : 0,
-                BatchMaxBytes = hdd ? 64L * 1024 * 1024 : 0,
+                // 🚨 2026-11-07：取值改从 Core 的纯计算常量读，数值逐字不变，
+                //    目的只是让这批参数能被自检钉死（防未来改坏共写实测达标的主路径）。
+                BatchMaxCount = hdd ? GeZi.Core.Support.DownloadSizing.HddBatchMaxCount : 0,
+                BatchMaxBytes = hdd ? GeZi.Core.Support.DownloadSizing.HddBatchMaxBytes : 0,
+                // 🚨 2026-11-07：注入「删除并移除」意图查询，取消分支据此不再写续传快照。
+                //    默认 false，普通暂停/取消行为逐字不变。
+                IsDeleteRemoveRequested = () => job.DeleteAndRemoveRequested,
             };
         }
 

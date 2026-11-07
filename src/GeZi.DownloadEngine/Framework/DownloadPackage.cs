@@ -32,6 +32,32 @@ public class DownloadPackage : IDisposable
     public long ReceivedBytesSize => (Chunks?.Sum(chunk => chunk.Position) ?? 0) + ExtraReceivedBytes;
 
     /// <summary>
+    /// 「真实已落盘字节数」—— 用于进度显示、播放判据与完成判据。
+    ///
+    /// <para>
+    /// 🚨🚨 2026-11-06 修「界面显示已下 20MB、文件却是 0KB」：
+    /// <see cref="ReceivedBytesSize"/> 只是各分片对象里 <c>Position</c> 的累加
+    /// （网络收到 + 交给落盘层就算数），跟磁盘上文件多长**完全无关**。
+    /// 顺序写把数据收进内存重排窗口、等连续前缀到齐才刷盘，
+    /// 一旦头部有缺口，两者可以差整个文件（实测 45MB 文件全程显示 0KB，
+    /// 收尾 FlushAsync 才一口气跳到 45MB）。
+    /// </para>
+    /// <para>
+    /// 顺序写用 <see cref="Storage"/>.Length（= 已连续刷盘偏移），共写保持原值 ——
+    /// 共写预分配后文件长度恒等于总长，不能用它当进度，否则一开局就 100%。
+    /// </para>
+    /// </summary>
+    public long EffectiveReceivedBytes
+    {
+        get
+        {
+            if (Storage != null && Storage.Name == "sequential")
+                return Storage.Length;
+            return ReceivedBytesSize;
+        }
+    }
+
+    /// <summary>
     /// 当前阶段说明（收尾/校验）。null = 正常下载阶段。见 <see cref="DownloadProgressChangedEventArgs.Phase"/>。
     /// </summary>
     public string Phase { get; set; }

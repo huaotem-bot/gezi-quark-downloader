@@ -148,6 +148,12 @@ public sealed class FileResumeStore : IResumeStore
                     state.Validator = Decode(rest);
                     break;
 
+                // 2026-11-04：源文件指纹（本地算的，必然存在）。
+                // 旧状态没有这一行 → SourceKey 保持空串 → 退回按 TotalBytes 判，向后兼容。
+                case "sourcekey":
+                    state.SourceKey = Decode(rest);
+                    break;
+
                 case "saved":
                     if (long.TryParse(rest, NumberStyles.Integer, CultureInfo.InvariantCulture, out long ticks))
                     {
@@ -176,6 +182,8 @@ public sealed class FileResumeStore : IResumeStore
         }
 
         state.Chunks = chunks.ToArray();
+        // 表不可用（不连续 / 长度对不上 / Position 越界）一律当没有续传 ——
+        // 宁可整份重下，也不能拿坏表拼出「长度对、内容坏」的文件。
         return state.IsUsable() ? state : null;
     }
 
@@ -210,6 +218,8 @@ public sealed class FileResumeStore : IResumeStore
         sb.Append(Magic).Append(' ').Append(state.Version).Append('\n');
         sb.Append("total ").Append(state.TotalBytes.ToString(CultureInfo.InvariantCulture)).Append('\n');
         sb.Append("validator ").Append(Encode(state.Validator)).Append('\n');
+        // 2026-11-04：写入源文件指纹，供 LoadResumeAsync 判断「是不是同一个源文件」。
+        sb.Append("sourcekey ").Append(Encode(state.SourceKey)).Append('\n');
         sb.Append("saved ").Append(state.SavedAtUtc.Ticks.ToString(CultureInfo.InvariantCulture)).Append('\n');
 
         foreach (ResumeChunk c in state.Chunks)

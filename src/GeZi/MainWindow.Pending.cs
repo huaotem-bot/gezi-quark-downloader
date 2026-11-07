@@ -61,6 +61,47 @@ namespace GeZi
 {
     public partial class MainWindow : Window
     {
+        /// <summary>
+        /// 🚨🚨 2026-11-07 修「下载途中右键删除并移除，未完成记录还在、续传文件没删掉」：
+        ///   删除时任务行被 RemoveTaskRow 从 _tasks 移除，SyncPending 的第 ③ 段
+        ///   「保留磁盘上有、但这一轮没进 list 的记录」会把磁盘上那条旧记录**无条件捡回来**
+        ///   → state.json 里永远留着一条「已暂停」→ 右上角「未完成 1」不消失；
+        ///   而取消流程随后又按这份记录写一次 .geziresume。
+        ///
+        ///   这个集合记录「用户明确删除并移除过的 Dest」，SyncPending 的 ③ 段遇到就跳过。
+        ///   带过期时间（60 秒），避免一个永远不清理的黑名单把将来**同名新建任务**也误杀。
+        /// </summary>
+        private static readonly Dictionary<string, DateTime> _deletedPendingDests =
+            new Dictionary<string, DateTime>(StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>标记某条记录的 Dest 已被用户删除并移除，SyncPending 不再保留它。</summary>
+        private static void MarkPendingDeleted(string dest)
+        {
+            if (string.IsNullOrEmpty(dest)) return;
+            lock (_deletedPendingDests)
+            {
+                // 顺手清掉过期项，集合不会随使用时长无限增长。
+                var now = DateTime.UtcNow;
+                var expired = _deletedPendingDests
+                    .Where(kv => (now - kv.Value).TotalSeconds > 60)
+                    .Select(kv => kv.Key).ToList();
+                foreach (var k in expired) _deletedPendingDests.Remove(k);
+                _deletedPendingDests[dest] = now;
+            }
+        }
+
+        /// <summary>判断某条磁盘记录是否属于「已被删除并移除」的任务。</summary>
+        private static bool WasPendingDeleted(string dest)
+        {
+            if (string.IsNullOrEmpty(dest)) return false;
+            lock (_deletedPendingDests)
+            {
+                DateTime at;
+                if (!_deletedPendingDests.TryGetValue(dest, out at)) return false;
+                // 超期后不再拦截：用户可能重新下载同一个路径，那是一条全新任务。
+                return (DateTime.UtcNow - at).TotalSeconds <= 60;
+            }
+        }
 
         /// <summary>
         /// 把当前"未完成"的任务（排队/下载/暂停）写进持久化记录，
@@ -135,6 +176,26 @@ namespace GeZi
                 var sb = new StringBuilder();
                 var list = new List<PendingTask>();
                 var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+                // 2026-11-05：先读一次磁盘上的旧记录，建立 Dest → 创建时刻 映射。
+                // ⚠️ 必须在重建列表**之前**读：SyncPending 每轮都会 new PendingTask，
+                //    若这里无条件写 DateTime.Now，昨天的任务每次刷新都会被刷成"今天"。
+                //    只有磁盘上确实没有这条记录（= 本次会话新建）才用当前时间。
+                List<PendingTask> existing = null;
+                try { existing = HistoryStore.GetPending(); }
+                catch { }
+                var createdAtOf = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
+                if (existing != null)
+                {
+                    foreach (var old in existing)
+                    {
+                        if (old == null || string.IsNullOrEmpty(old.Dest)) continue;
+                        if (old.CreatedAtTicks > 0 && !createdAtOf.ContainsKey(old.Dest))
+                            createdAtOf[old.Dest] = old.CreatedAtTicks;
+                    }
+                }
+                long nowTicks = DateTime.Now.Ticks;
+
                 foreach (var t in _tasks)
                 {
                     // 更新包下载不持久化：跨重启续传没有意义，且避免 Pending 信息残缺
@@ -192,16 +253,39 @@ namespace GeZi
                             Source = (int)ResolvePendingSource(pi),
                             ShareUrl = pi?.ShareUrl,
                             SavedFid = pi?.SavedFid,
+                            // 2026-11-05：沿用磁盘上的原始创建时刻，只有全新任务才用现在。
+                            // ⚠️ 不能用内联 out 声明（老语言版本不支持），先查再取。
+                            CreatedAtTicks = CreatedAtFor(createdAtOf, t.Job.Dest, nowTicks),
                         });
                         if (!string.IsNullOrEmpty(t.Job.Dest))
                             seen.Add(t.Job.Dest);
                     }
                 }
 
+                // 🚨🚨 2026-11-06 修「全部下完了，右上角还挂着未完成 1」：
+                //   ③ 原来无条件保留「磁盘上有、但这一轮没进 list 的记录」，
+                //   本意是保护「用户点了稍后再说、只存在于磁盘记录里」的任务。
+                //   但任务完成后 State=Completed，不进 list、也不进 seen，
+                //   于是磁盘上那条旧记录每轮都被 ③ 捡回来 → **永远删不掉**。
+                //   日志实锤：20:24:12「全部完成」、20:24:45 又「未完成的任务已保留」，
+                //   state.json 里那条状态还停在「排队中」。
+                //
+                //   正解：先收集「当前已处于终态的任务」的 Dest；
+                //   磁盘记录若落在这些 Dest 上，说明它对应的任务已经结束，不再保留。
+                //   ⚠️ 只排除终态（Completed/Failed/Cancelled）；Cancelling 是非终态
+                //      （强杀时分片可能还没清完），必须继续保留 —— AGENTS.md 二十一节红线。
+                var terminalDests = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                foreach (var t in _tasks)
+                {
+                    if (t?.Job == null || string.IsNullOrEmpty(t.Job.Dest)) continue;
+                    if (t.State == JobState.Completed || t.State == JobState.Failed
+                        || t.State == JobState.Cancelled)
+                        terminalDests.Add(t.Job.Dest);
+                }
+
                 // ③ 保留磁盘上有、但这一轮没进 _tasks 的记录。
-                List<PendingTask> existing = null;
-                try { existing = HistoryStore.GetPending(); }
-                catch { }
+                //    existing 已在循环前读过一次（建创建时刻映射用），这里复用，
+                //    不再重复读盘 + DPAPI 解密。
                 if (existing != null)
                 {
                     foreach (var old in existing)
@@ -209,6 +293,11 @@ namespace GeZi
                         if (old == null) continue;
                         if (string.IsNullOrEmpty(old.Dest)) continue;
                         if (seen.Contains(old.Dest)) continue;
+                        // 用户明确「删除并移除」过 → 无论磁盘记录状态如何，一律不再捡回来。
+                        // （2026-11-07 实测：删完又冒出「已暂停」，state.json 残留一条）
+                        if (WasPendingDeleted(old.Dest)) continue;
+                        // 对应任务已经终态 → 这条待续记录已无意义，丢弃。
+                        if (terminalDests.Contains(old.Dest)) continue;
                         // 同一份记录里也不能出现两条相同 Dest（历史脏数据兜底）
                         if (!seen.Add(old.Dest)) continue;
                         list.Add(old);
@@ -220,33 +309,34 @@ namespace GeZi
                 // 不带上就会「保留了新记录但签名没变 → 不写盘」。
                 if (existing != null && existing.Count != list.Count)
                     sig += "#" + list.Count;
+                // 🚨 2026-11-06：有任务刚进入终态时，必须强制写一次盘。
+                //   否则「本轮清空了非终态任务、但磁盘旧记录被 ③ 排除掉」这种变化
+                //   可能因为 sb 恰好相同而被 _pendingSig 早退吞掉，
+                //   右上角「未完成」徽章就一直不刷新。
+                if (terminalDests.Count > 0)
+                    sig += "#T" + terminalDests.Count;
                 if (sig == _pendingSig)
                     return;
                 _pendingSig = sig;
                 HistoryStore.SetPending(list);
-                // 🚨 2026-11-03：**新的未完成任务**出现时，自动取消静音 ——
-                //   静音只针对「用户已经看过并选择稍后再说」的那一批，
-                //   新问题该重新提醒，不能一直哑着。
-                // 🚨 2026-11-04 修正：原来只要 list.Count>0 就清静音，
-                //   而「稍后再说」故意保留记录 → 静音刚设就被清、图标又冒出来。
-                //   现在比对**指纹**：只有记录集合真的变了（出现新任务）才重置。
-                try
-                {
-                    if (_settings != null && _settings.PendingReminderMuted)
-                    {
-                        string nowSig = PendingSignature(list);
-                        if (nowSig != (_settings.PendingMutedSignature ?? ""))
-                        {
-                            _settings.PendingReminderMuted = false;
-                            _settings.PendingMutedSignature = null;
-                            SettingsStore.Save(_settings);
-                        }
-                    }
-                }
-                catch { }
+                // 2026-11-04：静音机制已整体废弃（见 Settings.PendingReminderMuted 的注释），
+                // 这里不再需要「指纹比对 → 清静音」那段逻辑，直接刷新入口即可。
                 RefreshPendingEntry();
             }
             catch { }
+        }
+
+
+        /// <summary>
+        /// 查这条任务的原始创建时刻；磁盘上没有（= 本次会话新建）才用当前时间。
+        /// 单独抽出来是为了避开内联 out 变量声明（保持与项目现有语言版本一致）。
+        /// </summary>
+        private static long CreatedAtFor(Dictionary<string, long> map, string dest, long nowTicks)
+        {
+            long born;
+            if (!string.IsNullOrEmpty(dest) && map.TryGetValue(dest, out born) && born > 0)
+                return born;
+            return nowTicks;
         }
 
 
@@ -386,6 +476,20 @@ namespace GeZi
             var wrappers = new List<PendingRow>();
             foreach (var p in all) wrappers.Add(new PendingRow(p));
 
+            // 2026-11-05：按「今天 / 昨天 / 更早」分组。
+            //   · wrappers 保持全量平铺，按钮统计/勾选状态仍按它算，不受分组影响；
+            //   · 只有 ListBox 的显示源换成带 GroupDescriptions 的视图；
+            //   · 排序键：分组顺序 → 组内按创建时刻倒序（新的在上）。
+            //   · 旧记录 CreatedAtTicks=0 → DateGroupOrder=3，稳定落到「更早」。
+            var sorted = wrappers
+                .OrderBy(w => w.DateGroupOrder)
+                .ThenByDescending(w => w.CreatedAtTicks)
+                .ToList();
+            // 只按「DateGroup」一层分组；组间顺序由 sorted 的顺序决定
+            // （ListCollectionView 按首次出现的分组键排组，sorted 已按 DateGroupOrder 排好）。
+            var groupedView = new ListCollectionView(sorted);
+            groupedView.GroupDescriptions.Add(new PropertyGroupDescription("DateGroup"));
+
             // 「全选」已在统计条右侧（selAllTop），这里不再重复造一个。
             var selAll = selAllTop;
             var resumeBtn = DialogChrome.PrimaryButton("继续下载");
@@ -417,7 +521,24 @@ namespace GeZi
             //    「GeZi.MainWindow+PendingRow」（用户反馈：「续传的时候为什么都
             //    显示同样的东西，不应该显示需要续传的文件名吗」）。
             box.ItemTemplate = BuildPendingRowTemplate();
-            foreach (var w in wrappers) box.Items.Add(w);
+            // 2026-11-05：用分组视图当数据源，不再逐条 Add。
+            // ⚠️ 一旦设了 ItemsSource 就不能再往 box.Items 里 Add（会抛
+            //    「使用 ItemsSource 时操作无效」），所以这里必须整体替换。
+            box.ItemsSource = groupedView;
+
+            // 分组标题样式：一行小字 + 细分隔线，不抢文件行的视觉重量。
+            // GroupStyle 的 HeaderTemplate 里 Name 就是分组键（DateGroup）。
+            var groupStyle = new GroupStyle();
+            var headerTemplate = new DataTemplate();
+            var nameFactory = new FrameworkElementFactory(typeof(TextBlock));
+            nameFactory.SetBinding(TextBlock.TextProperty, new Binding("Name"));
+            nameFactory.SetValue(TextBlock.FontSizeProperty, 12.0);
+            nameFactory.SetValue(TextBlock.FontWeightProperty, FontWeights.SemiBold);
+            nameFactory.SetValue(TextBlock.MarginProperty, new Thickness(6, 10, 6, 4));
+            nameFactory.SetResourceReference(TextBlock.ForegroundProperty, "TextSecondaryBrush");
+            headerTemplate.VisualTree = nameFactory;
+            groupStyle.HeaderTemplate = headerTemplate;
+            box.GroupStyle.Add(groupStyle);
 
             // 2026-11-02 用户反馈「双击不能选中文件」：
             //   原来没有任何点击/双击绑定，勾选只能精确点中那个 18px 的小方框。
@@ -583,27 +704,26 @@ namespace GeZi
                     : string.Format("已丢弃 {0} 个未完成任务（释放 {1}）；其中 {2} 个有文件正被占用未能删除，"
                         + "下次启动的自动清扫会兜底回收。网盘文件保留。",
                         n + failed, Util.FormatSize(freed), failed));
+                // 🚨🚨 2026-11-04 修「点了丢弃，未完成图标还在」：
+                //   本方法在**开头**（dlg.ShowDialog() 之后）就调过一次 RefreshPendingEntry()，
+                //   那一次读到的是**还没清空**的记录 → 入口照常显示；
+                //   而这里 ClearPending() 清完记录后直接 return，**再没人刷新** →
+                //   图标一直挂到下一次 SyncPending（新建任务 / 重启）才消失。
+                //   用户实测：日志明明写着「已丢弃 3 个未完成任务」，右上角还挂着「未完成 3」。
+                //   ⇒ 清空记录之后必须**立刻再刷一次**。
+                //   ⚠️ 启动时的续传弹窗走的也是本方法，所以这一处修好，两处都好了。
+                RefreshPendingEntry();
                 return;
             }
 
             if (!doResume)
             {
-                // 🚨 2026-11-03：用户选了「稍后再说」/右上角 × —— 语义是
-                //   「这次不想续，别一直提醒我」，而记录**保留**（分片还在，随时能续）。
-                //   所以这里把「未完成」入口静音掉，避免图标一直挂着让人以为放弃没生效。
-                try
-                {
-                    if (_settings != null)
-                    {
-                        _settings.PendingReminderMuted = true;
-                        // 🚨 同时记下**当前指纹** —— SyncPending 靠它判断
-                        //   「这批记录没变，别重置静音」，否则下一秒就会被清掉。
-                        _settings.PendingMutedSignature = PendingSignature(all);
-                        SettingsStore.Save(_settings);
-                    }
-                }
-                catch { }
-                Log("未完成的任务已保留记录，稍后可从下载页重新下载（分片在，会自然续传）。");
+                // 2026-11-04（用户明确要求）：用户选了「稍后再说」/右上角 × ——
+                //   语义是「这次先不续」，**记录保留、入口也保留**，
+                //   随时能点右上角「未完成」回来继续。
+                // ⚠️ 11-03 那版会在这里把入口静音藏掉，导致用户再也找不到续传入口，
+                //   已整体废弃（见 Settings.PendingReminderMuted 的注释）。
+                Log("未完成的任务已保留，随时可点右上角「未完成」继续（分片在，会自然续传）。");
                 RefreshPendingEntry();
                 return;
             }
@@ -663,18 +783,12 @@ namespace GeZi
             }
             catch { count = 0; }
 
-            // 🚨 2026-11-03 修「选了放弃续传，未完成图标还在」：
-            //   用户点「稍后再说」时记录是**故意保留**的（方便下次续传），
-            //   所以只数条数就会让图标永远亮着，看起来像「放弃没生效」。
-            //   现在按 PendingReminderMuted 判断：静音期间不显示图标，
-            //   但记录仍然保留、仍然能从下载页重新开始。
-            if (count > 0 && _settings != null && _settings.PendingReminderMuted)
-            {
-                PendingEntryBtn.Visibility = Visibility.Collapsed;
-                if (PendingBadge != null) PendingBadge.Visibility = Visibility.Collapsed;
-                return;
-            }
-
+            // 🚨🚨 2026-11-04（用户第二次报同一问题后彻底改正）：
+            //   11-03 我为了修「点了稍后再说图标还挂着」，加了「静音」把入口整个藏掉；
+            //   11-04 又加指纹比对想让它「有新任务才恢复」—— 结果记录没变就永远不显示，
+            //   用户再也回不到续传界面（原话：「点击稍后再说，任务界面右边没有显示未完成」）。
+            //   ⇒ 正确语义：**「稍后再说」只是这次先不续，入口必须留着**，随时能点回去。
+            //   静音机制整体废弃，这里恢复成「有条数就显示」。
             if (count <= 0)
             {
                 PendingEntryBtn.Visibility = Visibility.Collapsed;
@@ -1124,25 +1238,9 @@ namespace GeZi
         }
 
 
-        /// <summary>
-        /// 一组待续传记录的**指纹**（用于判断「集合是否真的变了」）。
-        /// <para>
-        /// 只取 <c>Dest</c> 排序后拼接 —— 那是每条记录的唯一标识（同一路径不会重复），
-        /// 且不会因为状态/大小变化而抖动（那些变化不该算「新任务」）。
-        /// </para>
-        /// </summary>
-        private static string PendingSignature(List<PendingTask> list)
-        {
-            if (list == null || list.Count == 0) return "";
-            var dests = new List<string>(list.Count);
-            foreach (var p in list)
-            {
-                if (p == null || string.IsNullOrEmpty(p.Dest)) continue;
-                dests.Add(p.Dest);
-            }
-            dests.Sort(StringComparer.OrdinalIgnoreCase);
-            return string.Join("\n", dests.ToArray());
-        }
+        // 2026-11-04：PendingSignature 已随「静音机制」一起删除。
+        //   它唯一的用途是给 PendingMutedSignature 算指纹，
+        //   静音废弃后没有调用方（留着会是未使用的私有方法）。
 
 
         private async Task ResumePendingBatchAsync(List<PendingTask> tasks)
@@ -1162,6 +1260,16 @@ namespace GeZi
             // ⚠️ 判据是「任意一家登录了」而不是「夸克客户端拿到了」：
             //    阿里/迅雷账号下 _client 恒为 null（走 _ownProvider），
             //    用 client == null 判会让这两家的续传永远进不来。
+            //
+            // 🚨🚨 2026-11-04 补充说明（UC 续传 403 的现场）：
+            //   这里拿到的 client 只是「**当前登录账号**的客户端」，**不是**「这条任务所属网盘的」。
+            //   实测日志：22:57:47 在 UC 网盘下正常新建下载成功；
+            //   22:57:57 自动登录切成迅雷 → 22:58:02 点续传时
+            //   EnsureClientForResumeAsync() 返回的是**迅雷**路径（_client 为 null），
+            //   而这条任务的 PanKindValue = 1（UC）。
+            //   真正的取链在下面 `else` 分支里会按 kind 重新调 EnsureLiveQuarkClientAsync，
+            //   所以 client 拿错不会直接导致失败 —— 但 `PendingDownloadCookie(kind, client)`
+            //   会用到它，必须保证传进去的是**同 kind** 的实例（见该方法的实现）。
             if (client == null && !IsLoggedInAny)
             {
                 Log("续传需要先登录。请登录后重新下载（分片在，会自然续传）。");
@@ -1196,7 +1304,9 @@ namespace GeZi
             // 这只是**预估**：按"全部待续传任务"分配，但取链阶段会有一部分失败被跳过
             // （阿里/迅雷缺分享 ID、分享失效等），那些失败的条目不该继续占预算。
             // 取链结束后会用**实际成功的那批**重新分配一次（见下方 jobs.Count 分支）。
-            var alloc = AllocateThreads(tasks.Select(p => p.Size).ToList());
+            var alloc = AllocateThreadsByPan(
+                tasks.Select(p => p.Size).ToList(),
+                tasks.Select(p => (PanKind)p.PanKindValue).ToList());
             int allocIdx = 0;
 
             // 2026-11-02：取链时会拿到真实大小（DownloadLink.Size），记在这里，
@@ -1206,7 +1316,7 @@ namespace GeZi
             {
                 foreach (var p in tasks)
                 {
-                    int myAlloc = allocIdx < alloc.Length ? alloc[allocIdx] : _settings.Threads;
+                    int myAlloc = allocIdx < alloc.Length ? alloc[allocIdx] : ThreadsFor((PanKind)p.PanKindValue);
                     allocIdx++;
                     try
                     {
@@ -1445,9 +1555,18 @@ namespace GeZi
                             UserAgent = DownloadUserAgentFor(kind),
                             Origin = DownloadOriginFor(kind),
                             UseOpenSsl = DownloadUseOpenSslFor(kind),
-                            MaxParallelCount = MaxParallelFor((PanKind)p.PanKindValue),
+                            MaxParallelCount = ThreadsFor((PanKind)p.PanKindValue),
+                            SlowFloorBps = SlowFloorFor((PanKind)p.PanKindValue),
+                            // 2026-11-05：续传也补齐客户端头（与新建任务同一份档案）。
+                            PanKind = p.PanKindValue,
+                            ExtraHeaders = DownloadExtraHeadersFor((PanKind)p.PanKindValue),
                             Threads = myAlloc,
                             Md5 = p.Md5, Sha1 = p.Sha1, Sha256 = p.Sha256,
+                            // 2026-11-04：续传也必须带源文件指纹，且要用**刚取链拿到的真实大小**
+                            // （p.Size 可能是旧值或 0）。与新建任务用同一个方法拼，保证口径一致。
+                            SourceKey = BuildSourceKey(
+                                knownSizes.ContainsKey(p) && knownSizes[p] > 0 ? knownSizes[p] : p.Size,
+                                p.PanKindValue, p.Fid),
                             PartsRoot = string.IsNullOrWhiteSpace(_settings.PartsRoot) ? null : _settings.PartsRoot,
                             Pending = new PendingInfo
                             {
@@ -1558,7 +1677,11 @@ namespace GeZi
                         }
                         realSizes.Add(sz);
                     }
-                    var realAlloc = AllocateThreads(realSizes);
+                    // 🚨 2026-11-07：续传批可能混合网盘，重分配也必须**按网盘分桶**
+                    //    （见 AllocateThreadsByPan）。整批用一个 cap 会把迅雷撑爆或把夸克饿死。
+                    var realAlloc = AllocateThreadsByPan(
+                        realSizes,
+                        jobs.Select(j => (PanKind)j.PanKind).ToList());
                     for (int i = 0; i < jobs.Count; i++)
                     {
                         if (i < realAlloc.Length && realAlloc[i] > 0)
@@ -1912,18 +2035,42 @@ namespace GeZi
         /// <summary>
         /// 续传任务该带的下载 Cookie（按「这条任务来自哪家网盘」，不是当前登录账号）。
         /// <para>
-        /// 夸克：用当前夸克客户端的 Cookie；UC：用设置里的 UC Cookie（与夸克是**不同域、不同值**，
-        /// 原来这里对非夸克一律清空，UC 续传就少了登录态）；阿里/迅雷：空
-        /// （直链是 OSS 预签名，带了反而可能被判非法请求）。
+        /// 夸克/UC：**优先用传进来的活客户端**的 Cookie；拿不到才退回配置快照。
+        /// 阿里/迅雷：空（直链是 OSS 预签名，带了反而可能被判非法请求）。
+        /// </para>
+        /// <para>
+        /// 🚨🚨 2026-11-04 修「UC 续传必 403」（用户实测日志）：
+        ///   原来 UC 分支写死 `_settings.UcCookie` —— 那是**配置文件里的快照**，
+        ///   而 UC/夸克的 <c>__puus</c> 约 **3 小时轮换一次**，快照早晚过期。
+        ///   过期快照签出来的直链，CDN 一律 403。
+        ///   实测现场：22:57:47 在 UC 网盘下**新建下载成功**（走全局活客户端），
+        ///   22:57:57 自动登录切成迅雷，22:58:02 点续传 → 用快照 Cookie → 403。
+        ///   同一台机器、同一分钟、同一个文件，**唯一差别就是 Cookie 来源**。
+        /// </para>
+        /// <para>
+        /// ⇒ 现在与夸克走同一条规则：**传进来的 client 是同一家就用它的 CookieStr**
+        ///   （那是跑过 KeepAlive、__puus 被自动轮换过的新鲜值）。
+        ///   ⚠️ 必须校验 <c>quarkClient.Kind == kind</c> —— 拿夸克客户端的 Cookie 发给 UC 的 CDN
+        ///   同样是 403，而且更难排查。
         /// </para>
         /// </summary>
         private string PendingDownloadCookie(PanKind kind, QuarkClient quarkClient)
         {
-            if (kind == PanKind.Quark)
-                return quarkClient != null ? quarkClient.CookieStr : "";
-            if (kind == PanKind.Uc)
-                return _settings == null ? "" : (_settings.UcCookie ?? "");
-            return "";
+            // 阿里 / 迅雷：OSS 预签名直链不需要 Cookie，带了反而可能被判非法。
+            if (kind != PanKind.Quark && kind != PanKind.Uc)
+                return "";
+
+            // 夸克 / UC：优先用**同一家**活客户端的新鲜 Cookie。
+            if (quarkClient != null
+                && quarkClient.Kind == kind
+                && !string.IsNullOrEmpty(quarkClient.CookieStr))
+            {
+                return quarkClient.CookieStr;
+            }
+
+            // 兜底：配置快照（可能已过期，但总比空着强）。
+            if (_settings == null) return "";
+            return kind == PanKind.Uc ? (_settings.UcCookie ?? "") : (_settings.Cookie ?? "");
         }
 
 

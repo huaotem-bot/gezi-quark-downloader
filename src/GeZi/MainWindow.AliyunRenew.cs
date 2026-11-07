@@ -112,6 +112,20 @@ namespace GeZi
             DateTime now = DateTime.UtcNow;
             if (now < _aliyunAutoRenewBlockedUntil)
                 return;
+            // 🚨 2026-11-07：冷却期跨重启持久化。
+            //   凭证长期失效时，原来每次启动都白开一次 WebView2（50 秒）→ 启动卡顿 + 日志刷屏。
+            //   上次失败还在 10 分钟冷却内就别再启动了；用户可随时点阿里卡「登录账号」手动重试。
+            try
+            {
+                long failedTicks = _settings.AliyunRenewFailedTicks;
+                if (failedTicks > 0)
+                {
+                    var failedAt = new DateTime(failedTicks, DateTimeKind.Utc);
+                    if (now - failedAt < AliyunAutoRenewCooldown)
+                        return;
+                }
+            }
+            catch { }
             if (now - _aliyunAutoRenewLastTry < AliyunAutoRenewDebounce)
                 return;
 
@@ -208,8 +222,10 @@ namespace GeZi
                     _panLive[PanKind.Aliyun] = true;
                     if (!_panNick.ContainsKey(PanKind.Aliyun))
                         _panNick[PanKind.Aliyun] = "";
+                    // 🚨 2026-11-07：续期成功 → 清掉跨重启冷却标记。
+                    try { _settings.AliyunRenewFailedTicks = 0; SettingsStore.Save(_settings); } catch { }
                     RefreshPanCards();
-                    RefreshPanStateList();
+                    RefreshPanStateList(force: true);
                 }
                 catch (Exception ex)
                 {
@@ -219,11 +235,13 @@ namespace GeZi
             else
             {
                 _aliyunAutoRenewBlockedUntil = DateTime.UtcNow + AliyunAutoRenewCooldown;
+                // 🚨 2026-11-07：失败时刻落盘，重启后仍在冷却期内直接跳过，不再白开 WebView2。
+                try { _settings.AliyunRenewFailedTicks = DateTime.UtcNow.Ticks; SettingsStore.Save(_settings); } catch { }
                 Log("阿里自动续期未成功（内嵌浏览器里的登录态可能也已过期），"
                     + (int)AliyunAutoRenewCooldown.TotalMinutes
                     + " 分钟内不再自动尝试；需要时点阿里卡的「登录账号」重新登录。");
                 RefreshPanCards();
-                RefreshPanStateList();
+                RefreshPanStateList(force: true);
             }
         }
 

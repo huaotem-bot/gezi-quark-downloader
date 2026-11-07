@@ -405,7 +405,10 @@ namespace GeZi
                         }
                     },
                     // 注册必然是新账号 → 打开前先清 Cookie
-                    msg => LogDetail(msg), clearSessionOnStart: true)
+                    msg => LogDetail(msg), clearSessionOnStart: true,
+                    // 🚨 2026-11-04 用户要求：注册要打开**指定的分享链接**，不是网盘首页。
+                    //   三处共用 RegisterUrlFor，改那一处即改全部。
+                    startUrl: RegisterUrlFor(kind))
                 {
                     Owner = this,
                     Title = PanUrlParser.DisplayNameOf(kind) + " 注册",
@@ -446,15 +449,40 @@ namespace GeZi
             }
         }
 
-        /// <summary>各家网盘的注册/首页地址（都没有独立注册页，注册入口在首页）。</summary>
-        private static string RegisterUrlFor(PanKind kind)
+        /// <summary>
+        /// 各家网盘的**注册页地址**（2026-11-04 用户提供）。
+        /// <para>
+        /// 🚨 用户要求：除阿里外，三个网盘的「注册账号」——
+        /// 无论选「软件内注册」还是「浏览器打开」——都必须打开**下面这几个指定链接**，
+        /// 而不是各网盘的首页。
+        /// </para>
+        /// <para>
+        /// 阿里保持原样（用户没提供链接，且阿里的注册在首页走手机号流程即可）。
+        /// </para>
+        /// <para>
+        /// ⚠️ 三处共用本方法：<see cref="OpenWebLoginForRegister"/>（内嵌窗口）、
+        /// <see cref="OpenRegisterInBrowser"/>（系统浏览器），以及日志里打印的地址。
+        /// 改这里就是改全部，不要在各处各写一份。
+        /// </para>
+        /// </summary>
+        internal static string RegisterUrlFor(PanKind kind)
         {
             switch (kind)
             {
-                case PanKind.Uc: return UcConstants.LoginUrl;
-                case PanKind.Aliyun: return "https://www.alipan.com/";
-                case PanKind.Xunlei: return "https://pan.xunlei.com/";
-                default: return "https://pan.quark.cn/";
+                // 夸克：用户提供的分享链接（内含注册引导）
+                case PanKind.Quark:
+                    return "https://pan.quark.cn/s/2923c9dd7b2b";
+                // UC：public=1 表示公开分享页
+                case PanKind.Uc:
+                    return "https://drive.uc.cn/s/55e79ea88d684?public=1";
+                // 迅雷：带提取码 pwd=d8mb
+                case PanKind.Xunlei:
+                    return "https://pan.xunlei.com/s/VP5bB0PHw8CYbGCoIg12v22fA1?pwd=d8mb";
+                // 阿里：用户未提供，保持官网首页（注册入口在那里）
+                case PanKind.Aliyun:
+                    return "https://www.alipan.com/";
+                default:
+                    return "https://pan.quark.cn/";
             }
         }
 

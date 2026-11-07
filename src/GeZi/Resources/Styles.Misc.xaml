@@ -362,16 +362,32 @@
          !! 说明列必须放**同一行**，不能再像原来那样用 Margin="120,0,0,0" 硬缩进 ——
             那个 120 是照 160 宽标签算的，标签一改就全歪。
     -->
+    <!-- 2026-11-04：SettingsGroupBox / SettingsGroupTitle 已删除。
+         用户原话「网络与下载卡片里边儿不要加灰色背景了太丑了」。
+         我上一轮给三个子分区包了浅灰色块（SurfaceSunken + 圆角 8）想靠底色建立层次，
+         结果只是把界面弄脏。现在改回「3px 竖条 + 小字标题」——
+         不占额外高度、不用底色，同样能分层次。
+         别再往设置页加色块。 -->
+
     <Style x:Key="SettingsRow3" TargetType="Grid">
         <!-- 2026-11-04：14 → 10。用户要求设置页「一整页直接包含所有设置，不要滚动条」。
              行距是垂直空间的最大消耗项（10 行 × 4px = 40px），压这里收益最高。 -->
         <Setter Property="Margin" Value="0,0,0,10"/>
     </Style>
 
-    <!-- 标签：三栏布局专用（与 FieldLabel 的区别是垂直居中 + 不加底边距） -->
+    <!--
+        设置行标签。
+        🚨🚨 2026-11-04 修「标签和控件没对齐」（用户截图指出）：
+          原来 VerticalAlignment=Center —— 而同一行右侧内容高度**不一样**：
+            · 下拉框 34px  · 两个单选 60px  · 复选框 20px
+          各自居中的结果就是视觉上参差不齐。
+          现在改成 Top + 固定 8px 上边距：
+          8px 正好是 34px 高控件里文字基线的位置，
+          这样无论右侧多高，**所有标签都从同一条基线开始**。
+    -->
     <Style x:Key="SettingsRowLabel" TargetType="TextBlock" BasedOn="{StaticResource FieldLabel}">
-        <Setter Property="VerticalAlignment" Value="Center"/>
-        <Setter Property="Margin" Value="0"/>
+        <Setter Property="VerticalAlignment" Value="Top"/>
+        <Setter Property="Margin" Value="0,8,0,0"/>
         <Setter Property="TextWrapping" Value="Wrap"/>
     </Style>
 

@@ -305,6 +305,55 @@ namespace GeZi
                         }
                     }
                     catch { }
+
+                    // 🚨🚨 2026-11-07 修「阿里/迅雷冒出好多个相同账号」的第二条根因：
+                    //   StableCookieFingerprint 在老凭证里提取不到设备号时会退回
+                    //   "raw:" + 整串凭证；而阿里的 access_token 两小时过期、
+                    //   迅雷的 refresh_token 单次有效 —— 同一个账号每续期一次
+                    //   就算出一个新指纹，上面的查重全部落空，接着「同名不同号」
+                    //   分支给 Key 加短后缀，于是 accounts/aliyun/ 堆 2 份、
+                    //   accounts/xunlei/ 堆 3 份（用户实测截图）。
+                    //
+                    //   正解：当指纹是 "raw:" 兜底（= 没拿到稳定设备号）时，
+                    //   **不再按凭证内容区分账号**，改为按「本家已有档案」归并：
+                    //   优先复用本家主账号的 Key，其次复用本家任意一份同名档案的 Key。
+                    //   ⚠️ 绝不删除任何已有档案（用户数据不动）；只是停止继续新增。
+                    //   ⚠️ 只对阿里/迅雷这类「凭证会轮换」的网盘生效；
+                    //      夸克/UC 的 __pus/__uid 指纹是稳定的，走原来的精确查重。
+                    if (fp.StartsWith("raw:", StringComparison.Ordinal)
+                        && (panKind == (int)PanKind.Aliyun || panKind == (int)PanKind.Xunlei))
+                    {
+                        try
+                        {
+                            string kindDir2 = KindDirPath(panKind);
+                            if (Directory.Exists(kindDir2))
+                            {
+                                string bestKey = null;
+                                bool bestPrimary = false;
+                                foreach (var f2 in Directory.GetFiles(kindDir2, "*.xml"))
+                                {
+                                    var o = LoadRaw(f2);
+                                    if (o == null || string.IsNullOrEmpty(o.Key)) continue;
+                                    // 同名（Nick 相同）才归并，避免把两个真不同的账号并成一份。
+                                    if (!string.IsNullOrEmpty(nick) && !string.IsNullOrEmpty(o.Nick)
+                                        && !string.Equals(o.Nick, nick, StringComparison.Ordinal))
+                                        continue;
+                                    if (bestKey == null || (o.IsPrimary && !bestPrimary))
+                                    {
+                                        bestKey = o.Key;
+                                        bestPrimary = o.IsPrimary;
+                                    }
+                                }
+                                if (!string.IsNullOrEmpty(bestKey))
+                                {
+                                    key = bestKey;
+                                    profilePath = ProfilePath(panKind, key);
+                                }
+                            }
+                        }
+                        catch { }
+                    }
+
                     var p = LoadRaw(profilePath) ?? new AccountProfile { Key = key };
                     p.Key = key;
                     if (!string.IsNullOrEmpty(nick))

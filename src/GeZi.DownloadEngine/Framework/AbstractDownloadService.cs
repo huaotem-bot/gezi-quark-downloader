@@ -289,9 +289,13 @@ public abstract class AbstractDownloadService : IDownloadService, IDisposable
         _bandwidth.CalculateSpeed(e.ProgressedByteSize);
         var totalProgressArg = new DownloadProgressChangedEventArgs(nameof(DownloadService)) {
             TotalBytesToReceive = Package.TotalFileSize,
-            ReceivedBytesSize = Package.ReceivedBytesSize,
+            // 🚨 2026-11-06：顺序写用「真实已刷盘长度」，否则头部缺口会让
+            //    界面显示已下 20MB、磁盘文件却是 0KB。共写取值不变。
+            ReceivedBytesSize = Package.EffectiveReceivedBytes,
             BytesPerSecondSpeed = _bandwidth.Speed,
             AverageBytesPerSecondSpeed = _bandwidth.AverageSpeed,
+            // 🚨 2026-11-07：界面显示用 5 秒平滑值；限速/调度仍读 BytesPerSecondSpeed。
+            DisplaySpeed = _bandwidth.SmoothedSpeed,
             ProgressedByteSize = e.ProgressedByteSize,
             ReceivedBytes = e.ReceivedBytes,
             ActiveChunks = LiveActiveChunks(),
@@ -318,7 +322,7 @@ public abstract class AbstractDownloadService : IDownloadService, IDisposable
         var arg = new DownloadProgressChangedEventArgs(nameof(DownloadService))
         {
             TotalBytesToReceive = Package.TotalFileSize,
-            ReceivedBytesSize = Package.ReceivedBytesSize,
+            ReceivedBytesSize = Package.EffectiveReceivedBytes,
             BytesPerSecondSpeed = 0,
             AverageBytesPerSecondSpeed = _bandwidth.AverageSpeed,
             ProgressedByteSize = 0,
@@ -354,10 +358,24 @@ public abstract class AbstractDownloadService : IDownloadService, IDisposable
     protected void RaiseCompletedProgress()
     {
         Package.Phase = null;
+        // 🚨 2026-11-06：不能再无条件把 Done 钉成总长。
+        //   实测日志：哈希复核「本地只读到 0/262144 字节」，却因为
+        //   「按服务器声明的长度下完」被判文件可用，随后界面直接从 0 跳到 45MB。
+        //   顺序写下 ReceivedBytesSize 只是分片计数，不代表文件真的落了盘。
+        //   这里改用实际文件长度，避免进度条撒谎。
+        long actualLen = -1;
+        try
+        {
+            if (!string.IsNullOrWhiteSpace(Package.FileName) && System.IO.File.Exists(Package.FileName))
+                actualLen = new System.IO.FileInfo(Package.FileName).Length;
+        }
+        catch { }
+        if (actualLen < 0) actualLen = Package.TotalFileSize;
+
         var arg = new DownloadProgressChangedEventArgs(nameof(DownloadService))
         {
             TotalBytesToReceive = Package.TotalFileSize,
-            ReceivedBytesSize = Package.TotalFileSize,
+            ReceivedBytesSize = actualLen,
             BytesPerSecondSpeed = 0,
             AverageBytesPerSecondSpeed = _bandwidth.AverageSpeed,
             ProgressedByteSize = 0,

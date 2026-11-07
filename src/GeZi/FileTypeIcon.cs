@@ -53,12 +53,26 @@ namespace GeZi
             Audio,
             Pdf,
             Archive,
+            Disc,
             Doc,
             Sheet,
             Slide,
             Code,
+            Script,
+            Json,
             Text,
+            Subtitle,
+            Font,
+            Database,
+            Book,
+            Torrent,
+            Design,
+            Game,
+            Package,
+            Key,
             Exe,
+            Apk,
+            Mac,
         }
 
         public object Convert(object value, Type targetType, object parameter, CultureInfo culture)
@@ -113,12 +127,26 @@ namespace GeZi
                 case Kind.Audio: return "Audio";
                 case Kind.Pdf: return "Pdf";
                 case Kind.Archive: return "Archive";
+                case Kind.Disc: return "Disc";
                 case Kind.Doc: return "Doc";
                 case Kind.Sheet: return "Sheet";
                 case Kind.Slide: return "Slide";
                 case Kind.Code: return "Code";
+                case Kind.Script: return "Script";
+                case Kind.Json: return "Json";
                 case Kind.Text: return "Text";
+                case Kind.Subtitle: return "Subtitle";
+                case Kind.Font: return "Font";
+                case Kind.Database: return "Database";
+                case Kind.Book: return "Book";
+                case Kind.Torrent: return "Torrent";
+                case Kind.Design: return "Design";
+                case Kind.Game: return "Game";
+                case Kind.Package: return "Package";
+                case Kind.Key: return "Key";
                 case Kind.Exe: return "Exe";
+                case Kind.Apk: return "Apk";
+                case Kind.Mac: return "Mac";
                 default: return "";
             }
         }
@@ -132,12 +160,26 @@ namespace GeZi
                 case Kind.Audio: return "WarningBrush";
                 case Kind.Pdf: return "DangerBrush";
                 case Kind.Archive: return "WarningBrush";
+                case Kind.Disc: return "TextSecondaryBrush";
                 case Kind.Doc: return "PrimaryBrush";
                 case Kind.Sheet: return "SuccessBrush";
                 case Kind.Slide: return "WarningBrush";
                 case Kind.Code: return "TextSecondaryBrush";
+                case Kind.Script: return "TextSecondaryBrush";
+                case Kind.Json: return "WarningBrush";
                 case Kind.Text: return "TextTertiaryBrush";
+                case Kind.Subtitle: return "TextSecondaryBrush";
+                case Kind.Font: return "PrimaryBrush";
+                case Kind.Database: return "SuccessBrush";
+                case Kind.Book: return "PrimaryBrush";
+                case Kind.Torrent: return "SuccessBrush";
+                case Kind.Design: return "DangerBrush";
+                case Kind.Game: return "WarningBrush";
+                case Kind.Package: return "WarningBrush";
+                case Kind.Key: return "DangerBrush";
                 case Kind.Exe: return "TextSecondaryBrush";
+                case Kind.Apk: return "SuccessBrush";
+                case Kind.Mac: return "TextSecondaryBrush";
                 default: return "TextTertiaryBrush";
             }
         }
@@ -160,7 +202,7 @@ namespace GeZi
                 case "jpg": case "jpeg": case "jpe": case "png": case "gif":
                 case "bmp": case "webp": case "svg": case "ico": case "tif":
                 case "tiff": case "heic": case "heif": case "avif": case "raw":
-                case "cr2": case "nef": case "psd": case "ai": case "sketch":
+                case "cr2": case "nef": case "arw": case "dng":
                     return Kind.Image;
 
                 // 视频
@@ -169,60 +211,141 @@ namespace GeZi
                 case "mp4": case "mkv": case "avi": case "mov": case "wmv":
                 case "flv": case "rmvb": case "rm": case "ts": case "m2ts":
                 case "mts": case "webm": case "m4v": case "mpg": case "mpeg":
-                case "3gp": case "vob": case "f4v": case "m2v":
+                case "3gp": case "vob": case "f4v": case "m2v": case "ogv":
                     return Kind.Video;
 
                 // 音频
                 case "mp3": case "flac": case "wav": case "aac": case "m4a":
                 case "ogg": case "wma": case "ape": case "opus": case "aiff":
-                case "mid": case "midi": case "amr":
+                case "mid": case "midi": case "amr": case "ac3": case "dts":
+                case "dsf": case "wv": case "tta":
                     return Kind.Audio;
 
                 // PDF（单独一类：用户点名要它有自己的图标）
                 case "pdf":
                     return Kind.Pdf;
 
-                // 压缩包 / 镜像
+                // 压缩包
                 // ⚠️ "001"~"999" 这类分卷序号不在这里 —— 见上面的 IsVolumeNumber，
                 //    它们已经被提前判成 Archive 了。
                 case "zip": case "rar": case "7z": case "tar": case "gz":
                 case "tgz": case "bz2": case "xz": case "zst": case "lz4":
-                case "iso": case "cab": case "arj": case "lzh":
+                case "cab": case "arj": case "lzh": case "z": case "lz":
+                case "ace": case "r00":
                     return Kind.Archive;
+
+                // 光盘镜像（与压缩包分开：镜像要挂载，压缩包要解压，动作不一样）
+                case "iso": case "img": case "nrg": case "mdf": case "mds":
+                case "bin": case "cue": case "vcd": case "udf": case "toast":
+                    return Kind.Disc;
 
                 // 文档
                 case "doc": case "docx": case "rtf": case "odt": case "pages":
-                case "wps": case "epub": case "mobi":
+                case "wps": case "dot": case "dotx": case "wpd": case "abw":
                     return Kind.Doc;
+
+                // 电子书（独立一类：阅读场景与办公文档不同）
+                case "epub": case "mobi": case "azw": case "azw3": case "fb2":
+                case "djvu": case "cbz": case "cbr": case "ibooks":
+                    return Kind.Book;
 
                 // 表格
                 case "xls": case "xlsx": case "csv": case "ods": case "numbers":
-                case "et": case "tsv":
+                case "et": case "tsv": case "xlsm": case "xlsb":
                     return Kind.Sheet;
 
                 // 演示
                 case "ppt": case "pptx": case "odp": case "key": case "dps":
+                case "pps": case "ppsx": case "potx":
                     return Kind.Slide;
 
-                // 纯文本 / 字幕 / 配置
+                // 纯文本
                 case "txt": case "log": case "md": case "markdown": case "nfo":
-                case "srt": case "ass": case "ssa": case "vtt": case "lrc":
+                case "me": case "readme": case "rst": case "tex":
                     return Kind.Text;
 
-                // 代码
+                // 字幕（从纯文本里独立出来：字幕框 + 两行对白更好认）
+                case "srt": case "ass": case "ssa": case "vtt": case "lrc":
+                case "sub": case "idx": case "smi": case "ttml":
+                    return Kind.Subtitle;
+
+                // 字体
+                case "ttf": case "otf": case "woff": case "woff2": case "eot":
+                case "fon": case "fnt": case "ttc":
+                    return Kind.Font;
+
+                // 数据 / 数据库
+                // ⚠️ "mdf" 属于光盘镜像那一类（Media Descriptor File），这里不能再列一次，
+                //    C# 的 switch 出现重复 case 标签会直接编译失败。
+                case "db": case "sqlite": case "sqlite3": case "mdb": case "accdb":
+                case "dbf": case "sql": case "ldf": case "parquet": case "ndf":
+                    return Kind.Database;
+
+                // JSON / 配置
+                case "json": case "jsonl": case "json5": case "plist":
+                    return Kind.Json;
+
+                // 代码（源码）
                 case "cs": case "vb": case "js": case "mjs": case "tsx":
-                case "jsx": case "py": case "java": case "c": case "h": case "cpp":
-                case "cc": case "hpp": case "go": case "rs": case "php": case "rb":
-                case "swift": case "kt": case "scala": case "lua": case "pl":
-                case "sh": case "bash": case "zsh": case "bat": case "cmd":
-                case "ps1": case "sql": case "html": case "htm": case "css":
-                case "scss": case "less": case "xml": case "json": case "yaml":
-                case "yml": case "toml": case "ini": case "cfg": case "conf":
+                case "jsx": case "py": case "java": case "c": case "h":
+                case "cpp": case "cc": case "hpp": case "go": case "rs":
+                case "php": case "rb": case "swift": case "kt": case "kts":
+                case "scala": case "lua": case "pl": case "pm": case "dart":
+                case "html": case "htm": case "css": case "scss": case "less":
+                case "vue": case "svelte": case "zig": case "nim": case "hx":
+                case "xml": case "xaml": case "xsd": case "xsl": case "svgz":
                     return Kind.Code;
 
-                // 可执行 / 安装包
-                case "exe": case "msi": case "apk": case "appx": case "msix":
-                case "dmg": case "pkg": case "deb": case "rpm": case "jar":
+                // 脚本 / 命令行（与「源码」分开：脚本直接可执行）
+                case "sh": case "bash": case "zsh": case "fish": case "ksh":
+                case "bat": case "cmd": case "ps1": case "psm1": case "vbs":
+                case "pyw": case "awk": case "sed": case "tcl": case "ahk":
+                    return Kind.Script;
+
+                // 配置
+                case "yaml": case "yml": case "toml": case "ini": case "cfg":
+                case "conf": case "properties": case "env": case "editorconfig":
+                    return Kind.Json;
+
+                // 种子 / 磁力
+                case "torrent": case "magnet": case "metalink": case "mgt":
+                    return Kind.Torrent;
+
+                // 设计稿
+                case "psd": case "psb": case "ai": case "sketch": case "fig":
+                case "xd": case "cdr": case "afdesign": case "afphoto":
+                case "aseprite": case "ase": case "tga": case "xcf":
+                    return Kind.Design;
+
+                // 游戏 / 模拟器镜像
+                case "nes": case "snes": case "smc": case "gba": case "gbc":
+                case "nds": case "3ds": case "cia": case "nsp": case "xci":
+                case "wbfs": case "wad": case "rom": case "save":
+                    return Kind.Game;
+
+                // 资源包 / 模组
+                case "mcpack": case "mcworld": case "mcaddon": case "omod":
+                case "pak": case "vpk": case "pbo": case "unity3d": case "bundle":
+                    return Kind.Package;
+
+                // 加密 / 证书
+                // ⚠️ 不能列 "key"：那是 Keynote 演示文稿，已经在上面判给 Slide 了。
+                case "pem": case "crt": case "cer": case "p12":
+                case "pfx": case "ppk": case "keystore": case "jks": case "asc":
+                    return Kind.Key;
+
+                // 安卓应用
+                case "apk": case "aab": case "apks": case "xapk": case "apkm":
+                    return Kind.Apk;
+
+                // 苹果应用 / 安装包
+                case "dmg": case "pkg": case "mpkg": case "app": case "ipa":
+                    return Kind.Mac;
+
+                // 可执行 / 系统安装包
+                case "exe": case "msi": case "appx": case "msix": case "msixbundle":
+                case "deb": case "rpm": case "jar": case "flatpak": case "appimage":
+                case "snap": case "run": case "elf": case "so":
                     return Kind.Exe;
 
                 default:

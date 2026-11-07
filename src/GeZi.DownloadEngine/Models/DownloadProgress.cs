@@ -18,8 +18,14 @@ namespace GeZi.DownloadEngine
     {
         public long Done { get; set; }
         public long Total { get; set; }
-        /// <summary>最近窗口平均速度（字节/秒）。</summary>
+        /// <summary>最近窗口平均速度（字节/秒）。供调度水位使用，保持瞬时语义。</summary>
         public double Speed { get; set; }
+
+        /// <summary>
+        /// 🚨 2026-11-07：界面展示用的 5 秒平滑速度（字节/秒）。
+        /// 与 <see cref="Speed"/> 分开，避免补货判定被平滑值拖迟。
+        /// </summary>
+        public double DisplaySpeed { get; set; }
 
         public double Percent => Total > 0 ? (Done * 100.0 / Total) : 0.0;
 

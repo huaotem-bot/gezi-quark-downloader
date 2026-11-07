@@ -84,6 +84,30 @@ namespace GeZi.Providers.Quark
         /// <summary>实时汇总的 Cookie 串（含服务端 Set-Cookie 更新后的最新值）。</summary>
         public string CookieStr => _session.BuildCookieString();
 
+        /// <summary>
+        /// 取链接口的查询参数：以 <see cref="PanClientProfile"/> 里的客户端档案为底
+        /// （pr / fr / sys / ve），再叠加本入口的差异化参数（entry / fr 变体 / uc_param_str）。
+        ///
+        /// <para>
+        /// 🚨 2026-11-05：原来只带 pr/fr/uc_param_str，缺 <c>sys=win32</c> 与 <c>ve=</c>。
+        /// refs/LinkSwift 与 refs/YunX 两家都带这两个参数 —— 它们是服务端识别
+        /// 「官方 PC 客户端」的一部分。缺版本号的请求更容易被降级成游客/网页身份，
+        /// UC 对非会员账号的视频就会下发「请使用 UC 浏览器播放」的引导流。
+        /// </para>
+        /// </summary>
+        private IDictionary<string, string> DownloadQuery(params string[] extra)
+        {
+            var d = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var kv in PanClientProfile.For(_kind).Query)
+                d[kv.Key] = kv.Value;
+            for (int i = 0; i + 1 < extra.Length; i += 2)
+            {
+                if (extra[i + 1] == null) d.Remove(extra[i]);
+                else d[extra[i]] = extra[i + 1];
+            }
+            return d;
+        }
+
         // ---------------- 底层请求 ----------------
 
         private Timer _keepAliveTimer;
@@ -858,11 +882,11 @@ namespace GeZi.Providers.Quark
             var attempts = new[]
             {
                 // 入口 1：PC 客户端入口（常规最优）
-                new Dictionary<string, string> { { "pr", _pr }, { "fr", "pc" }, { "uc_param_str", "" } },
+                DownloadQuery("uc_param_str", ""),
                 // 入口 2：网页端入口（CDN 选择策略可能不同）
-                new Dictionary<string, string> { { "pr", _pr }, { "fr", "pc" }, { "uc_param_str", "" }, { "entry", "ft" } },
+                DownloadQuery("uc_param_str", "", "entry", "ft"),
                 // 入口 3：移动端入口（部分网络下反而更稳）
-                new Dictionary<string, string> { { "pr", _pr }, { "fr", "android" }, { "uc_param_str", "" } },
+                DownloadQuery("uc_param_str", "", "fr", "android"),
             };
 
             object lastRes = null;
@@ -912,9 +936,9 @@ namespace GeZi.Providers.Quark
         {
             var attempts = new[]
             {
-                new Dictionary<string, string> { { "entry", "ft" }, { "fr", "pc" }, { "pr", _pr } },
-                new Dictionary<string, string> { { "pr", _pr }, { "fr", "pc" }, { "uc_param_str", "" } },
-                new Dictionary<string, string> { { "pr", _pr }, { "fr", "android" }, { "uc_param_str", "" } },
+                DownloadQuery("entry", "ft"),
+                DownloadQuery("uc_param_str", ""),
+                DownloadQuery("uc_param_str", "", "fr", "android"),
             };
 
             object lastRes = null;

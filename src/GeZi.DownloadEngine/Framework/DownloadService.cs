@@ -62,9 +62,33 @@ public class DownloadService : AbstractDownloadService
         base.Resume();
     }
 
+    /// <summary>
+    /// 顺序写模式下默认优先下载的「头部窗口」长度（字节）。
+    /// <para>
+    /// 2026-11-05：用于消除队头阻塞 + 实现边下边看。取 16 MB：
+    /// 播放器一般只需要开头几 MB 就能起播，16 MB 既够用又不会把
+    /// 后面所有连接都饿死（每轮监控都会重新按 _flushed 推进窗口）。
+    /// </para>
+    /// </summary>
+    private const long SequentialHeadPriorityBytes = 16L * 1024 * 1024;
+
     // ---- 阶段3：续传 + 内容校验 ----
     private string _resumeKey;
     private string _validatorValue = "";
+
+    /// <summary>
+    /// 2026-11-04：源文件指纹（本地算的，不依赖服务端响应头）。
+    /// <para>
+    /// 格式：<c>总长|网盘类型|源文件Fid</c>。写入 .geziresume 的 <c>sourcekey</c> 行，
+    /// 续传加载时与本次任务比对 —— 不一致说明「同一目标路径换成了另一个源文件」，
+    /// 必须整份作废重下，否则会拼出「长度对、内容坏」的成品。
+    /// </para>
+    /// <para>
+    /// 空串 = 调用方没提供（老代码路径 / 自检），此时不做这项校验，退回按 TotalBytes 判。
+    /// </para>
+    /// </summary>
+    private string _sourceKeyValue = "";
+
     private CancellationTokenSource _resumeSaveCts;
     private Task _resumeSaveTask;
 
@@ -119,6 +143,31 @@ public class DownloadService : AbstractDownloadService
     /// </summary>
     private readonly object _tailRefillGate = new object();
 
+    /// <summary>
+    /// 「整体限速」判定器（状态机）。
+    /// <para>
+    /// 抽成独立类型不是为了好看，是为了**能自检**：<see cref="PreemptRound"/> 需要真实分片、
+    /// 真实连接、真实计时器才能跑，而判定规则本身是纯逻辑（样本数 / 慢数 / 是否收尾 / 时间）。
+    /// 抽出来之后自检可以覆盖「粘滞窗口」「收尾期豁免」「样本不足不判定」这些边界，
+    /// 不必起真实下载。
+    /// </para>
+    /// </summary>
+    private readonly OverallSlowGate _overallSlow = new OverallSlowGate();
+
+    /// <summary>
+    /// 把字节/秒格式化成「12.3 KB/s」这种人类可读形式。
+    /// <para>只用于日志，不进界面 —— 界面速度格式化走 <c>Util.FormatSize</c> 那一套。</para>
+    /// </summary>
+    private static string FmtBps(double bps)
+    {
+        if (bps < 0) bps = 0;
+        if (bps >= 1024 * 1024)
+            return (bps / (1024.0 * 1024.0)).ToString("0.0") + " MB";
+        if (bps >= 1024)
+            return (bps / 1024.0).ToString("0.0") + " KB";
+        return bps.ToString("0") + " B";
+    }
+
     protected override async Task<Stream> StartDownload()
     {
         try
@@ -138,6 +187,9 @@ public class DownloadService : AbstractDownloadService
             // 它有两个用途：① 每个分片请求带 If-Range，资源一变服务端就回 200 让我们停手；
             // ② 判断上次的续传状态是不是同一份文件。
             _validatorValue = await ProbeValidatorAsync(_globalCancellationTokenSource.Token).ConfigureAwait(false);
+            // 2026-11-04：源文件指纹由调用方给（本地算的，不依赖服务端响应头）。
+            // 见 ResumeState.SourceKey 的注释 —— 它兜住 Validator 探测不到时的空档。
+            _sourceKeyValue = Options.SourceKey ?? "";
             CancelScheduledPhase();
             Package.Phase = null;
 
@@ -255,6 +307,23 @@ public class DownloadService : AbstractDownloadService
                     await ClearResumeAsync().ConfigureAwait(false);
                     throw new InvalidDataException(verify.Message);
                 }
+                // 🚨 2026-11-07：抽样 16 段全未取到时，补一条本地长度确认日志。
+                //   纯日志、零行为：不改放行结论（红线：不在内容校验里用 Fail 拦长度），
+                //   只让「长度对内容坏」这类共写固有风险在现场可被直接读出来。
+                if (check == CrossCheckUnverified)
+                {
+                    try
+                    {
+                        long realLen = !string.IsNullOrWhiteSpace(Package.FileName)
+                            && System.IO.File.Exists(Package.FileName)
+                            ? new System.IO.FileInfo(Package.FileName).Length : -1;
+                        _logger?.LogInfo(string.Format(
+                            "抽样复核未取到远端样本，本地长度为 {0} 字节，应有 {1} 字节；"
+                            + "长度一致仅说明已刷盘，内容仍待用户打开确认。",
+                            realLen, Package.TotalFileSize));
+                    }
+                    catch { }
+                }
                 verify = VerifyOutcome.Warn(check == CrossCheckMatched
                     ? "内容已按服务器返回完整下载（抽样逐字节复核一致）；"
                       + "网盘接口给的哈希与实际内容不符，属元数据问题，文件可用"
@@ -283,9 +352,30 @@ public class DownloadService : AbstractDownloadService
             // 想彻底清干净由上层调 ResumeStore.ClearAsync 决定。
             await StopResumeSaverAsync().ConfigureAwait(false);
 
-            // 必须补一次最终快照：周期保存器默认 3 秒一轮，短任务被取消时可能一次都没跑过，
-            // 只停保存器而不落盘 = 取消后完全没有续传信息（实测 24MB / 0.3 秒的下载就命中）。
-            await SaveResumeSnapshotAsync(CancellationToken.None).ConfigureAwait(false);
+            // 🚨🚨 2026-11-07 修「下载途中右键删除并移除，.geziresume 又回来」：
+            //   取消分支原本**无条件写一次最终快照**，与删除线程删文件形成竞态，
+            //   谁后跑谁赢 —— 实测删完又冒出「已暂停」、续传命中 177 片。
+            //   用户明确「删除并移除」时不再写快照，反而主动清一次。
+            //   默认（普通暂停/取消）该回调为 null 或返回 false，行为逐字不变。
+            bool deleteRemove = false;
+            try
+            {
+                var probe = Options.IsDeleteRemoveRequested;
+                if (probe != null) deleteRemove = probe();
+            }
+            catch { deleteRemove = false; }
+
+            if (deleteRemove)
+            {
+                await ClearResumeAsync().ConfigureAwait(false);
+                _logger?.LogInfo("删除并移除：取消流程不再写续传快照，已清除续传记录。");
+            }
+            else
+            {
+                // 必须补一次最终快照：周期保存器默认 3 秒一轮，短任务被取消时可能一次都没跑过，
+                // 只停保存器而不落盘 = 取消后完全没有续传信息（实测 24MB / 0.3 秒的下载就命中）。
+                await SaveResumeSnapshotAsync(CancellationToken.None).ConfigureAwait(false);
+            }
             await SendDownloadCompletionSignal(DownloadStatus.Stopped, exp).ConfigureAwait(false);
         }
         catch (Exception exp)
@@ -416,6 +506,20 @@ public class DownloadService : AbstractDownloadService
         if (!Options.EnableMoovFirst) { _logger?.LogDebug("moov 优先：EnableMoovFirst=false，跳过"); return; }
         if (Package.TotalFileSize <= 0) { _logger?.LogDebug("moov 优先：总长为 0，跳过"); return; }
         if (!Mp4Moov.LooksLikeMp4(Package.FileName)) { _logger?.LogDebug("moov 优先：不是 MP4（" + Package.FileName + "），跳过"); return; }
+
+        // 🚨🚨 2026-11-07：顺序写默认**不做** moov 优先。
+        //   moov 优先必须 EnsureLength(总长) 预分配才能把索引写到文件尾，
+        //   那会让顺序写的文件第一秒就是 45MB 全零 —— 长度不再等于真实进度，
+        //   播放器按索引读到中间全是零，只能播开头一小段（用户实测）。
+        //   「连续增长」与「边下边看」在顺序写下互斥，这里选前者（诚实降级为下完才能播）。
+        //   共写（StorageMode.Shared）不受影响，照旧走 moov 优先（用户实测可用）。
+        //   MoovFirstOnSequential 默认 false；置 true 才回到改造前行为。
+        if (Options.StorageMode == StorageMode.Sequential && !Options.MoovFirstOnSequential)
+        {
+            _logger?.LogInfo("顺序写：跳过 moov 优先以保持文件连续增长（视频下完即可播放）；"
+                + "如需边下边看可改用共写模式。");
+            return;
+        }
 
         IChunkTransport transport = Options.Transport;
         Request first = _requestInstances.FirstOrDefault();
@@ -893,16 +997,60 @@ public class DownloadService : AbstractDownloadService
 
         if (state.TotalBytes != totalBytes)
         {
+            _logger?.LogWarning(string.Format(
+                "续传状态的长度（{0}）与本次探测（{1}）不一致 → 这不是同一个文件，丢弃旧续传状态",
+                state.TotalBytes, totalBytes));
             await ClearResumeAsync().ConfigureAwait(false);
             return null;
         }
 
-        // 资源标识不一致 = 文件在暂停期间被改过，续下去必然拼出坏文件
-        if (!string.IsNullOrEmpty(validatorValue) &&
-            !string.IsNullOrEmpty(state.Validator) &&
-            !string.Equals(state.Validator, validatorValue, StringComparison.Ordinal))
+        // 🚨🚨 2026-11-04 修复「同名不同文件串进度」（用户实测 UC 续传 403）：
+        //   原来的判据要求 **两边都非空** 才比对：
+        //     if (!string.IsNullOrEmpty(validatorValue) && !string.IsNullOrEmpty(state.Validator) && ...)
+        //   于是只要本次探测**没拿到** validator（CDN 不回 ETag / 走 OpenSSL 桥时响应头缺失 /
+        //   探测超时返回空串），校验就被整个跳过 —— 旧状态被**无条件采信**。
+        //   真实事故：用户先下了夸克的「示例视频」（15,340,287 字节），
+        //   之后从 UC 网盘下**同名**的另一个文件（186,678,707 字节），
+        //   UniquePath 把它落成「示例视频 (1)」，而 .geziresume 是按路径定位的 ——
+        //   引擎读到了旧状态，长度虽然对不上会被上面那条挡住，
+        //   但只要长度恰好相同（同名不同内容），就会拿旧进度续新文件 → 拼出坏文件。
+        //   ⇒ 现在的规则（更严格，宁可重下也不出错）：
+        //     · 本次探测**有** validator → 必须与记录**完全一致**，否则作废；
+        //     · 本次探测**没有** validator，但记录**有** → 无法证明是同一个文件 → 作废；
+        //     · 两边都没有 → 只能靠 TotalBytes 判（上面已判过），放行。
+        bool hasNow = !string.IsNullOrEmpty(validatorValue);
+        bool hasOld = !string.IsNullOrEmpty(state.Validator);
+        if (hasNow && hasOld
+            && !string.Equals(state.Validator, validatorValue, StringComparison.Ordinal))
         {
-            _logger?.LogWarning("资源标识已变化，丢弃旧续传状态");
+            _logger?.LogWarning("资源标识已变化（" + state.Validator + " → " + validatorValue
+                + "），丢弃旧续传状态");
+            await ClearResumeAsync().ConfigureAwait(false);
+            return null;
+        }
+        if (!hasNow && hasOld)
+        {
+            // 本次拿不到资源标识 = 无法证明"还是那个文件"。
+            // 旧版这里是静默放行，结果同名不同文件会串进度。
+            _logger?.LogWarning("本次未取到资源标识，无法确认与旧续传状态是否同一文件，丢弃旧状态重下");
+            await ClearResumeAsync().ConfigureAwait(false);
+            return null;
+        }
+
+        // 🚨🚨 2026-11-04 第二道保险：**源文件指纹**（本地算的，必然存在）。
+        //   上面那两道靠的是服务端 ETag，而 ETag 可能探测不到（CDN 不回 / 超时 / OpenSSL 桥）。
+        //   指纹是 UI 层用「总长 + 网盘序号 + 源文件 Fid」拼的，与网络无关，永远有值。
+        //   真实事故：夸克的「示例视频」(15,340,287) 与 UC 的同名文件 (186,678,707)
+        //   下到同一目录，UniquePath 把后者落成「示例视频 (1)」，
+        //   而 .geziresume 按路径定位 → 长度若恰好相同就会串进度。
+        //   空串表示旧版本写的状态（没这个字段）或调用方没提供 → 跳过，向后兼容。
+        if (!string.IsNullOrEmpty(_sourceKeyValue)
+            && !string.IsNullOrEmpty(state.SourceKey)
+            && !string.Equals(state.SourceKey, _sourceKeyValue, StringComparison.Ordinal))
+        {
+            _logger?.LogWarning(string.Format(
+                "源文件指纹不一致（旧 {0} / 新 {1}）→ 这不是同一个源文件，丢弃旧续传状态重下",
+                state.SourceKey, _sourceKeyValue));
             await ClearResumeAsync().ConfigureAwait(false);
             return null;
         }
@@ -1164,6 +1312,15 @@ public class DownloadService : AbstractDownloadService
     /// </summary>
     private async Task SaveResumeSnapshotAsync(CancellationToken cancel)
     {
+        // 🚨 2026-11-07：用户「删除并移除」后，周期保存器 / 收尾补写都不许再落盘，
+        //    否则与删除线程抢同一个 .geziresume，文件被反复写回来。
+        try
+        {
+            var probe = Options.IsDeleteRemoveRequested;
+            if (probe != null && probe()) return;
+        }
+        catch { /* 回调异常不影响正常下载路径 */ }
+
         if (string.IsNullOrEmpty(_resumeKey))
         {
             return;
@@ -1212,6 +1369,9 @@ public class DownloadService : AbstractDownloadService
         {
             TotalBytes = Package.TotalFileSize,
             Validator = _validatorValue,
+            // 2026-11-04：源文件指纹（本地算的，不依赖服务端响应头）。
+            // 见 ResumeState.SourceKey 的注释：用于识别「同一路径换了另一个源文件」。
+            SourceKey = _sourceKeyValue,
             SavedAtUtc = DateTime.UtcNow,
             Chunks = new ResumeChunk[sorted.Length],
         };
@@ -1371,6 +1531,35 @@ public class DownloadService : AbstractDownloadService
         {
             return VerifyOutcome.Skip("未校验（内存流或没有目标路径）");
         }
+
+        // 🚨🚨 2026-11-06：「假完成」的诊断。
+        //
+        // 实测日志（45.45MB 文件）：进度显示 100%、哈希复核「本地只读到 0/262144 字节」，
+        // 却因为「按服务器声明的长度下完 + 抽样拿不到远端样本」被判「文件可用」。
+        // 根因是 ReceivedBytesSize / VerifyChunkCoverage 都只看 Chunk.Position
+        // 这个**内存计数**，顺序写窗口被队头阻塞时它可以是满的、磁盘文件仍是 0 字节。
+        //
+        // ⚠️ 这里**只记日志、不改判定**：真正的拦截在 FusionDownloader 完成后的
+        //    LinkLengthMismatchException 长度硬校验（它会触发重新取链自愈）。
+        //    若在这里直接返回 Fail，会变成 InvalidDataException → 不触发自愈 →
+        //    用户看到「下载失败」而不是自动重来，体验更差。
+        // 进度显示已由 DownloadPackage.EffectiveReceivedBytes 改用真实刷盘长度，
+        // 不会再出现「界面 20MB / 磁盘 0KB」。
+        try
+        {
+            if (Package.TotalFileSize > 0 && System.IO.File.Exists(Package.FileName))
+            {
+                long realLen = new System.IO.FileInfo(Package.FileName).Length;
+                if (realLen != Package.TotalFileSize)
+                {
+                    _logger?.LogWarning(string.Format(
+                        "文件实际长度与总长不符（期望 {0} 字节，实际 {1} 字节），数据尚未全部落盘，"
+                        + "完成后会由外层长度校验拦下并重新取链。",
+                        Package.TotalFileSize, realLen));
+                }
+            }
+        }
+        catch { }
 
         var expect = new HashExpectation
         {
@@ -1646,6 +1835,10 @@ public class DownloadService : AbstractDownloadService
         {
             var lastPos = new Dictionary<string, long>();
             var lastTick = new Dictionary<string, int>();
+            // 2026-11-05：动态慢阈值用的采样状态。
+            // 语义 = 「本任务平均每条连接的速度」：总字节增量 / 时间增量 / 活跃连接数。
+            long dynLastBytes = 0;
+            int dynLastTick = Environment.TickCount;
 
             while (!stopMonitor.IsCancellationRequested && !cancel.IsCancellationRequested)
             {
@@ -1661,15 +1854,122 @@ public class DownloadService : AbstractDownloadService
                     // 播放窗口是运行期可变的（用户可能拖动进度），所以每轮都看一次，
                     // 成本只有一次 List 扫描，不含 I/O。
                     ApplyPriorityWindowToQueue(queue);
+
+                    // ---- 2026-11-05 新增：更新动态慢阈值 ----
+                    // 目的：并发开得很高时（256/512），带宽摊到每条连接必然远低于
+                    // 固定阈值 16KB/s，会让**几乎所有连接同时被判慢**并触发重连风暴。
+                    // 这里按「本任务平均单连接速度 × DynamicSlowRatio」算出相对阈值，
+                    // 由 ChunkDownloader 取 max(绝对下限, 本值) 使用。
+                    //
+                    // 为什么用「平均单连接速度」而不是「总速度」：
+                    //   总速度高不代表每条连接都快（可能只是并发多）。要判断「某条连接是否掉队」，
+                    //   参照系必须是**同伴的平均水平**，这正是 refs/YunX 的 avgPerConn 思路。
+                    try
+                    {
+                        int dynNow = Environment.TickCount;
+                        long dynBytes = Package.ReceivedBytesSize;
+                        int dynDt = dynNow - dynLastTick;
+                        // ⚠️ 采样基准只在**真正算完之后**才更新：
+                        //   如果放在 if 外面，每次监控轮询（默认 2 秒）都会重置基准，
+                        //   而窗口是 1 秒 —— 等于每次都从头算，增量永远接近 0，
+                        //   动态阈值会一直停在 0（退化成只有绝对下限，白改一场）。
+                        if (dynDt >= 1000)
+                        {
+                            double totalBps = (dynBytes - dynLastBytes) * 1000.0 / dynDt;
+                            if (totalBps < 0) totalBps = 0;
+                            int live = Volatile.Read(ref _liveWorkers);
+                            if (live < 1) live = 1;
+                            double avgPerConn = totalBps / live;
+                            double ratio = Options.DynamicSlowRatio;
+                            long floor = ratio > 0 ? (long)(avgPerConn * ratio) : 0;
+                            Options.DynamicSlowThresholdBps = floor;
+                            dynLastBytes = dynBytes;
+                            dynLastTick = dynNow;
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger?.LogDebug($"更新动态慢阈值失败: {ex.Message}");
+                    }
+
                     PreemptRound(active, queue, lastPos, lastTick, cancel);
                 }
                 catch (OperationCanceledException) { break; }
                 catch (Exception ex)
                 {
-                    _logger?.LogDebug($"PreemptRound failed: {ex.Message}");
+                    _logger?.LogDebug($"慢片抢占本轮失败：{ex.Message}");
                 }
             }
         }, stopMonitor.Token);
+
+        // ---- 慢启动闸门（2026-11-05，对齐 refs/gopeed 的 slowStartController）----
+        //
+        // 🚨🚨 为什么需要：worker 池是一次性 Task.Run 开满的，于是下载开始那一瞬间
+        //   会同时发生 256 次 DNS 解析 + 256 次 TCP 握手 + 256 次 TLS 握手
+        //   + 256 个 HTTP Range 请求。任何一个环节抖动（DNS 超时、CDN 判异常流量回 503），
+        //   都会让这一大批连接**同时**失败、同时退避、同时重连 —— 吞吐周期性塌陷。
+        //   分批放行（1 → 2 → 4 → 16 → 256）能把「同时失败」变成「局部失败」，
+        //   而且 4 步就爬满，用户感知不到启动变慢。
+        SlowStartGate slowGate = Options.EnableSlowStart ? new SlowStartGate(workerCount) : null;
+        // 已真正领到过活的 worker 数（慢启动推进判据，见下方驱动器）。
+        int slowStartStarted = 0;
+
+        // 🚨 小文件豁免：片数本来就少（≤ 8 片）时，慢启动只会让「本该 8 路并行」
+        // 退化成「1 路慢慢爬」—— 爬坡的收益（防握手风暴）远小于损失（串行下载）。
+        // 判据用「片数 ≤ 8」而不是「文件大小」：分片规划器对小文件本来就会切得很少，
+        // 片数才是决定「能开几路并行」的那个量。
+        if (slowGate != null && Package.Chunks.Length <= 8)
+        {
+            slowGate.OpenAll();
+        }
+        var slowStartClock = slowGate != null ? System.Diagnostics.Stopwatch.StartNew() : null;
+        Task slowStartDriver = null;
+        if (slowGate != null)
+        {
+            slowStartDriver = Task.Run(async () =>
+            {
+                try
+                {
+                    while (!slowGate.Done && !stopMonitor.IsCancellationRequested
+                           && !cancel.IsCancellationRequested)
+                    {
+                        await Task.Delay(150, stopMonitor.Token).ConfigureAwait(false);
+
+                        // 放行下一批的判据：**当前已放行的车道都已经被 worker 占满**
+                        // （_liveWorkers ≥ 已放行数），说明这一批连接已经真的在传数据了。
+                        // 只看「有没有开出来」不看「快不快」——
+                        // 慢启动的职责是防止握手风暴，不是判断链路质量。
+                        // 🚨 必须先判「全部下完」：否则 worker 会在闸门前干等，
+                        //    Task.WhenAll 永远不返回 → stopMonitor 不被取消 → 闸门永远不放行，
+                        //    形成死锁（片数少于并发数时必然踩到）。
+                        if (AllChunksDone())
+                        {
+                            slowGate.OpenAll();
+                            break;
+                        }
+
+                        // 判据用「已经真正领到过活的 worker 数」而不是「此刻在飞数」：
+                        //   在飞数会随着单个 worker 下载完一片而回到 0，
+                        //   若只放在飞数，1 路放行时 worker 下完一片就再也推不动闸门，
+                        //   只能干等 10 秒硬超时 —— 等于把慢启动变成 10 秒卡顿。
+                        int started = Volatile.Read(ref slowStartStarted);
+                        bool healthy = started >= slowGate.Allowed;
+                        // 硬超时兜底：CDN 卡住不返回数据时不能无限等，否则下载被慢启动自己卡死。
+                        bool timedOut = slowStartClock.ElapsedMilliseconds >= Options.SlowStartMaxWaitMs;
+                        if (healthy || timedOut)
+                            slowGate.Advance();
+                    }
+                }
+                catch (OperationCanceledException) { }
+                catch (Exception ex) { _logger?.LogDebug("慢启动推进失败: " + ex.Message); }
+                finally
+                {
+                    // 无论怎么退出，都必须放开全部车道 ——
+                    // 否则一旦推进任务异常，剩下的 worker 会永远卡在闸门前。
+                    slowGate.OpenAll();
+                }
+            });
+        }
 
         // ---- worker 池 ----
         // 抢占路径不走信号量，活跃数只能自己数（见 LiveActiveChunks 的注释）。
@@ -1677,8 +1977,22 @@ public class DownloadService : AbstractDownloadService
         var workers = new Task[workerCount];
         for (int w = 0; w < workerCount; w++)
         {
+            int workerIndex = w;   // 闭包捕获：不能直接捕获循环变量
             workers[w] = Task.Run(async () =>
             {
+                // 慢启动：轮到自己之前先等一等（每 30ms 看一次闸门，成本可忽略）。
+                // ⚠️ 这个等待必须**在 while 之外**：worker 只等一次，
+                //    一旦放行就一直跑到下载结束，不会被反复挡回去。
+                while (slowGate != null && !slowGate.IsAllowed(workerIndex))
+                {
+                    if (cancel.IsCancellationRequested)
+                        return;
+                    try { await Task.Delay(30, cancel).ConfigureAwait(false); }
+                    catch (OperationCanceledException) { return; }
+                }
+
+                bool tookFirstChunk = false;
+
                 while (!cancel.IsCancellationRequested)
                 {
                     Chunk chunk;
@@ -1701,6 +2015,13 @@ public class DownloadService : AbstractDownloadService
                         continue;
                     }
 
+                    // 慢启动判据：这个 worker 第一次领到活 = 它已经真的跑起来了
+                    //（见 slowStartDriver 的注释）。只记第一次，不按领活次数累加。
+                    if (!tookFirstChunk)
+                    {
+                        tookFirstChunk = true;
+                        Interlocked.Increment(ref slowStartStarted);
+                    }
                     active[chunk.Id] = chunk;
                     Interlocked.Increment(ref _liveWorkers);
                     try
@@ -1740,6 +2061,13 @@ public class DownloadService : AbstractDownloadService
         {
             stopMonitor.Cancel();
             try { await monitor.ConfigureAwait(false); } catch { }
+            if (slowStartDriver != null)
+            {
+                // 先放开全部车道再等它退出：驱动器退出时也会 OpenAll，
+                // 这里提前放开可以避免「驱动器正卡在 Task.Delay 里、worker 还在等闸门」的窗口。
+                slowGate.OpenAll();
+                try { await slowStartDriver.ConfigureAwait(false); } catch { }
+            }
             stopMonitor.Dispose();
         }
 
@@ -1780,7 +2108,7 @@ public class DownloadService : AbstractDownloadService
         Interlocked.Exchange(ref _priorityLength, length);
         // 先写长度再写起点：读取方先看到起点非 -1 时，长度一定已经是新的。
         Interlocked.Exchange(ref _priorityStart, start);
-        _logger?.LogDebug($"Priority window set: [{start}, {start + length})");
+        _logger?.LogDebug($"已设置播放优先区间：[{start}, {start + length})");
     }
 
     /// <summary>当前播放窗口；未设置时返回 false。</summary>
@@ -1811,19 +2139,58 @@ public class DownloadService : AbstractDownloadService
     /// </summary>
     private void ApplyPriorityWindowToQueue(ChunkQueue queue)
     {
+        bool sequential = Package?.Storage != null
+            && Options.StorageMode == Storage.StorageMode.Sequential;
+
         long start, end;
-        if (!TryGetPriorityWindow(out start, out end))
+        bool hasWindow = TryGetPriorityWindow(out start, out end);
+
+        if (sequential)
+        {
+            // 🚨🚨 2026-11-05：顺序写「边下边看」+ 消除队头卡住的关键改动。
+            //
+            // 顺序写只在「连续前缀」上推进 _flushed：第 0 片那块数据没到，
+            // 后面 200 条快连接下的数据全堆在内存窗口里，窗口一满就全员背压，
+            // 表现为「下了几兆突然卡着不动」。这是队头阻塞（head-of-line blocking），
+            // 不是磁盘慢，也不是网络慢。
+            //
+            // 解法：不管用户有没有点「边下边看」，都默认把**紧接已刷盘偏移的头部区间**
+            // 提到队列最前，让 _flushed 持续推进。这样：
+            //   ① 窗口不再被后面的乱序数据塞满 → 卡住消失；
+            //   ② 文件开头几 MB 很快落盘，配合已有的 moov 优先（EnsureLength +
+            //      WriteBypass 把索引写到文件尾）→ 顺序写也能边下边看；
+            //   ③ 用户显式拖了播放进度时，仍优先尊重用户窗口（取两者较靠前的起点）。
+            //
+            // ⚠️ 这段**只在 Sequential 分支**执行，共写（Shared）走下面的原逻辑，
+            //    一个字节都不改，避免影响已经实测达标的主路径。
+            long flushed = Package.Storage.Length;
+            long headEnd = Math.Min(Package.TotalFileSize,
+                flushed + SequentialHeadPriorityBytes) - 1;
+
+            if (hasWindow)
+            {
+                // 用户在播放器里拖了进度：以用户窗口为准，但起点不能退到
+                // 已刷盘之前（那部分已经写完了，提了也没用）。
+                if (start < flushed) start = flushed;
+                if (start > end) return;
+            }
+            else
+            {
+                start = flushed;
+                end = headEnd;
+            }
+
+            if (end < start) return;
+            int moved = queue.Reorder(start, end);
+            if (moved > 0)
+                _logger?.LogDebug($"顺序写头部优先 [{start}, {end}]：提前 {moved} 片");
+            return;
+        }
+
+        if (!hasWindow)
             return;
 
-        if (Package?.Storage != null && Options.StorageMode == Storage.StorageMode.Sequential)
-        {
-            long flushed = Package.Storage.Length;
-            if (start < flushed)
-                start = flushed;
-            if (start > end)
-                return;   // 窗口整个落在未刷盘前缀里，这轮没得提
-        }
-        else if (Package != null && Package.TotalFileSize > 0 && start >= Package.TotalFileSize)
+        if (Package != null && Package.TotalFileSize > 0 && start >= Package.TotalFileSize)
         {
             // 随机写 + 预分配：文件长度已经是总长，调用方按「当前文件长度」算出来的
             // 起点会落在文件末尾之外，窗口里一个待下载分片都没有。
@@ -1831,9 +2198,9 @@ public class DownloadService : AbstractDownloadService
             start = 0;
         }
 
-        int moved = queue.Reorder(start, end);
-        if (moved > 0)
-            _logger?.LogDebug($"Priority window [{start}, {end}]: promoted {moved} chunk(s)");
+        int movedShared = queue.Reorder(start, end);
+        if (movedShared > 0)
+            _logger?.LogDebug($"播放优先区间 [{start}, {end}]：提前 {movedShared} 片");
     }
 
     /// <summary>是否所有分片都已下完。</summary>
@@ -1850,6 +2217,20 @@ public class DownloadService : AbstractDownloadService
     /// <summary>
     /// 一轮抢占：找出进度明显落后的分片，把它剩余区间从中间切开，
     /// 后半段作为新分片塞回队列。
+    ///
+    /// <para>
+    /// 🚨🚨 2026-11-05 新增「整体限速判定」（老引擎 <c>SegmentedDownloader</c> 有，融合引擎迁移时丢了）：
+    /// 如果**大多数连接同时低于阈值**，那不是个别慢节点，而是服务端按 IP 的整体配额低。
+    /// 此时换连接、切片、重连全都无用 —— 每条新连接照样被压到同一个速度，
+    /// 反而把带宽全烧在 TCP 握手和 HTTP 请求头上，吞吐还会周期性塌陷。
+    /// </para>
+    ///
+    /// <para>
+    /// 实测依据（用户 2026-11-05 日志）：19 分钟里 151 次慢重连，
+    /// 实测速度全部聚集在 10221~12269 B/s（分片 24=10239、52=10234、78=10226），
+    /// 而并发 256 × 10KB/s ≈ 2.5 MB/s —— 正好是阿里/UC 的单 IP 配额。
+    /// 这种「全员整齐地慢」正是整体限速的典型特征，不是单连接问题。
+    /// </para>
     /// </summary>
     private void PreemptRound(ConcurrentDictionary<string, Chunk> active,
         ChunkQueue queue,
@@ -1894,9 +2275,73 @@ public class DownloadService : AbstractDownloadService
         if (avg <= 0)
             return;
 
-        double threshold = avg * Options.PreemptSpeedRatio;
+        // 3) 慢的判定阈值 = max(绝对下限, 平均单连接速度 × 比例)。
+        //
+        // 🚨 绝对下限 PreemptMinBps(12KB/s) 不是可选项：
+        //    收尾阶段只剩一两路时，平均值就是那一两路自己，
+        //    「低于平均值 × 0.34」永远成立不了，谁都不会被判慢 —— 阈值会自己塌掉。
+        //    加了下限后，收尾那几路只要真的慢就会被抓出来换掉。
+        double threshold = Math.Max((double)Options.PreemptMinBps, avg * Options.PreemptSpeedRatio);
 
-        // 3) 挑最慢的、且剩余量够大的分片，切一半
+        // 4) 整体限速判定（规则见 OverallSlowGate，收尾期自动豁免）
+        int slowCount = 0;
+        foreach (var s in speeds)
+        {
+            if (s.Value < threshold) slowCount++;
+        }
+
+        bool newlyLogged;
+        bool skip = _overallSlow.Evaluate(
+            speeds.Count, slowCount, active.Count,
+            Options.PreemptEndgameInflight, Options.OverallSlowMinSamples,
+            Options.OverallSlowHoldMs,
+            DateTime.UtcNow.Ticks / TimeSpan.TicksPerMillisecond,
+            out newlyLogged);
+
+        if (newlyLogged)
+        {
+            // 🚨 2026-11-07：把「目标并发 / 当前在飞」一起打出来（纯日志、零行为）。
+            //   用户问「为什么吃不满线程」时，这条能直接区分两种情况：
+            //     · 在飞数 ≈ 目标并发，但全员慢 → 服务端按 IP 的整体配额低（正常）；
+            //     · 在飞数远小于目标并发 → 客户端侧没开出来，需另查慢启动 / 闸门。
+            int targetConn = Options.ParallelCount;
+            if (targetConn < 1) targetConn = 1;
+            _logger?.LogInfo(string.Format(
+                "整体限速中：{0}/{1} 路都低于阈值 {2}/s（本轮实测平均单连接 {3}/s）；"
+                + "目标并发 {4} 路，当前在飞 {5} 路。这属于服务端整体配额低、"
+                + "而非个别慢节点，已暂停抢占以免无谓重连。",
+                slowCount, speeds.Count, FmtBps(threshold), FmtBps(avg),
+                targetConn, active.Count));
+        }
+
+        if (skip)
+        {
+            // ⚠️ 抑制期间也要同步标记：ChunkDownloader 会据此**丢掉绝对下限**，
+            //    只按「相对同伴」判慢 —— 否则 16KB/s 的绝对线会把全员判慢，
+            //    整体限速判定白做（实测日志里 151 次重连全是这么来的）。
+            Options.OverallSlowActive = _overallSlow.Active;
+            return;
+        }
+
+        if (_overallSlow.ClearLogged())
+        {
+            _logger?.LogInfo("整体限速已缓解，恢复慢连接抢占。");
+        }
+        Options.OverallSlowActive = false;
+
+        // 3) 挑最慢的分片：**先请求换连接，换不动才切片**
+        //
+        // 🚨🚨 2026-11-05 改（对齐 refs/YunX 的 preemptSlowChunks）：
+        //   原来这里只有「切片」一种手段 —— 把慢片的剩余区间切一半给别的 worker。
+        //   但切片的本质是**把同一条慢连接的工作分给更多连接**，
+        //   如果慢的根因是「这条 TCP 连接落在慢节点上」，切片治不了本；
+        //   而 YunX 的做法是**直接换一条新连接** —— 换连接本身就可能落到快节点。
+        //
+        //   两者都保留，但顺序反过来：
+        //     ① 先请求换连接（成本：一次 TCP+TLS 握手，200~600ms）；
+        //     ② 该分片已经换过太多次（SpeedReconnectCount 达上限）→ 才切片。
+        //   这样「个别连接掉队」能真正换到快节点，
+        //   而「这条 Range 区间本身被限速」时才退化成分片摊薄。
         speeds.Sort((a, b) => a.Value.CompareTo(b.Value));
         int done = 0;
         foreach (var s in speeds)
@@ -1910,7 +2355,18 @@ public class DownloadService : AbstractDownloadService
             if (!active.TryGetValue(s.Key, out c))
                 continue;
 
-            // 慢片抢占：用保守下限（512KB），避免正常下载期把片切太碎。
+            // ① 优先换连接：只要这个分片还有换连接额度，就交给它自己重连。
+            //    worker 在 ReadStream 的每轮循环开头会读到这个标志并主动断流。
+            //    注意用 >= 而不是 >：达到上限后不再请求，避免无意义的重连风暴。
+            if (c.SpeedReconnectCount < Options.MaxSpeedReconnects)
+            {
+                c.RequestExternalReconnect();
+                done++;
+                continue;
+            }
+
+            // ② 换连接额度用完 → 退化为切片（把剩余区间摊给别的 worker）。
+            //    用保守下限（512KB），避免正常下载期把片切太碎。
             if (!TrySplitChunk(c, queue, cancel, Options.PreemptMinBytes))
                 continue;
             done++;
@@ -1972,6 +2428,50 @@ public class DownloadService : AbstractDownloadService
     /// 所以用 <c>_tailRefillGate</c> 让它们串行，避免同一片被两个线程各切一刀。
     /// </para>
     /// </summary>
+    /// <summary>
+    /// 2026-11-05 新增：按**实测速度**算末段补片的目标块大小（对齐 refs/YunX 的 ElasticAllocator）。
+    ///
+    /// <para>
+    /// 公式：<c>块 ≈ 单连接 5 秒能下完的量</c>，夹在 [TailRefillMinBytes, 4MB]。
+    /// </para>
+    ///
+    /// <para>
+    /// 为什么是 5 秒：YunX 的 <c>TARGET_SECONDS = 5</c> 来自实测 —— 块太小则 Range 请求数爆炸
+    /// （每次都要重新建连 + 握手，200~600ms），块太大则「最后一点数据」全压在少数几块上，
+    /// 空闲 worker 只能干等。5 秒是「一块刚好能被一条连接连续下完、又不至于拖住收尾」的平衡点。
+    /// </para>
+    ///
+    /// <para>
+    /// 返回 0 表示「速度还测不出来」，调用方应保持原值 —— 绝不能把块算成 0 或极小值。
+    /// </para>
+    /// </summary>
+    private long AdaptiveTailSliceBytes()
+    {
+        try
+        {
+            // 用「动态慢阈值 / 比例」反推平均单连接速度：
+            // DynamicSlowThresholdBps = avgPerConn × DynamicSlowRatio，所以 avgPerConn = 阈值 / 比例。
+            // 这样不用再单独维护一份速度采样，避免两处口径漂移。
+            double ratio = Options.DynamicSlowRatio;
+            long floor = Options.DynamicSlowThresholdBps;
+            if (ratio <= 0 || floor <= 0)
+                return 0;
+
+            double avgPerConn = floor / ratio;
+            if (avgPerConn <= 0)
+                return 0;
+
+            // 🚨 2026-11-06：把算式抽到 Core 的纯计算类，算式与常量逐字不变，
+            //    目的只是让它能被自检直接断言边界（可验证化），行为零变化。
+            return GeZi.Core.Support.DownloadSizing.AdaptiveSliceBytes(avgPerConn, Options.TailRefillMinBytes);
+        }
+        catch
+        {
+            return 0;
+        }
+    }
+
+
     private bool TryRefillTail(ChunkQueue queue, ConcurrentDictionary<string, Chunk> active)
     {
         // 队列里已经有活（别的 worker 刚塞进去的），不必再切。
@@ -2109,6 +2609,32 @@ public class DownloadService : AbstractDownloadService
             if (sliceBytes < Options.TailRefillMinBytes)
                 sliceBytes = Options.TailRefillMinBytes;
 
+            // 🚨🚨 2026-11-05 新增：**速度自适应块大小**（对齐 refs/YunX 的 ElasticAllocator）。
+            //
+            // YunX 的做法（ElasticAllocator.baseBlockSize）：
+            //     块 ≈ 单 worker 下载 TARGET_SECONDS(5秒) 的量，夹在 [256KB, 4MB]
+            // 它这么设计是因为：
+            //   · 快连接 → 用大块，省掉每次 Range 请求的建连/握手开销；
+            //   · 慢连接 → 用小块，让「最后一点数据」能摊到所有连接上并行冲完。
+            //
+            // 我们原来是纯静态的：sliceBytes = maxRemain / slicesWanted，
+            // 只跟「剩余量 / 缺口数」有关，**完全不看速度**。
+            // 后果：链路很慢时（单连接 10KB/s），切出来的 256KB 块要磨 26 秒；
+            //       而链路很快时，256KB 又太小 —— 每切一块都要重新建连，纯亏。
+            //
+            // 现在按实测速度校准：块 = 单连接 5 秒能下完的量。
+            //   · 阈值仍由 TailRefillMinBytes 兜底（不低于 256KB，避免碎片化）；
+            //   · 上限 4MB（对齐 YunX 的 MAX_ELASTIC_BLOCK，过大块会降低动态性）。
+            // ⚠️ 速度取不到（0）时保持原值 —— 不能让「还没测出速度」把块算成 0。
+            long adaptive = AdaptiveTailSliceBytes();
+            if (adaptive > 0)
+            {
+                // 自适应值只做**上限收窄**，不放宽：
+                // 放宽会让「剩余量很少」时切出超过剩余量的块（切不动）。
+                if (adaptive < sliceBytes)
+                    sliceBytes = Math.Max(adaptive, Options.TailRefillMinBytes);
+            }
+
             // 按「份」切：每次从最大的片子里切出 sliceBytes 一段塞回队列。
             // 与二分不同，这里切出的尾巴大小固定 = sliceBytes，
             // 所以 2 个 768KB 的片可以被切成 6 份 256KB，真正填满空闲 worker。
@@ -2198,7 +2724,7 @@ public class DownloadService : AbstractDownloadService
 
             queue.Enqueue(tail);
             _splitChunks[tail.Id] = tail;
-            _logger?.LogDebug($"TailRefill: chunk {chunk.Id} tail {tail.Id} ({tailBytes} bytes, {tailStart}-{curEnd})");
+            _logger?.LogDebug($"末段补片：分片 {chunk.Id} 切出尾部 {tail.Id}（{tailBytes} 字节，{tailStart}-{curEnd}）");
         }
         return true;
     }
@@ -2248,7 +2774,7 @@ public class DownloadService : AbstractDownloadService
 
             queue.Enqueue(tail);
             _splitChunks[tail.Id] = tail;
-            _logger?.LogDebug($"Preempted chunk {chunk.Id}: split at {mid}, tail={tail.Id} ({curEnd - mid} bytes)");
+            _logger?.LogDebug($"抢占分片 {chunk.Id}：在 {mid} 处切开，尾部 {tail.Id}（{curEnd - mid} 字节）");
         }
         return true;
     }

@@ -54,25 +54,29 @@ public sealed class ActionLogger : ILogger
         }
     }
 
-    public void LogDebug(string message) => Write("debug", message);
+    // 🚨 2026-11-06：级别标签全部改中文（用户要求「日志全中文」）。
+    // ⚠️ 改标签必须同步 MainWindow.Log.cs 的 StartsWith("[调试]") 判据 ——
+    //    那条用来把调试级日志排除出简化视图，标签一变判据失效，
+    //    每秒上万条 debug 会灌进界面把正常日志挤光（AGENTS.md 二十一节）。
+    public void LogDebug(string message) => Write("调试", message);
 
-    public void LogInfo(string message) => Write("info", message);
+    public void LogInfo(string message) => Write("信息", message);
 
-    public void LogWarning(string message) => Write("warn", message);
+    public void LogWarning(string message) => Write("警告", message);
 
-    public void LogError(string message) => Write("error", message);
+    public void LogError(string message) => Write("错误", message);
 
     public void LogError(Exception exception, string message) =>
-        Write("error", message + (exception == null ? "" : " :: " + exception.Message));
+        Write("错误", message + (exception == null ? "" : "，" + exception.Message));
 
-    public void LogCritical(string message) => Write("critical", message);
+    public void LogCritical(string message) => Write("严重", message);
 
     public void LogCritical(Exception exception, string message) =>
-        Write("critical", message + (exception == null ? "" : " :: " + exception.Message));
+        Write("严重", message + (exception == null ? "" : "，" + exception.Message));
 
     public string Formatter(string logType, string message, Exception exception)
     {
-        return "[" + logType + "] " + message + (exception == null ? "" : " :: " + exception.Message);
+        return "[" + logType + "] " + message + (exception == null ? "" : "，" + exception.Message);
     }
 
     public Task FlushAsync()

@@ -38,6 +38,18 @@ namespace GeZi
         /// 用一句「正在检查文件…」把岛先亮出来，别让用户以为点了没反应。
         /// </summary>
         private string _islandStage;
+        /// <summary>
+        /// 当前阶段文案是不是「一次性通知」（显示 2 秒后自动收起）。
+        /// <para>
+        /// 🚨 为什么必须区分：<see cref="SetIslandStage"/> 的文案是为「正在检查文件…」
+        /// 这类**持续阶段**设计的 —— <see cref="RestartIslandTimer"/> 的 Tick 里
+        /// 「有阶段文案就不关，继续重启计时」，所以它压根不会自己消失，只能由调用方
+        /// 再调一次 <c>SetIslandStage(null)</c> 清掉。
+        /// 如果「有任务正在进行，暂停任务后再改设置」这种一次性提示也走那条路，
+        /// 岛会**永久挂在屏幕上**，用户点了叉才能关。
+        /// </para>
+        /// </summary>
+        private bool _islandStageTransient;
         /// <summary>灵动岛上「已入队 N」的真实目标值（每批 30 个跳一次）。</summary>
         private int _islandTargetQueued;
         /// <summary>灵动岛上实际显示的数字（由 <see cref="PumpIslandQueued"/> 平滑推向目标值）。</summary>
@@ -128,8 +140,9 @@ namespace GeZi
             {
                 StopIslandTimer();
                 if (_islandHover) return;   // 鼠标还在上面 → 不关
-                // 有阶段文案（正在检查文件…）→ 别收起来，继续显示
-                if (!string.IsNullOrEmpty(_islandStage))
+                // 一次性通知（如「有任务正在进行…」）会被这里收起，符合预期。
+                // 有**持续**阶段文案（正在检查文件…）→ 别收起来，继续显示
+                if (!string.IsNullOrEmpty(_islandStage) && !_islandStageTransient)
                 {
                     RestartIslandTimer();
                     return;
@@ -182,6 +195,7 @@ namespace GeZi
             if (verb != null) _islandChainVerb = verb;
             // 进入取链阶段 → 撤掉「正在检查文件…」这类阶段文案
             _islandStage = null;
+            _islandStageTransient = false;
             if (Island == null) return;
             try
             {
@@ -207,6 +221,7 @@ namespace GeZi
             _islandChainTotal = 0;
             _islandChainVerb = "正在准备直链";
             _islandStage = null;
+            _islandStageTransient = false;
             _islandTargetQueued = 0;
             StopIslandPump();
             try
@@ -271,6 +286,31 @@ namespace GeZi
         private void SetIslandStage(string stage)
         {
             _islandStage = string.IsNullOrEmpty(stage) ? null : stage;
+            // 走这条老入口的一律是持续阶段（「正在检查文件…」），保持原来的常驻语义。
+            _islandStageTransient = false;
+            if (Island == null) return;
+            try
+            {
+                UpdateIslandText();
+                EnsureIslandVisible();
+                RestartIslandTimer();
+            }
+            catch { }
+        }
+
+
+        /// <summary>
+        /// 弹一条**一次性**轻提示（2 秒后自动淡出，鼠标悬停时暂停）。
+        /// <para>
+        /// 与 <see cref="SetIslandStage"/> 的区别只有一个：到点会被
+        /// <see cref="RestartIslandTimer"/> 的 Tick 正常收起，不需要调用方再清一次。
+        /// 用于「有任务正在进行，暂停任务后再改设置」这类不需要用户持续关注的提示。
+        /// </para>
+        /// </summary>
+        private void ShowIslandNotice(string notice)
+        {
+            _islandStage = string.IsNullOrEmpty(notice) ? null : notice;
+            _islandStageTransient = _islandStage != null;
             if (Island == null) return;
             try
             {
@@ -369,6 +409,7 @@ namespace GeZi
                 _islandChainQueued = 0;
                 _islandChainTotal = 0;
                 _islandStage = null;
+                _islandStageTransient = false;
                 _islandTargetQueued = 0;
                 _islandShownQueued = 0;
                 StopIslandPump();

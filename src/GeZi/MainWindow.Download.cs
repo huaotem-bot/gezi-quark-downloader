@@ -97,7 +97,13 @@ namespace GeZi
                 // 2026-10-26 用户诉求「日志与下载记录持久化，退出重进不丢」：
                 // 下载记录/解析历史本来就在 GeZi.state.json 里，只有运行日志是纯内存的。
                 // 这里同步追加到 GeZi.log（内部加锁，失败静默 —— 写日志绝不能影响下载）。
-                LogStore.Append((detail ? "[详] " : "") + text);
+                //
+                // 🚨 2026-11-07 落盘前**必须脱敏**：GeZi.log 是用户会主动发给别人求助的文件，
+                //    而直链查询串里带 CDN 签名（阿里 Signature=、夸克/UC sign=、迅雷 auth_key=），
+                //    拿到的人在有效期内能直接下别人的文件。
+                //    ⚠️ 只有落盘这一路脱敏，**界面 LogBox 保留原文** ——
+                //       界面上看到的确切内容用户自己负责，而文件会离开这台机器。
+                LogStore.Append(LogRedactor.Redact((detail ? "[详] " : "") + text));
             }
             catch { }
         }
@@ -867,15 +873,119 @@ namespace GeZi
         /// <summary>
         /// 按**文件大小比例**把总连接预算分给这一批任务，返回与入参等长的线程数数组。
         /// </summary>
-        private int[] AllocateThreads(IList<long> sizes)
+        /// <param name="kind">
+        /// 这一批任务来自哪家网盘。**必须传任务的真实来源**（分享看 <c>_panKind</c>、
+        /// 我的网盘看 <c>_activeKind</c>，统一走 <see cref="DownloadPanKind"/>），
+        /// 不能传「当前登录账号」。
+        /// </param>
+        /// <remarks>
+        /// 🚨🚨 2026-11-07 修「设置了各网盘线程却完全没生效（只有调低有效）」。
+        /// <para>
+        /// 旧实现这里是 <c>Math.Min(_settings.Threads, MaxRealConcurrency)</c> —— 只读**全局**
+        /// <c>_settings.Threads</c>，一个字都没读 per-pan 配置。而 per-pan 值只在调度器里
+        /// 被当作 <c>MaxParallelCount</c>（上限）夹一次：
+        /// </para>
+        /// <code>
+        /// DownloadScheduler: int want = job.Threads &gt; 0 ? job.Threads : DownloadThreads;
+        ///                    if (job.MaxParallelCount &gt; 0 &amp;&amp; want &gt; job.MaxParallelCount) want = job.MaxParallelCount;
+        /// </code>
+        /// <para>
+        /// ⇒ per-pan 值**只能往下压、永远不能往上抬**。迅雷设 16 有效（256 被压下来）、
+        /// 阿里设 64 有效，但夸克设 512 **完全无效** —— 基数早就被锁成 256，而 512 这个上限
+        /// 比 256 大，夹了个寂寞。用户看到的就是「怎么改都只像作用于全局」。
+        /// </para>
+        /// <para>
+        /// 现在基数直接取 <see cref="ThreadsFor"/>(kind)：per-pan 覆盖值优先、否则走
+        /// <see cref="DefaultThreadsFor"/>（全局 <c>Threads</c> 回落基准），最后叠服务端硬上限。
+        /// 这样调高调低都真正生效，而迅雷 16 / 阿里 64 / UC 256 这些实测阈值仍然保留。
+        /// </para>
+        /// </remarks>
+        private int[] AllocateThreads(IList<long> sizes, PanKind kind)
         {
+            return AllocateThreads(sizes, kind, 0);
+        }
+
+
+        /// <summary>
+        /// 同上，但可以指定这一桶能用的**连接预算**（只给混合网盘分桶用）。
+        /// </summary>
+        /// <param name="budget">
+        /// 0 = 用全局 <see cref="DownloadConnBudget"/>（512）—— 单网盘批走这条，行为与改造前逐字一致。
+        /// &gt;0 = 分桶后分摊到的预算，会同时压 <c>perFileCap</c>，
+        /// 否则「n == 1 直接给满 cap」会让四个桶各拿满额、绕过 512 总预算。
+        /// </param>
+        private int[] AllocateThreads(IList<long> sizes, PanKind kind, int budget)
+        {
+            int cap = ThreadsFor(kind);
+            // 分桶预算比该网盘的上限还小时，单文件也不能拿超过预算的连接数。
+            if (budget > 0 && budget < cap) cap = budget;
             return GeZi.DownloadEngine.ThreadAllocator.Allocate(
                 sizes,
-                Math.Min(_settings.Threads, GeZi.DownloadEngine.Planning.ChunkSplitter.MaxRealConcurrency),
-                DownloadConnBudget,
+                cap,
+                budget > 0 ? budget : DownloadConnBudget,
                 MinThreadsPerFile,
                 // 同时最多跑几个 —— 预算约束的是"同时并发"的量级，不是整批的账面总和
                 Math.Max(1, _settings.ConcurrentTasks));
+        }
+
+
+        /// <summary>
+        /// 给**混合网盘**的一批任务分配线程数（只给续传用，新建任务时整批同源）。
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// <see cref="ThreadAllocator.Allocate"/> 的 <c>perFileCap</c> 是**单值**参数，
+        /// 而「继续下载」一批里可能同时有夸克、UC、阿里、迅雷的记录。
+        /// 整批用一个 cap 必然错：按夸克算会撑爆迅雷（503 洪泛），
+        /// 按迅雷算会把夸克饿到 16 路。
+        /// </para>
+        /// <para>
+        /// ⇒ 按网盘**分桶**各算一次 <c>Allocate</c>，再按原始下标合并回去。
+        /// 每家的份额仍在自己的桶内按大小比例分，语义与单网盘批次完全一致。
+        /// </para>
+        /// </remarks>
+        private int[] AllocateThreadsByPan(IList<long> sizes, IList<PanKind> kinds)
+        {
+            int n = sizes == null ? 0 : sizes.Count;
+            var result = new int[n];
+            if (n == 0) return result;
+            if (kinds == null || kinds.Count < n)
+            {
+                // 兜底：来源未知时按夸克（不限流）算，与升级前行为一致。
+                return AllocateThreads(sizes, PanKind.Quark);
+            }
+
+            // 按网盘分桶（保持原始下标）
+            var buckets = new Dictionary<PanKind, List<int>>();
+            for (int i = 0; i < n; i++)
+            {
+                PanKind k = kinds[i];
+                List<int> idx;
+                if (!buckets.TryGetValue(k, out idx))
+                {
+                    idx = new List<int>();
+                    buckets[k] = idx;
+                }
+                idx.Add(i);
+            }
+
+            foreach (var kv in buckets)
+            {
+                var sub = new List<long>(kv.Value.Count);
+                foreach (int i in kv.Value) sub.Add(sizes[i]);
+                // 🚨 每个桶必须分到**自己的那份预算**，不能都拿满 512。
+                //   ThreadAllocator.Allocate 在 n == 1 时会**直接返回 cap**
+                //   （源码注释：「单文件：保持原行为」），四个桶各 1 个文件 =
+                //   夸克 512 + UC 256 + 阿里 64 + 迅雷 16 = 848 路，直接绕过 512 总预算。
+                //   ⇒ 分摊规则抽成 Core 纯函数 DownloadSizing.PanBucketBudget（便于自检钉死），
+                //      单桶（= 单网盘批）时占比 1、得满额，与改造前**逐字等价**。
+                int bucketBudget = DownloadSizing.PanBucketBudget(
+                    DownloadConnBudget, kv.Value.Count, n, MinThreadsPerFile);
+                var subAlloc = AllocateThreads(sub, kv.Key, bucketBudget);
+                for (int j = 0; j < kv.Value.Count && j < subAlloc.Length; j++)
+                    result[kv.Value[j]] = subAlloc[j];
+            }
+            return result;
         }
 
 
@@ -914,7 +1024,7 @@ namespace GeZi
             //   ② 迅雷拿夸克的 0（不限流）→ 256 并发 → 大面积 503 失败；
             //   ③ StoredKind 错 → 清理时用夸克客户端去删阿里/迅雷的转存副本 → 永久残留。
             PanKind srcKind = DownloadPanKind;
-            var alloc = AllocateThreads(items.Select(i => i.Size).ToList());
+            var alloc = AllocateThreads(items.Select(i => i.Size).ToList(), srcKind);
             var jobs = new List<DownloadJob>();
             // 同一批里可能出现同名文件（不同目录各有一个 video.mp4）。只看磁盘时
             // 两个 dest 都还没落盘 → 会算出同一个路径 → 第二个任务被调度器当成重复丢掉。
@@ -941,12 +1051,20 @@ namespace GeZi
                     // 按「本任务来自哪家网盘」限流，不能按 _activeKind（当前登录账号）：
                     // 登录夸克却解析 UC 分享时 _activeKind 仍是 Quark，UC 的 256 上限会失效；
                     // 迅雷更危险 —— 32 条就大面积 503，按夸克（不限）跑必然失败。
-                    MaxParallelCount = MaxParallelFor(srcKind),
-                    Threads = i < alloc.Length ? alloc[i] : _settings.Threads,
+                    MaxParallelCount = ThreadsFor(srcKind),
+                    // 慢连接的绝对下限也按网盘分档（见 SlowFloorFor 的注释）：
+                    // 阿里/UC 单 IP 总配额低，用夸克的 16KB/s 会把全部连接误判成慢。
+                    SlowFloorBps = SlowFloorFor(srcKind),
+                    // 2026-11-05：下载数据面按网盘补齐客户端头，与取链身份一致。
+                    PanKind = (int)srcKind,
+                    ExtraHeaders = DownloadExtraHeadersFor(srcKind),
+                    Threads = i < alloc.Length ? alloc[i] : ThreadsFor(srcKind),
                     Md5 = item.Md5, Sha1 = item.Sha1, Sha256 = item.Sha256,
                     // 写入方式统一取设置页的全局值（原来靠下载区的「边下边播」勾选框，
                     // 与设置页重复且容易误导，已移除该勾选框）。
                     PartsRoot = string.IsNullOrWhiteSpace(_settings.PartsRoot) ? null : _settings.PartsRoot,
+                    // 2026-11-04：源文件指纹，写进 .geziresume，防止「同一路径换成另一个源文件」时串进度。
+                    SourceKey = BuildSourceKey(item.Size, (int)srcKind, item.Fid),
                     LinkRefresher = ct => RefreshLinkAsync(item, ct),
                     // 免转存（从分享直接取链）→ 续传取不到新链，失败文案别承诺"可续传"
                     ResumeCannotRefresh = item.FromShare,
@@ -1587,7 +1705,8 @@ namespace GeZi
                 return jobs;
 
             // 连接数按文件大小比例分配（大文件多分、小文件少分，各不低于下限）
-            var alloc = AllocateThreads(items.Select(x => x.Size).ToList());
+            // 🚨 2026-11-07：必须带上 srcKind —— 否则 per-pan 线程设置对新建任务完全无效。
+            var alloc = AllocateThreads(items.Select(x => x.Size).ToList(), srcKind);
             LogAllocation(alloc);
 
             for (int i = 0; i < items.Count; i++)
@@ -1608,12 +1727,20 @@ namespace GeZi
                     Origin = OwnDownloadOrigin,
                     UseOpenSsl = OwnDownloadUseOpenSsl,
                     // 同上：按任务实际来源网盘限流，不按当前登录账号。
-                    MaxParallelCount = MaxParallelFor(srcKind),
-                    Threads = i < alloc.Length ? alloc[i] : _settings.Threads,
+                    MaxParallelCount = ThreadsFor(srcKind),
+                    // 慢连接的绝对下限也按网盘分档（见 SlowFloorFor 的注释）：
+                    // 阿里/UC 单 IP 总配额低，用夸克的 16KB/s 会把全部连接误判成慢。
+                    SlowFloorBps = SlowFloorFor(srcKind),
+                    // 2026-11-05：下载数据面按网盘补齐客户端头，与取链身份一致。
+                    PanKind = (int)srcKind,
+                    ExtraHeaders = DownloadExtraHeadersFor(srcKind),
+                    Threads = i < alloc.Length ? alloc[i] : ThreadsFor(srcKind),
                     Md5 = item.Md5, Sha1 = item.Sha1, Sha256 = item.Sha256,
                     // 分片根目录：留空 = 与目标同级（默认）。非空则分片集中存放，
                     // 下载目录不被 .qparts 污染，也支持分片跨盘（如放 SSD）。
                     PartsRoot = string.IsNullOrWhiteSpace(_settings.PartsRoot) ? null : _settings.PartsRoot,
+                    // 2026-11-04：源文件指纹（同上一处，见 BuildSourceKey 的注释）。
+                    SourceKey = BuildSourceKey(item.Size, (int)srcKind, item.Fid),
                     // 直链带时效签名，长任务下到一半会过期。
                     // 给下载器一个"重新取链"的口子，它就能自动换链续传，而不是整个任务失败。
                     LinkRefresher = ct2 => RefreshLinkAsync(item, ct2),
@@ -2304,37 +2431,92 @@ namespace GeZi
         /// 这是"自动回收磁盘"与"无限期保留断点"之间必须做的取舍。
         /// </para>
         /// </summary>
+        /// <summary>
+        /// 浅层探测：这些目录里**有没有任何** `.qparts` 目录（不递归深扫）。
+        /// <para>
+        /// 🚨 2026-11-04：融合引擎不产生 .qparts，所以绝大多数用户这里返回 false，
+        /// 直接跳过 <c>SearchOption.AllDirectories</c> 的深度递归 ——
+        /// 那是启动时一次很重的 I/O（下载目录可能几十万文件）。
+        /// </para>
+        /// <para>只探测「根目录下」和「第一层子目录」，足够判断有没有历史遗留。</para>
+        /// </summary>
+        private static bool HasAnyQparts(IList<string> roots, string outDir)
+        {
+            var dirs = new List<string>();
+            if (roots != null) dirs.AddRange(roots);
+            if (!string.IsNullOrWhiteSpace(outDir)) dirs.Add(outDir);
+
+            foreach (string raw in dirs)
+            {
+                string dir = (raw ?? "").Trim();
+                if (dir.Length == 0) continue;
+                try
+                {
+                    if (!Directory.Exists(dir)) continue;
+                    // ① 根本身就是 .qparts
+                    if (dir.EndsWith(".qparts", StringComparison.OrdinalIgnoreCase))
+                        return true;
+                    // ② 根下一层有没有 .qparts
+                    if (Directory.GetDirectories(dir, "*.qparts").Length > 0)
+                        return true;
+                }
+                catch
+                {
+                    // 权限/占用 —— 当作没有，下次再试
+                }
+            }
+            return false;
+        }
+
+
         private void StartPartsSweep()
         {
             var roots = AllPartsRoots();
             string outDir = EffectiveOutDir();
-            string rootSnapshot = roots.Count == 0 ? "（无自定义根目录）" : string.Join("；", roots);
 
+            // 🚨🚨 2026-11-04 修「用户：我的下载器根本没有分片这个东西，为什么还清扫分片」：
+            //
+            //   事实核查：**用户说得对**。
+            //   · PartsSweeper 只扫 `*.qparts` 目录（PartsSweeper.cs:130）；
+            //   · 而 `.qparts` 是**老引擎**（Legacy/SegmentedDownloader）的产物；
+            //   · 老引擎已于 2026-10-29 物理删除，融合引擎是唯一引擎；
+            //   · 融合引擎的续传记录只有**一个文件** `{目标}.geziresume`，
+            //     **不产生任何 .qparts 目录**。
+            //   ⇒ 这个清扫对当前版本来说是**纯死代码**：每次启动白扫一遍磁盘
+            //      （SearchOption.AllDirectories 递归！），然后什么都不删，
+            //      还打一条让用户困惑的日志。
+            //
+            //   保留的唯一价值：老用户旧目录里可能还有历史 .qparts 残留。
+            //   但那属于「一次性迁移」场景，不该每次启动都跑。
+            //   ⇒ 现在改成：**只在真的扫到东西时才扫**（先做一次浅层探测），
+            //      且日志只在**真删了东西**时才打。
             var t = new Thread(() =>
             {
                 try
                 {
+                    // 🚨 先做**浅层探测**：融合引擎不产生 .qparts，
+                    //   绝大多数用户的目录里一个都没有 → 直接跳过深度递归扫描。
+                    //   （SearchOption.AllDirectories 在大下载目录下是很重的 I/O）
+                    if (!HasAnyQparts(roots, outDir))
+                        return;
+
                     var r = PartsSweeper.Sweep(roots, PartsSweeper.DefaultMaxAgeDays);
                     // 默认 {dest}.qparts 不在 roots 里，单独扫一遍下载目录。
                     var d = PartsSweeper.SweepDefault(
                         string.IsNullOrWhiteSpace(outDir) ? null : new[] { outDir },
                         PartsSweeper.DefaultMaxAgeDays);
-                    if (r.Scanned == 0 && d.Scanned == 0)
-                        return;   // 没有任何分片文件，不必打扰用户
 
                     int removed = r.Removed + d.Removed;
                     int skipped = r.Skipped + d.Skipped;
                     long freed = r.FreedBytes + d.FreedBytes;
+                    // 🚨 只有**真的删了东西**才打日志。
+                    //   原来启动时无条件打一条「已启动分片自动清扫…」，
+                    //   而当前版本根本没有分片 → 纯噪音，用户会困惑「哪来的分片」。
                     if (removed > 0)
                     {
                         LogFromWorker(string.Format(
-                            "分片清扫：回收了 {0} 个过期分片（{1}），跳过 {2} 个被占用/受保护的目录。",
+                            "已清理历史遗留分片 {0} 个（{1}），跳过 {2} 个被占用的。",
                             removed, Util.FormatSize(freed), skipped));
-                    }
-                    else if (skipped > 0)
-                    {
-                        LogFromWorker(string.Format(
-                            "分片清扫：{0} 个过期分片因被占用或仍在租约保护期而跳过。", skipped));
                     }
 
                     // 上次“软删除”时文件仍被占用而留下的 *.gezi-deleting：
@@ -2359,7 +2541,10 @@ namespace GeZi
             };
             t.Start();
 
-            LogDetail("已启动分片自动清扫（阈值 " + PartsSweeper.DefaultMaxAgeDays + " 天）。扫描范围: " + rootSnapshot);
+            // 🚨 2026-11-04：这条日志**删掉了**。
+            //   它原来每次启动都无条件打「已启动分片自动清扫（阈值 1 天）。扫描范围: …」，
+            //   而融合引擎根本不产生分片 → 用户看到只会困惑「我的下载器哪来的分片」。
+            //   现在只在**真的清理了历史遗留**时才由后台线程打一条（见上面的 removed > 0）。
         }
 
 
@@ -2441,15 +2626,15 @@ namespace GeZi
         }
 
 
-        private int SelectedThreads()
-        {
-            int i = ThreadsBox.SelectedIndex;
-            if (i < 0 || i >= ThreadPresets.Length) i = 1;   // 默认 32
-            int v = ThreadPresets[i];
-            // 兜底：即使档位表被改错，也不会把超过核心上限的值交给下载器。
-            if (v > ConcurrencyCap) v = ConcurrencyCap;
-            return v;
-        }
+        // 🚨 2026-11-07：`SelectedThreads()` **已彻底删除**。
+        //   历史：它原来读设置页的「单文件并发连接数」下拉（ThreadsBox）。
+        //   后来全局下拉被删掉、只留「四家网盘分别设置」，它退化成"读 _settings.Threads"，
+        //   而 _settings.Threads 当时还只能往下压 per-pan 值 —— 于是出现
+        //   「夸克设 512 完全无效、界面始终显示 256」这个用户报的 bug。
+        //   现在并发数的**唯一来源**是 `ThreadsFor(PanKind)`（见 MainWindow.Log.cs），
+        //   它直接读 per-pan 覆盖值、再按各家服务端上限夹取。
+        //   `_settings.Threads` 字段仍保留（老 GeZi.config.xml 存过，删了反序列化会炸），
+        //   语义降级为「四家都没单独配置时的回落基准」，只被 `DefaultThreadsFor` 读。
 
 
         /// <summary>

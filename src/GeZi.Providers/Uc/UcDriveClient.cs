@@ -69,6 +69,24 @@ namespace GeZi.Providers.Uc
             get { return PanKind.Uc; }
         }
 
+        /// <summary>
+        /// 取链接口的查询参数：以 UC 客户端档案为底（pr / fr / sys / ve），
+        /// 叠加本入口的变体。与 <c>QuarkClient.DownloadQuery</c> 同源，
+        /// 保证「取链时声明的客户端身份」与下载时带的头完全一致。
+        /// </summary>
+        private static Dictionary<string, string> UcDownloadQuery(params string[] extra)
+        {
+            var d = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var kv in PanClientProfile.For(PanKind.Uc).Query)
+                d[kv.Key] = kv.Value;
+            for (int i = 0; i + 1 < extra.Length; i += 2)
+            {
+                if (extra[i + 1] == null) d.Remove(extra[i]);
+                else d[extra[i]] = extra[i + 1];
+            }
+            return d;
+        }
+
         public string DisplayName
         {
             get { return "UC网盘"; }
@@ -238,9 +256,9 @@ namespace GeZi.Providers.Uc
 
             var attempts = new[]
             {
-                new Dictionary<string, string> { { "entry", "ft" }, { "fr", "pc" }, { "pr", UcConstants.Pr } },
-                new Dictionary<string, string> { { "pr", UcConstants.Pr }, { "fr", "pc" }, { "uc_param_str", "" } },
-                new Dictionary<string, string> { { "pr", UcConstants.Pr }, { "fr", "android" }, { "uc_param_str", "" } },
+                UcDownloadQuery("entry", "ft"),
+                UcDownloadQuery("uc_param_str", ""),
+                UcDownloadQuery("uc_param_str", "", "fr", "android"),
             };
 
             List<DownloadLink> best = null;
@@ -291,7 +309,7 @@ namespace GeZi.Providers.Uc
 
             var res = await RequestAsync(HttpMethod.Post,
                 _apiBase + "/1/clouddrive/file/download",
-                new Dictionary<string, string> { { "pr", UcConstants.Pr }, { "fr", "pc" }, { "uc_param_str", "" } },
+                UcDownloadQuery("uc_param_str", ""),
                 new { fids = fids }, cancel).ConfigureAwait(false);
 
             Check(res, "获取直链");

@@ -325,45 +325,57 @@ namespace GeZi.Providers.Quark
 
         /// <summary>
         /// 按 <see cref="Kind"/> 注入对应网盘的请求头。
-        /// 夸克走原实现（行为完全不变）；UC 换 UA / Referer / Origin / same-origin 判据。
+        ///
+        /// <para>
+        /// 🚨 2026-11-05：改成从 <see cref="PanClientProfile"/> 统一取值 ——
+        /// 下载数据面（FusionDownloader）也从同一份档案取头，
+        /// 这样「取链时的客户端身份」与「实际下载时的身份」逐字一致。
+        /// 原来这里额外写了 Sec-Fetch-* / Accept-Language，下载层却一个都没有。
+        /// </para>
         /// </summary>
         public void ApplyHeadersForKind(HttpRequestMessage req, string url, bool api = true)
         {
-            if (Kind != PanKind.Uc)
-            {
-                ApplyHeaders(req, url, api);
-                return;
-            }
-
-            Set(req, "User-Agent", UcUa(url, api));
+            var p = PanClientProfile.For(Kind);
+            bool webDomain = IsUcWebDomain(url);
+            Set(req, "User-Agent", UcUa(url, api, p));
             Set(req, "Accept", api
                 ? "application/json, text/plain, */*"
                 : "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8");
-            Set(req, "Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8");
-            Set(req, "Referer", UcConstants.Referer);
-            Set(req, "Origin", UcConstants.Origin);
-            Set(req, "Cache-Control", "no-cache");
-            Set(req, "Pragma", "no-cache");
+            Set(req, "Referer", p.Referer);
+            Set(req, "Origin", p.Origin);
             Set(req, "DNT", "1");
             Set(req, "Connection", "keep-alive");
 
-            bool sameOrigin = url != null && url.IndexOf("uc.cn", StringComparison.OrdinalIgnoreCase) >= 0;
-            Set(req, "Sec-Fetch-Dest", api ? "empty" : "document");
-            Set(req, "Sec-Fetch-Mode", api ? "cors" : "navigate");
-            Set(req, "Sec-Fetch-Site", sameOrigin ? "same-origin" : "same-site");
+            foreach (var kv in p.CommonHeaders)
+            {
+                if (p.ForbiddenHeaders.Contains(kv.Key)) continue;
+                // 网页域账号接口用普通 Chrome UA，不能同时带 UC 客户端的 Sec-Ch-Ua：
+                // 两者对不上反而更像伪造。这条接口按 UA 分身份（见 WebUa 的注释）。
+                if (webDomain && kv.Key.Equals("Sec-Ch-Ua", StringComparison.OrdinalIgnoreCase)) continue;
+                Set(req, kv.Key, kv.Value);
+            }
+        }
+
+        /// <summary>UC 的网页域（drive.uc.cn）账号接口，走的是另一套网页身份。</summary>
+        private static bool IsUcWebDomain(string url)
+        {
+            return url != null && url.IndexOf("drive.uc.cn", StringComparison.OrdinalIgnoreCase) >= 0;
         }
 
         /// <summary>
         /// UC 的两个域认不同的 UA：<c>pc-api.uc.cn</c> 只认客户端 UA，
         /// <c>drive.uc.cn</c> 的 <c>account/info</c> 只认网页 UA（见 <see cref="UcConstants.WebUa"/>）。
+        /// 其余网盘一律用档案里的 UA，保证取链与下载同版本。
         /// </summary>
-        private static string UcUa(string url, bool api)
+        private string UcUa(string url, bool api, PanClientProfile.Profile p)
         {
+            if (Kind != PanKind.Uc)
+                return api ? p.ApiUserAgent : p.DownloadUserAgent;
             if (!api)
-                return UcConstants.DlUa;
+                return p.DownloadUserAgent;
             if (url != null && url.IndexOf("drive.uc.cn", StringComparison.OrdinalIgnoreCase) >= 0)
-                return UcConstants.WebUa;
-            return UcConstants.ApiUa;
+                return UcConstants.WebUa;   // 网页域的 account/info 按 UA 分身份，单独处理
+            return p.ApiUserAgent;
         }
 
         /// <summary>
@@ -376,41 +388,23 @@ namespace GeZi.Providers.Quark
         /// </remarks>
         public Dictionary<string, string> BuildHeadersForKind(string url, bool api = true)
         {
-            var d = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-            if (Kind == PanKind.Uc)
+            var p = PanClientProfile.For(Kind);
+            var d = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
             {
-                d["User-Agent"] = UcUa(url, api);
-                d["Accept"] = api
+                { "User-Agent", UcUa(url, api, p) },
+                { "Accept", api
                     ? "application/json, text/plain, */*"
-                    : "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8";
-                d["Accept-Language"] = "zh-CN,zh;q=0.9,en;q=0.8";
-                d["Referer"] = UcConstants.Referer;
-                d["Origin"] = UcConstants.Origin;
-                bool sameOrigin = url != null && url.IndexOf("uc.cn", StringComparison.OrdinalIgnoreCase) >= 0;
-                d["Sec-Fetch-Dest"] = api ? "empty" : "document";
-                d["Sec-Fetch-Mode"] = api ? "cors" : "navigate";
-                d["Sec-Fetch-Site"] = sameOrigin ? "same-origin" : "same-site";
-            }
-            else
-            {
-                d["User-Agent"] = api ? QuarkConstants.ApiUa : QuarkConstants.DlUa;
-                d["Accept"] = api
-                    ? "application/json, text/plain, */*"
-                    : "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8";
-                d["Accept-Language"] = "zh-CN,zh;q=0.9,en;q=0.8";
-                d["Referer"] = QuarkConstants.Referer;
-                d["Origin"] = "https://pan.quark.cn";
-                bool sameOrigin = url != null && url.IndexOf("pan.quark.cn", StringComparison.OrdinalIgnoreCase) >= 0;
-                d["Sec-Fetch-Dest"] = api ? "empty" : "document";
-                d["Sec-Fetch-Mode"] = api ? "cors" : "navigate";
-                d["Sec-Fetch-Site"] = sameOrigin ? "same-origin" : "same-site";
-            }
-            d["Cache-Control"] = "no-cache";
-            d["Pragma"] = "no-cache";
-            d["DNT"] = "1";
-            // 每条请求各开一条 TLS 连接，必须显式 close，否则对端会等 Content-Length。
-            d["Connection"] = "close";
-            d["Cookie"] = BuildCookieString();
+                    : "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8" },
+                { "Referer", p.Referer },
+                { "Origin", p.Origin },
+                { "DNT", "1" },
+                // 每条请求各开一条 TLS 连接，必须显式 close，否则对端会等 Content-Length。
+                { "Connection", "close" },
+                { "Cookie", BuildCookieString() },
+            };
+            PanClientProfile.ApplyHeaders(Kind, d);
+            // 网页域账号接口用普通 Chrome UA，不能同时带 UC 客户端的 Sec-Ch-Ua。
+            if (IsUcWebDomain(url)) d.Remove("Sec-Ch-Ua");
             return d;
         }
 

@@ -1571,6 +1571,10 @@ namespace GeZi
             UpdateAccountCard(nick, 0, 0, kind);
             LogDetail("已切换到 " + PanUrlParser.DisplayNameOf(kind) + "（复用已登录会话，未重新登录）");
 
+            // 记住「最后浏览的是这一家」—— 下次启动直接打开它。
+            // ⚠️ 只写 LastBrowsePanKind，不碰上面注释里那四项「登录身份」，方案A 不受影响。
+            RememberBrowsePan(kind);
+
             if (!ShareMode)
             {
                 ResetNav();
@@ -1578,6 +1582,35 @@ namespace GeZi
             }
             await RefreshCapacityAsync();
             return true;
+        }
+
+
+        /// <summary>
+        /// 记住「最后浏览的是哪家网盘」，下次启动先打开它。
+        /// <para>
+        /// 🚨 这个字段与「登录身份」（<c>ActivePanKind</c> / <c>Who</c> / <c>AvatarUrl</c> /
+        /// <c>CurrentAccountKey</c>）**是两件事**，别合并 —— 合并会重演 2026-10-25
+        /// 用户骂过的问题（「在我的网盘里选不同的网盘为什么会影响我的账号登录」）。
+        /// </para>
+        /// <para>
+        /// 为什么要单独记：原来启动只读 <c>ActivePanKind</c>，而它只在**登录成功**时写入，
+        /// 在「我的网盘」里点页签走的是浏览快路径、压根不落盘 —— 于是
+        /// 「切回夸克 → 重启又跳迅雷」会一直复现，记忆从来没被更新过。
+        /// </para>
+        /// </summary>
+        private void RememberBrowsePan(PanKind kind)
+        {
+            try
+            {
+                if (_settings.LastBrowsePanKind == (int)kind) return;
+                _settings.LastBrowsePanKind = (int)kind;
+                SettingsStore.Save(_settings);
+            }
+            catch (Exception ex)
+            {
+                // 记不住只是下次启动回退到旧逻辑，不该影响当前浏览
+                LogDetail("记住上次浏览的网盘失败：" + ex.Message);
+            }
         }
 
 
@@ -1735,6 +1768,9 @@ namespace GeZi
                     else
                         _settings.Cookie = client.CookieStr;
                     _settings.ActivePanKind = (int)kind;
+                    // 登录成功也顺带记一次「最后浏览」—— 刚登录完用户就在看这一家，
+                    // 重启后留在这里最符合预期。
+                    _settings.LastBrowsePanKind = (int)kind;
                     _settings.Who = nick;
                     // 记住昵称：切走之后再切回来走的是"复用缓存实例"的快速路径，
                     // 那时不会再调 ValidateAsync，昵称只能从这里取。
@@ -2115,6 +2151,8 @@ namespace GeZi
                 else
                     _settings.XunleiPanToken = credential;
                 _settings.ActivePanKind = (int)kind;
+                // 登录成功也顺带记一次「最后浏览」（同上：刚登录完就在看这一家）。
+                _settings.LastBrowsePanKind = (int)kind;
                 _settings.Who = string.IsNullOrEmpty(nick) ? PanUrlParser.DisplayNameOf(kind) : nick;
                 // 记住昵称：切走后再切回来走快速路径，不会再 ValidateAsync。
                 _panNick[kind] = _settings.Who;

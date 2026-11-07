@@ -105,8 +105,28 @@ public class DownloadConfiguration : ICloneable, INotifyPropertyChanged
     private long _lowestSpeedLimit = 16L * 1024;
     private int _lowestSpeedLimitSeconds = 10;
     private int _maxSpeedReconnects = 3;
+    /// <summary>2026-11-05：动态慢阈值（由 DownloadService 监控任务实时更新），见 <see cref="DynamicSlowThresholdBps"/>。</summary>
+    private long _dynamicSlowThresholdBps;
+    /// <summary>2026-11-05：相对慢阈值比例，默认 0.5（对齐 refs/YunX 的 avgPerConn/2）。</summary>
+    private double _dynamicSlowRatio = 0.5;
+    /// <summary>2026-11-05：整体限速判定的最少样本数，默认 4。</summary>
+    private int _overallSlowMinSamples = 4;
+    /// <summary>2026-11-05：整体限速抑制窗口的粘滞时长，默认 30 秒。</summary>
+    private int _overallSlowHoldMs = 30_000;
+    /// <summary>2026-11-05：整体限速进行中的实时标记（由 DownloadService 监控任务维护）。</summary>
+    private volatile bool _overallSlowActive;
+    /// <summary>2026-11-05：慢分片判定的绝对下限，默认 12 KB/s。</summary>
+    private long _preemptMinBps = 12L * 1024;
+    /// <summary>2026-11-05：收尾期在飞连接数门槛，默认 3。</summary>
+    private int _preemptEndgameInflight = 3;
+    /// <summary>2026-11-05：慢启动开关，默认开启。</summary>
+    private bool _enableSlowStart = true;
+    /// <summary>2026-11-05：慢启动硬超时，默认 10 秒。</summary>
+    private int _slowStartMaxWaitMs = 10_000;
     private IResumeStore _resumeStore;
     private IContentValidator _validator;
+    /// <summary>2026-11-04：源文件指纹，见 <see cref="SourceKey"/>。</summary>
+    private string _sourceKey;
     private int _resumeSaveIntervalMs = 3000;
     private string _expectedSha256;
     private string _expectedSha1;
@@ -338,6 +358,197 @@ public class DownloadConfiguration : ICloneable, INotifyPropertyChanged
     }
 
     /// <summary>
+    /// 2026-11-05 新增：**动态慢阈值**（字节/秒）。0 = 未设置，退回只用 <see cref="LowestSpeedLimit"/>。
+    ///
+    /// <para>
+    /// 🚨🚨 为什么需要它（用户实测日志：分片 24 只有 10239 B/s 被判慢并重连）：
+    /// <see cref="LowestSpeedLimit"/> 是**绝对值** 16384 B/s。当用户把并发开到 256/512 时，
+    /// 带宽被摊到每条连接上必然远低于 16KB/s —— 于是**几乎所有连接同时被判慢**，
+    /// 触发重连风暴，吞吐周期性塌陷。实测 512 路时单连接约 10KB/s，正好落在阈值下方。
+    /// </para>
+    ///
+    /// <para>
+    /// 对照 refs/YunX 的 <c>preemptSlowChunks</c>：它用的是**相对阈值** ——
+    /// <c>floor = max(PREEMPT_MIN_BPS, 本任务平均单连接速度 / 2)</c>。
+    /// 用相对值是为了适配不同 CDN 的限速档次：夸克单连接几十 KB/s、迅雷更低，
+    /// 固定阈值必然有一边不合适；而绝对下限兜住「收尾只剩一两路、平均值被自己拉低」的退化情况。
+    /// </para>
+    ///
+    /// <para>
+    /// 本属性由 <c>DownloadService</c> 的监控任务按「实时平均单连接速度 × 比例」周期性更新；
+    /// 真正生效的阈值 = <c>max(LowestSpeedLimit, 本属性)</c> —— **绝对下限永远兜底**。
+    /// </para>
+    /// </summary>
+    public long DynamicSlowThresholdBps
+    {
+        get { return _dynamicSlowThresholdBps; }
+        set
+        {
+            long v = value < 0 ? 0 : value;
+            if (v == _dynamicSlowThresholdBps) return;   // 避免每轮都触发 PropertyChanged
+            _dynamicSlowThresholdBps = v;
+            OnPropertyChanged();
+        }
+    }
+
+    /// <summary>
+    /// 相对慢阈值的比例：某条连接速度低于「本任务平均单连接速度 × 本值」即视为慢。
+    /// 默认 0.5（对齐 refs/YunX 的 <c>avgPerConn / 2</c>）。
+    /// <para>0 或负数表示关闭相对判定，只按 <see cref="LowestSpeedLimit"/> 绝对值判。</para>
+    /// </summary>
+    public double DynamicSlowRatio
+    {
+        get { return _dynamicSlowRatio; }
+        set
+        {
+            _dynamicSlowRatio = value <= 0 ? 0 : value;
+            OnPropertyChanged();
+        }
+    }
+
+    /// <summary>
+    /// 慢分片判定的**绝对下限**（字节/秒）。默认 12288（12 KB/s）。
+    ///
+    /// <para>
+    /// 判定阈值 = <c>max(本值, 平均单连接速度 × PreemptSpeedRatio)</c>。
+    /// 没有这个下限时，收尾阶段只剩一两路、平均值被自己拉低，
+    /// 阈值会跟着塌到几百 B/s，谁都判不出慢（对齐 refs/YunX 的 PREEMPT_MIN_BPS）。
+    /// </para>
+    /// </summary>
+    public long PreemptMinBps
+    {
+        get { return _preemptMinBps; }
+        set
+        {
+            _preemptMinBps = value < 0 ? 0 : value;
+            OnPropertyChanged();
+        }
+    }
+
+    /// <summary>
+    /// 「收尾期」的在飞连接数门槛。默认 3。
+    ///
+    /// <para>
+    /// 在飞连接数 ≤ 本值时：
+    /// ① 样本太少，整体限速判定在统计上不可靠（1/1 路慢就判成「全都慢」）；
+    /// ② 收尾恰恰最需要抢占 —— 只剩几路在磨，那几路的速度就是用户看到的总速度，
+    ///    换节点远比干等便宜。
+    /// 所以收尾期**跳过整体限速判定**，永远允许抢占。
+    /// </para>
+    /// </summary>
+    public int PreemptEndgameInflight
+    {
+        get { return _preemptEndgameInflight; }
+        set
+        {
+            _preemptEndgameInflight = value < 1 ? 1 : value;
+            OnPropertyChanged();
+        }
+    }
+
+    /// <summary>
+    /// 是否启用「慢启动」（分批放行 worker）。默认 <c>true</c>。
+    ///
+    /// <para>
+    /// 关闭后所有 worker 一次性开跑 —— 这是融合引擎原来的行为。
+    /// 只有在排查「启动瞬间大面积失败」时才需要关掉做对照。
+    /// </para>
+    /// </summary>
+    public bool EnableSlowStart
+    {
+        get { return _enableSlowStart; }
+        set
+        {
+            _enableSlowStart = value;
+            OnPropertyChanged();
+        }
+    }
+
+    /// <summary>
+    /// 慢启动的**硬超时**（毫秒）。默认 10000。
+    ///
+    /// <para>
+    /// 慢启动正常情况下 1~2 秒就能爬满（1→2→4→16→256 只需 4 步）。
+    /// 但如果 CDN 卡住不返回数据，「等一批就放下一批」会永远等下去 ——
+    /// 超时后强制放开全部并发，保证下载不会被慢启动自己卡死。
+    /// </para>
+    /// </summary>
+    public int SlowStartMaxWaitMs
+    {
+        get { return _slowStartMaxWaitMs; }
+        set
+        {
+            _slowStartMaxWaitMs = value < 500 ? 500 : value;
+            OnPropertyChanged();
+        }
+    }
+
+    /// <summary>
+    /// 「整体限速」判定的最少有效样本数。默认 4。
+    ///
+    /// <para>
+    /// 少于这个数就只做抢占、不做整体限速判定 —— 样本太少时统计不可靠：
+    /// 启动爬坡期只有两三路刚建连，瞬时速度天然接近 0，
+    /// 一算就是「100% 的连接都慢」，把正常启动误判成整体限速。
+    /// </para>
+    /// </summary>
+    public int OverallSlowMinSamples
+    {
+        get { return _overallSlowMinSamples; }
+        set
+        {
+            _overallSlowMinSamples = value < 2 ? 2 : value;
+            OnPropertyChanged();
+        }
+    }
+
+    /// <summary>
+    /// 判定「整体限速」后，暂停慢连接抢占的**粘滞时长**（毫秒）。默认 30000。
+    ///
+    /// <para>
+    /// 🚨🚨 为什么必须是粘滞而不是每轮重算：慢连接是**抖动**的 ——
+    /// 这一轮 8/10 路慢、下一轮 3/10 路慢，每轮独立判定就会在
+    /// 「判定整体限速 → 恢复抢占 → 又判定整体限速」之间反复横跳，
+    /// 每次都掐掉一批连接重连，白白消耗握手和带宽。
+    /// 30 秒窗口保证判定一旦成立就稳定压住 30 秒，期间只观察不动手。
+    /// </para>
+    /// </summary>
+    public int OverallSlowHoldMs
+    {
+        get { return _overallSlowHoldMs; }
+        set
+        {
+            _overallSlowHoldMs = value < 1000 ? 1000 : value;
+            OnPropertyChanged();
+        }
+    }
+
+    /// <summary>
+    /// 「整体限速」是否正在进行中（由 <c>DownloadService</c> 的监控任务维护，只读）。
+    ///
+    /// <para>
+    /// 语义：**大多数连接同时低于阈值**，说明是服务端按 IP 的整体配额低，
+    /// 而不是个别慢节点 —— 此时换连接、切片、重连全都无用，只会白烧握手。
+    /// </para>
+    ///
+    /// <para>
+    /// ⚠️ 这个标记**只用于抑制慢连接抢占**，绝不能外泄给别的机制。
+    /// 老引擎（<c>SegmentedDownloader</c>）里曾用它去拦「假死抢救」，
+    /// 结果造成自我锁定：整体限速 → 不抢救 → 速度归零 → 更确信整体限速。
+    /// </para>
+    /// </summary>
+    public bool OverallSlowActive
+    {
+        get { return _overallSlowActive; }
+        set
+        {
+            if (value == _overallSlowActive) return;
+            _overallSlowActive = value;
+            OnPropertyChanged();
+        }
+    }
+
+    /// <summary>
     /// 分片规划器。默认 <see cref="StaticChunkPlanner"/>（bezzad 原生静态等分，向后兼容）。
     /// 网盘下载应设为 <see cref="AdaptiveChunkPlanner"/> —— 它给出「每连接 8 片」的
     /// 窃取深度，实测比静态等分快 2.7 倍（1.00 → 2.69 MB/s）。
@@ -379,6 +590,25 @@ public class DownloadConfiguration : ICloneable, INotifyPropertyChanged
         set
         {
             _validator = value;
+            OnPropertyChanged();
+        }
+    }
+
+    /// <summary>
+    /// 2026-11-04：源文件指纹（<c>总长|网盘序号|源文件Fid</c>），写入 .geziresume。
+    /// <para>
+    /// 用于识别「同一目标路径换成了另一个源文件」。
+    /// 为什么不靠 ETag：那是服务端给的，CDN 不回、探测超时、走 OpenSSL 桥时都会缺失，
+    /// 缺失时旧版会**静默跳过校验**，于是同名不同文件的续传状态被无条件采信。
+    /// </para>
+    /// <para>空串 = 不做这项校验（老调用方 / 自检），退回只按 TotalBytes 判。</para>
+    /// </summary>
+    public string SourceKey
+    {
+        get { return _sourceKey ?? ""; }
+        set
+        {
+            _sourceKey = value;
             OnPropertyChanged();
         }
     }
@@ -452,6 +682,26 @@ public class DownloadConfiguration : ICloneable, INotifyPropertyChanged
             OnPropertyChanged();
         }
     }
+
+    /// <summary>
+    /// 🚨 2026-11-07：由上层注入的「这个任务是不是被用户删除并移除了」查询。
+    /// 默认 null = 普通取消/暂停，行为逐字不变。取消分支读到 true 时不再写续传快照，
+    /// 并主动清一次，根治「删除线程删 .geziresume / 取消流程又写回来」的竞态。
+    /// </summary>
+    public Func<bool> IsDeleteRemoveRequested { get; set; }
+
+    /// <summary>
+    /// 🚨🚨 2026-11-07 修「顺序写文件第一秒就是 45MB、只能看前面一小段」：
+    /// 顺序写的最大价值是「文件从 0 连续增长、长度＝真实进度」，
+    /// 但 moov 优先会调 EnsureLength(总长) 把文件预分配成满尺寸（全零 + 尾部索引），
+    /// 于是长度恒等于总长、播放器按索引读到中间全是零 → 只能播开头一小段。
+    /// 二者在顺序写下互斥。
+    ///
+    /// <para>默认 <b>false</b>：顺序写跳过 moov 优先，文件真·连续增长；
+    /// 代价是「下完才能播」（诚实降级，不再两头骗）。共写不受此项影响，照旧做 moov 优先。</para>
+    /// <para>置 true = 用户明确接受「顺序写也要预分配」的取舍，此时行为回到改造前。</para>
+    /// </summary>
+    public bool MoovFirstOnSequential { get; set; }
 
     /// <summary>
     /// 续传状态的保存间隔（毫秒）。默认 3000。

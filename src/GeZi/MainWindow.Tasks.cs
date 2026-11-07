@@ -83,7 +83,8 @@ namespace GeZi
                     return;
                 }
 
-                double speed = active.Sum(t => t.Speed);
+                // 🚨 2026-11-07：日志里的总速度也用平滑值，避免 0↔10MB/s 跳动误导判断。
+                double speed = active.Sum(t => t.DisplaySpeed);
                 long done = active.Sum(t => t.Done);
                 long total = active.Sum(t => t.Total);
                 int running = active.Count(t => t.State == JobState.Downloading);
@@ -432,6 +433,8 @@ namespace GeZi
                 {
                     item.Percent = u.Progress.Percent;
                     item.Speed = u.Progress.Speed;
+                    // 🚨 2026-11-07：界面显示用 5 秒平滑速度；调度水位仍读 item.Speed。
+                    item.DisplaySpeed = u.Progress.DisplaySpeed;
                     item.Done = u.Progress.Done;
                     item.Total = u.Progress.Total;
                 }
@@ -676,16 +679,44 @@ namespace GeZi
                 if (t.State == JobState.Downloading || t.State == JobState.Queued
                     || t.State == JobState.Paused || t.State == JobState.Cancelling)
                 {
+                    // 🚨 必须先置位再取消：取消信号会立刻触发下载器的收尾分支，
+                    //    晚了就赶不上「不写续传快照」的判定（2026-11-07 实测竞态）。
+                    t.Job.DeleteAndRemoveRequested = true;
                     try { t.Job.CancelJob(); } catch { }
                     t.State = JobState.Cancelling;
                 }
 
                 string dest = t.Job.Dest;
                 string name = t.Name;
+                // 🚨 2026-11-07：先标记为「已删除」，必须在 SyncPending 之前。
+                //   否则第 ③ 段会把磁盘上那条旧记录捡回来，徽章与 .geziresume 都会复活。
+                MarkPendingDeleted(dest);
                 RemoveTaskRow(t);
                 // 后台删除：文件可能较大，且被占用时要等待句柄释放，不能卡 UI 线程。
-                _ = Task.Run(() => DeleteLocalFiles(dest, name));
+                // 删除结束后再回 UI 线程同步一次 pending —— 取消流程可能在这段时间内
+                // 按旧状态又写了一次记录，最后一刀把它清掉。
+                _ = Task.Run(() =>
+                {
+                    DeleteLocalFiles(dest, name);
+                    try
+                    {
+                        Dispatcher.BeginInvoke(new Action(() =>
+                        {
+                            try { SyncPending(); RefreshPendingEntry(); } catch { }
+                        }));
+                    }
+                    catch { }
+                });
             }
+
+            // 🚨 2026-11-06：删完必须**立刻**同步一次 pending 记录。
+            //   RemoveTaskRow 只改内存集合，不写盘；原来依赖 OnJobUpdate 的
+            //   状态变化帧去触发 SyncPending，但行已被移除 → FindTaskRow 返回 null
+            //   → 那一帧直接 return，GeZi.state.json 里这条记录永远留着，
+            //   重启后续传框里又冒出一条「已删除的任务」（用户实测）。
+            //   这里显式同步一次，把这条从磁盘记录里摘掉。
+            SyncPending();
+            RefreshPendingEntry();
         }
 
 
@@ -868,10 +899,21 @@ namespace GeZi
             catch { }
         }
 
-        private void RefreshPanStateList()
+        /// <summary>「当前状态」卡上次重建时刻（用于切换/刷新合并，避免频繁读盘重建）。</summary>
+        private DateTime _panStateLastRebuildUtc = DateTime.MinValue;
+
+        private void RefreshPanStateList(bool force = false)
         {
             if (PanStateList == null)
                 return;
+            // 🚨 2026-11-07：切换功能页时 SyncLoginPageState / 续期回调 / 主题刷新
+            //   会在几百毫秒内连调好几次本方法；每次都逐家读账号档案 XML + DPAPI 解密
+            //   + 重建 4 行控件 = 主线程同步 IO，用户感知「一切换就卡顿」。
+            //   300ms 内的重复调用直接合并掉；force=true 用于登录态确定的关键帧。
+            DateTime nowUtc = DateTime.UtcNow;
+            if (!force && (nowUtc - _panStateLastRebuildUtc) < TimeSpan.FromMilliseconds(300))
+                return;
+            _panStateLastRebuildUtc = nowUtc;
             try
             {
                 PanStateList.Children.Clear();
@@ -1139,6 +1181,12 @@ namespace GeZi
 
             if (ok)
             {
+                // 记住「最后浏览的是这一家」：下次启动直接打开它。
+                // 🚨 只写 LastBrowsePanKind，**绝不碰** ActivePanKind / Who / AvatarUrl /
+                //    CurrentAccountKey —— 那四项是「登录身份」，只由登录动作写入
+                //    （2026-10-25 用户拍板的方案A，见 ActivateCachedPanAsync 里的注释）。
+                RememberBrowsePan(kind);
+
                 // 🚨 2026-10-25 修「有些网盘不显示容量」：容量原来只在启动验证阶段查一次，
                 //    那次网络抖一下（迅雷还会静默吞异常）就永远空白，直到重启。
                 //    切到这家时发现没有容量就补查一次。
@@ -1399,7 +1447,8 @@ namespace GeZi
             }
             else
             {
-                sub = "还没有登录，点右侧「切换」或上方卡片登录";
+                // 四行结构恒定，右侧「切换」按钮现在永远都在，文案与之一致。
+                sub = "还没有登录，点上方卡片登录或右侧「切换」";
             }
             if (!string.IsNullOrEmpty(sub))
             {
@@ -1416,9 +1465,11 @@ namespace GeZi
             Grid.SetColumn(texts, 1);
             grid.Children.Add(texts);
 
-            // 每行都给「切换」：点开是**这一家网盘**的账号列表，可切到同网盘的另一个账号。
-            // 没有任何凭证时才不画（点了也是空列表，徒增困惑）。
-            if (hasCred || live)
+            // 🚨 2026-11-07：四行**永远**画「切换」按钮。
+            //   原来 `if (hasCred || live)` 会让「全未登录」时四行右侧全空 ——
+            //   加上副标题只剩一句灰字，整块看起来像消失了（用户反馈「很丑」）。
+            //   现在四行结构恒定：网盘名 + 状态胶囊 + 副标题 + 切换，任何时候都饱满。
+            //   没有凭证时点「切换」会打开该网盘的账号列表（空列表里有引导，不困惑）。
             {
                 var switchBtn = new Button
                 {
@@ -1889,7 +1940,8 @@ namespace GeZi
                 SetPanStateBusy(false);
             }
             RefreshPanCards();
-            RefreshPanStateList();
+            // 四卡实测结束 = 登录态已确定，这一帧必须重建，不能被节流吞掉。
+            RefreshPanStateList(force: true);
         }
 
 

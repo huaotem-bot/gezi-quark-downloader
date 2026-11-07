@@ -276,6 +276,24 @@ namespace GeZi
         }
 
         /// <summary>
+        /// 🚨 2026-11-07：界面展示用的**平滑速度**（5 秒滑动平均，来自 Bandwidth.SmoothedSpeed）。
+        /// 与 <see cref="Speed"/> 分开：调度水位（补货判定）必须继续用瞬时 Speed，
+        /// 界面显示改读本字段，避免 0 B/s ↔ 10 MB/s 的剧烈跳动（参照 gopeed calcSpeed）。
+        /// 未赋值时回落到 Speed，保证老路径行为等价。
+        /// </summary>
+        private double _displaySpeed = -1;
+        public double DisplaySpeed
+        {
+            get => _displaySpeed < 0 ? _speed : _displaySpeed;
+            set
+            {
+                if (value == _displaySpeed) return;
+                _displaySpeed = value;
+                OnChanged(nameof(SpeedText));
+            }
+        }
+
+        /// <summary>
         /// 用户**已经按过暂停**（界面立刻显示「已暂停 / 0 B/s」），
         /// 但下载器内部还在收尾（worker 要跑完手上那一次读）。核心层在此期间仍会报 Downloading。
         /// </summary>
@@ -421,9 +439,11 @@ namespace GeZi
                 // 真实速度掉到 0.5 B/s 时 (long)_speed == 0，会显示成"0 B/s" ——
                 // 用户看到的就是"速度归零"的假象。真实速度 < 1 B/s 与"还没测出来"
                 // 在观感上没区别，一律显示"…"更诚实。
-                if (_speed < 1.0)
+                // 🚨 2026-11-07：显示用 5 秒平滑值，调度仍用瞬时 Speed。
+                double shown = DisplaySpeed;
+                if (shown < 1.0)
                     return "…";
-                return Util.FormatSize((long)_speed) + "/s";
+                return Util.FormatSize((long)shown) + "/s";
             }
         }
 

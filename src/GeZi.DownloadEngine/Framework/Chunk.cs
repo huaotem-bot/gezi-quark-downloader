@@ -1,4 +1,5 @@
 using System;
+using System.Threading;   // 2026-11-05：外部换连接标志用 Interlocked
 
 namespace GeZi.DownloadEngine.Framework;
 
@@ -69,6 +70,45 @@ public class Chunk
     /// 达到上限后就不再重连，退化为让抢占机制把剩余区间切给别人。
     /// </summary>
     public int SpeedReconnectCount { get; set; }
+
+    /// <summary>
+    /// 2026-11-05 新增：**外部请求换连接**的标志（由 <c>PreemptRound</c> 置位）。
+    ///
+    /// <para>
+    /// 与 <see cref="SpeedReconnectCount"/> 的区别：
+    /// </para>
+    /// <list type="bullet">
+    /// <item><see cref="SpeedReconnectCount"/> 是**分片自己**在 ReadStream 里判断「我太慢了」，
+    ///       属于**自省式**判定；</item>
+    /// <item>本标志是**旁观者**（PreemptRound 的监控线程）比较「这条连接 vs 同伴」后，
+    ///       从外部要求它换连接，属于**相对式**判定。</item>
+    /// </list>
+    ///
+    /// <para>
+    /// 🚨 为什么两者都要（对齐 refs/YunX 的 <c>InflightChunk.preempt</c>）：
+    /// 自省式只能抓「绝对慢」（低于固定阈值），而网盘场景常见的是**相对慢** ——
+    /// 一条连接 60KB/s 在 16 路里不算慢，但在 256 路里就是掉队；
+    /// 反过来，全部连接都只有 10KB/s 时，谁都不该被判慢（那是整体限速，换连接也没用）。
+    /// 只有「同伴快、它慢」才值得换 —— 这正是旁观者视角才能看到的。
+    /// </para>
+    ///
+    /// <para>
+    /// 用 <see cref="Interlocked"/> 读写：监控线程写，worker 线程读。
+    /// </para>
+    /// </summary>
+    private int _externalReconnectRequested;
+
+    /// <summary>外部请求换连接（PreemptRound 调用）。</summary>
+    public void RequestExternalReconnect()
+    {
+        Interlocked.Exchange(ref _externalReconnectRequested, 1);
+    }
+
+    /// <summary>读取并**清除**「外部请求换连接」标志（worker 读取时用，读完即复位）。</summary>
+    public bool TakeExternalReconnectRequest()
+    {
+        return Interlocked.Exchange(ref _externalReconnectRequested, 0) != 0;
+    }
 
     /// <summary>
     /// Length of current chunk. 

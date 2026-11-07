@@ -61,6 +61,44 @@ namespace GeZi
 {
     public partial class MainWindow : Window
     {
+        /// <summary>
+        /// 🚨 2026-11-07：引擎侧重复日志抑制器。
+        /// 取消一次下载会灌进上百条「分片 N 发生致命错误 / 连接被关闭」，
+        /// 每 2 秒一轮的「整体限速中」「下载中…」也会刷屏。
+        /// 做法：按「去掉数字与分片 ID 后的模板」归并，同一模板 8 秒内只出 1 条，
+        /// 其余累计；窗口到期时补一条「（同类 N 条已合并）」。
+        /// ⚠️ 只作用于 LogFromWorker（专业级引擎日志）；日常级 Log() 一条不拦，
+        ///    任务完成/失败/删除结果等核心信息永远完整保留。
+        /// </summary>
+        private readonly Dictionary<string, int> _logDupCount = new Dictionary<string, int>();
+        private readonly Dictionary<string, DateTime> _logDupSince = new Dictionary<string, DateTime>();
+        private readonly object _logDupGate = new object();
+        private static readonly TimeSpan LogDupWindow = TimeSpan.FromSeconds(8);
+
+        /// <summary>把一条日志归一成模板键：抹掉数字、分片 ID、十六进制串，保留中文骨架。</summary>
+        private static string LogDupKey(string msg)
+        {
+            if (string.IsNullOrEmpty(msg)) return "";
+            string s = Regex.Replace(msg, @"[0-9a-fA-F]{6,}", "H");
+            s = Regex.Replace(s, @"\d+", "N");
+            return s.Length > 120 ? s.Substring(0, 120) : s;
+        }
+
+        /// <summary>这些是结果性信息，重复也必须每条都显示，不参与抑制。</summary>
+        private static bool LogDupExempt(string msg)
+        {
+            if (string.IsNullOrEmpty(msg)) return true;
+            return msg.IndexOf("全部完成", StringComparison.Ordinal) >= 0
+                || msg.IndexOf("下载完成", StringComparison.Ordinal) >= 0
+                || msg.IndexOf("已成功删除", StringComparison.Ordinal) >= 0
+                || msg.IndexOf("删除并移除", StringComparison.Ordinal) >= 0
+                || msg.IndexOf("已丢弃", StringComparison.Ordinal) >= 0
+                || msg.IndexOf("任务已全部结束", StringComparison.Ordinal) >= 0
+                || msg.IndexOf("收尾长度核对", StringComparison.Ordinal) >= 0
+                || msg.IndexOf("内容校验", StringComparison.Ordinal) >= 0
+                || msg.IndexOf("哈希复核", StringComparison.Ordinal) >= 0
+                || msg.IndexOf("连接租约", StringComparison.Ordinal) >= 0;
+        }
 
         /// <summary>
         /// 日志**入队**，不直接写控件 —— 由 <see cref="_logFlushTimer"/> 攒批刷入 LogBox。
@@ -75,7 +113,58 @@ namespace GeZi
         /// </summary>
         private void Log(string msg)
         {
+            // 🚨 2026-11-07：只抑制**明确的高频过程类**日常日志（白名单），
+            //    用户操作结果、任务结果一条都不合并。
+            //    反复切网盘时「目录加载完成 / 已切换到 X」能刷几十行，
+            //    反复切主题时「外观已切换」同理 —— 这些不是核心信息。
+            if (IsHighFrequencyUiLog(msg))
+            {
+                string key = "ui:" + LogDupKey(msg);
+                bool emit = false;
+                string summary = null;
+                lock (_logDupGate)
+                {
+                    DateTime now = DateTime.UtcNow;
+                    DateTime since;
+                    if (!_logDupSince.TryGetValue(key, out since))
+                    {
+                        _logDupSince[key] = now;
+                        _logDupCount[key] = 0;
+                        emit = true;
+                    }
+                    else if ((now - since) >= TimeSpan.FromSeconds(15))
+                    {
+                        int n;
+                        _logDupCount.TryGetValue(key, out n);
+                        _logDupSince[key] = now;
+                        _logDupCount[key] = 0;
+                        emit = true;
+                        if (n > 0) summary = "（同类 " + n + " 条已合并）";
+                    }
+                    else
+                    {
+                        int n;
+                        _logDupCount.TryGetValue(key, out n);
+                        _logDupCount[key] = n + 1;
+                    }
+                }
+                if (summary != null) EnqueueLog(summary, detail: false);
+                if (!emit) return;
+            }
             EnqueueLog(msg, detail: false);
+        }
+
+        /// <summary>明确的高频 UI 过程日志（只这几类参与合并，核心结果一律不拦）。</summary>
+        private static bool IsHighFrequencyUiLog(string msg)
+        {
+            if (string.IsNullOrEmpty(msg)) return false;
+            return msg.IndexOf("目录加载完成", StringComparison.Ordinal) >= 0
+                || msg.IndexOf("目录来自缓存", StringComparison.Ordinal) >= 0
+                || msg.IndexOf("已切换到 ", StringComparison.Ordinal) >= 0
+                || msg.IndexOf("外观已切换", StringComparison.Ordinal) >= 0
+                || msg.IndexOf("外观已设为跟随系统", StringComparison.Ordinal) >= 0
+                || msg.IndexOf("正在校验登录态", StringComparison.Ordinal) >= 0
+                || msg.IndexOf("正在自动登录", StringComparison.Ordinal) >= 0;
         }
 
 
@@ -123,21 +212,158 @@ namespace GeZi
                 case PanKind.Uc:
                     return 256;
                 default:
-                    return 0;
+                    return 0;   // 夸克：不限
+            }
+        }
+
+
+        /// <summary>
+        /// 2026-11-05：这个网盘**实际**可用的并发连接数。
+        ///
+        /// <para>
+        /// 优先级：用户在「四网盘分别设置」里填的值 → 全局 <c>Threads</c> →
+        /// 服务端硬上限 <see cref="MaxParallelFor"/>。
+        /// </para>
+        /// <para>
+        /// ⚠️ 硬上限**永远保留**：迅雷 16 / 阿里 64 / UC 256 是实测 503 / 掉速阈值，
+        /// 用户配到 512 也只按 16 跑，否则等于让用户一键把下载搞挂。
+        /// per-pan 值为 0 表示「没有单独覆盖、回落到默认基准」，是老配置升级后的默认状态。
+        /// </para>
+        /// <para>
+        /// 🚨 2026-11-07：内部拆出 <see cref="DefaultThreadsFor"/> 供弹窗「恢复默认」用，
+        ///    本方法行为与拆分前逐字等价（覆盖值优先、否则走默认基准、都叠加上限）。
+        /// </para>
+        /// </summary>
+        private int ThreadsFor(PanKind kind)
+        {
+            int want = ThreadsOverrideFor(kind);
+            if (want <= 0) return DefaultThreadsFor(kind);
+
+            int cap = MaxParallelFor(kind);
+            if (cap > 0 && want > cap) return cap;
+            return want;
+        }
+
+        /// <summary>
+        /// 🚨 2026-11-07：这个网盘的**默认**并发连接数（不看 per-pan 覆盖）。
+        /// 全局 <c>Threads</c>（默认 256）→ 再叠加各服务端硬上限。
+        /// 设置页全局下拉已删、弹窗不再有「跟随全局」项 —— 用这个直接把默认数字显示出来，
+        /// 也用作「恢复默认」按钮的目标值。
+        /// </summary>
+        private int DefaultThreadsFor(PanKind kind)
+        {
+            int want = _settings.Threads > 0 ? _settings.Threads : 256;
+            int cap = MaxParallelFor(kind);
+            if (cap > 0 && want > cap) return cap;
+            return want;
+        }
+
+        /// <summary>读取某网盘单独配置的 per-pan 覆盖值；0 = 无覆盖（回落默认基准）。仍被 <see cref="ThreadsFor"/> 使用。</summary>
+        private int ThreadsOverrideFor(PanKind kind)
+        {
+            switch (kind)
+            {
+                case PanKind.Uc: return _settings.ThreadsUc;
+                case PanKind.Aliyun: return _settings.ThreadsAliyun;
+                case PanKind.Xunlei: return _settings.ThreadsXunlei;
+                default: return _settings.ThreadsQuark;
+            }
+        }
+
+        /// <summary>
+        /// 每个网盘的「慢连接」绝对下限（字节/秒）。0 = 用引擎默认值（16 KB/s）。
+        ///
+        /// <para>
+        /// 🚨🚨 2026-11-05 新增（P2）。原来四家共用一个 16 KB/s 的绝对下限，
+        /// 但四家的限流方式完全不同，同一个数字必然有一边判错：
+        /// </para>
+        /// <list type="bullet">
+        /// <item><b>夸克 = 16 KB/s</b>：按连接限速，单连接 40~80 KB/s。
+        /// 低于 16 KB/s 就真的是半死连接，换一条立刻变快，判据不用改。</item>
+        /// <item><b>UC = 8 KB/s</b>：单 IP 总带宽 7~8 MB/s。256 路摊下来每路约 30 KB/s，
+        /// 但并发一旦超过 256 就掉到 13 KB/s —— 16 KB/s 会把**全部连接**判成慢，
+        /// 触发重连风暴（实测 378 连接 4.85 MB/s，砍到 256 反而 7.07 MB/s）。</item>
+        /// <item><b>阿里 = 8 KB/s</b>：单 IP 约 2.5~2.7 MB/s。用户日志里 151 次慢重连
+        /// 的实测速度全部聚集在 10221~12269 B/s —— 正好卡在 16 KB/s 下方，
+        /// 于是每条连接每 10 秒被判一次慢、重连、回来还是 10 KB/s，
+        /// 带宽全烧在 TCP 握手和 HTTP 请求头上。降到 8 KB/s 后只抓真正的半死连接。</item>
+        /// <item><b>迅雷 = 16 KB/s</b>：并发封 16，单连接实测 60~800 KB/s，阈值不用降。</item>
+        /// </list>
+        /// <para>
+        /// ⚠️ 这只是**绝对下限**。真正生效的阈值 = <c>max(本值, 平均单连接速度 × 0.5)</c>，
+        /// 相对阈值负责抓「掉队的个别连接」，绝对下限只负责抓「彻底半死的连接」。
+        /// </para>
+        /// </summary>
+        private static long SlowFloorFor(PanKind kind)
+        {
+            switch (kind)
+            {
+                case PanKind.Uc:
+                    return 8L * 1024;
+                case PanKind.Aliyun:
+                    return 8L * 1024;
+                case PanKind.Xunlei:
+                    return 16L * 1024;
+                default:
+                    return 16L * 1024;   // 夸克：按连接限速，保持原判据
             }
         }
 
 
         private void LogFromWorker(string msg)
         {
-            // 🚨 引擎的 [debug] 级日志一律不进界面。
+            // 🚨 引擎的「调试」级日志一律不进界面。
             // 实测教训：bezzad 的 ChunkDownloader 原本每个 4KB 缓冲打 3 条 debug，
             // 256 连接下每秒上万条 —— 它们全是 detail=true，会把 _logAll 撑爆，
             // TrimLogLines 一砍就把「解析成功/开始下载/下载完成」这些正常日志
             // 全部挤出窗口，于是「简化」视图变空白、只剩「详细」里满屏英文。
             // 逐包级别的追踪没有诊断价值（要看也是看分片级的），直接丢弃。
-            if (msg != null && msg.StartsWith("[debug]", StringComparison.Ordinal))
+            // ⚠️ 2026-11-06：级别标签已中文化，判据必须跟着改成 [调试]；
+            //    同时保留 [debug] 兜底，兼容旧版引擎 DLL 打出来的老格式日志。
+            if (msg != null && (msg.StartsWith("[调试]", StringComparison.Ordinal)
+                                || msg.StartsWith("[debug]", StringComparison.Ordinal)))
                 return;
+
+            // 🚨 2026-11-07：重复抑制（只作用于引擎专业级日志，核心结果永不拦）。
+            //   同一模板 8 秒内只出 1 条，窗口到期补一条「（同类 N 条已合并）」。
+            //   这样「取消一次下载灌 200 条分片错误」变成 1~2 行，核心信息仍在。
+            if (!LogDupExempt(msg))
+            {
+                string key = LogDupKey(msg);
+                bool emit = false;
+                string summary = null;
+                lock (_logDupGate)
+                {
+                    DateTime now = DateTime.UtcNow;
+                    DateTime since;
+                    if (!_logDupSince.TryGetValue(key, out since))
+                    {
+                        _logDupSince[key] = now;
+                        _logDupCount[key] = 0;
+                        emit = true;                    // 窗口内第一条，正常显示
+                    }
+                    else if ((now - since) >= LogDupWindow)
+                    {
+                        int n;
+                        _logDupCount.TryGetValue(key, out n);
+                        _logDupSince[key] = now;
+                        _logDupCount[key] = 0;
+                        emit = true;                    // 新一轮的第一条
+                        if (n > 0)
+                            summary = "（同类 " + n + " 条已合并）";
+                    }
+                    else
+                    {
+                        int n;
+                        _logDupCount.TryGetValue(key, out n);
+                        _logDupCount[key] = n + 1;       // 抑制，仅计数
+                    }
+                }
+                if (summary != null)
+                    EnqueueLog(summary, detail: true);
+                if (!emit)
+                    return;
+            }
 
             // 下载内核的过程日志（换链、抢占、停滞…）整体算专业级 ——
             // 日常视图只看任务最终结果（失败/取消走 OnTaskUpdate，是日常级）。
@@ -145,11 +371,30 @@ namespace GeZi
         }
 
 
-        /// <summary>把攒下的日志一次性刷进 LogBox（由定时器在 UI 线程上调用）。</summary>
+        /// <summary>
+        /// 把攒下的日志一次性刷进 LogBox（由定时器在 UI 线程上调用）。
+        /// <para>
+        /// 🚨🚨 2026-11-07 四修 —— 「日志一多界面就卡」的**最后一层也是最大一层**根因：
+        /// 本方法原来**无条件**把文本 <c>AppendText</c> 进 <see cref="LogBox"/>。
+        /// 但用户在下载时根本不看日志页（日志在「任务」页最下方），
+        /// 而 TextBox 带 <c>TextWrapping="Wrap"</c> 时每次 AppendText 都要把
+        /// **已存在的全部文本重新测量、重新折行** —— 2000 行就是每 200ms 一次全量折行，
+        /// 一天下来是 43 万次。界面自然会越用越卡，且和日志"多不多"无关，只和"多久"有关。
+        /// </para>
+        /// <para>
+        /// 正解：**界面不在看日志时，一个字都不碰控件**。日志照常进队列、
+        /// 照常进内存历史 <see cref="_logAll"/>（切「详细」要能补显），只是不刷 UI，
+        /// 同时记一个 <see cref="_logViewDirty"/>。等用户真的切到日志页，
+        /// 一次性 <see cref="RebuildLogBox"/> 把整屏拼好 —— 一次赋值、一次折行。
+        /// </para>
+        /// </summary>
         private void FlushLogs()
         {
-            if (_logQueue.IsEmpty)
+            // 🚨 不能只判队列空：上一轮可能已经 dirty 但队列空了，
+            //    此时用户刚切回日志页，不重建就永远是旧内容。
+            if (_logQueue.IsEmpty && !_logViewDirty)
                 return;
+
             var sb = new StringBuilder();
             LogLine item;
             int n = 0;
@@ -164,123 +409,166 @@ namespace GeZi
                 }
                 n++;
             }
+
+            // 先做纯内存裁剪（它可能报告「需要整体重建」）
+            bool trimmed = TrimLogLines();
+
+            if (!IsLogViewOnScreen())
+            {
+                // 没人在看 —— 不碰控件。这样就彻底消掉了「后台每 200ms 全量折行」。
+                _logViewDirty = true;
+                return;
+            }
+
+            if (trimmed || _logViewDirty)
+            {
+                // 整体重建一次：一次赋值、一次折行（比逐行 AppendText 便宜一个数量级）
+                _logViewDirty = false;
+                RebuildLogBox();
+                return;
+            }
+
             if (sb.Length > 0)
             {
+                // 可见时的常规增量：只有新攒的这几百行，折行成本可忽略
                 LogBox.AppendText(sb.ToString());
-                TrimLogLines();
                 LogBox.ScrollToEnd();
             }
         }
 
 
-        /// <summary>日志超过 <see cref="LogMaxLines"/> 时，从头部砍掉多余的整行。</summary>
-        private void TrimLogLines()
+        /// <summary>
+        /// 日志框此刻是否**真的在屏幕上被人看着**。
+        /// <para>
+        /// 三个条件缺一不可：日志框可见（页签没被切走时 TabItem 内容会被 Collapsed，
+        /// 于是 <c>IsVisible</c> 自动为 false）、窗口不是最小化、窗口有句柄。
+        /// </para>
+        /// <para>
+        /// ⚠️ 一律用 <c>IsVisible</c> 而不是自己比 <c>Tabs.SelectedIndex == 1</c>：
+        /// 索引与侧栏一一对应这件事只在 <see cref="OnTabsSelectionChanged"/> 那里维护，
+        /// 在这里再硬编码一个魔数，将来加页签必然错位。
+        /// </para>
+        /// </summary>
+        private bool IsLogViewOnScreen()
+        {
+            try
+            {
+                if (LogBox == null || !LogBox.IsVisible)
+                    return false;
+                if (WindowState == WindowState.Minimized)
+                    return false;
+                return IsVisible;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+
+        /// <summary>
+        /// 日志超过 <see cref="LogMaxLines"/> 时，从头部砍掉多余的整行。
+        /// <para>
+        /// 🚨🚨 2026-11-07 三修（用户第三次报「日志多了界面就卡」，前两次都改错了地方）：
+        /// 真正的卡顿源**不是**切档位，而是这里 —— 原来 <c>int cut = _logAll.Count - LogMaxLines;</c>
+        /// 每次只砍**超出的那几条**（通常 1~5），但紧跟着无条件 <see cref="RebuildLogBox"/>。
+        /// 而本方法是 <see cref="FlushLogs"/> 每次都调的，<see cref="FlushLogs"/> 又是
+        /// <b>每 200ms</b> 一次的定时器回调 —— 于是日志一旦累积到满额，
+        /// 就变成「每秒 5 次 × 2000 行全量拼串 + 全量赋值 + 全量折行」，
+        /// 而且会**永远持续下去**（因为 `_logAll` 再也退不回上限以下）。
+        /// 实测这就是「用久了越来越卡、日志一多就卡死」的成因。
+        /// </para>
+        /// <para>
+        /// 正解：**批量腾位置**。触发重建时一次砍到 <c>LogMaxLines - TrimSweep</c>，
+        /// 于是下一次重建要等累计 <see cref="TrimSweep"/> 条新日志 ——
+        /// 重建频率从「每 200ms」降到「每几百条日志」，日常使用基本无感。
+        /// 代价是 LogBox 里最多会短暂多出 <see cref="TrimSweep"/> 行，不影响可读性。
+        /// </para>
+        /// <para>
+        /// ⚠️ 不能靠「降低 <see cref="LogMaxLines"/>」来解决：那只是把每次重建的成本
+        /// 降一点，频率问题原封不动，日志少了也照样每 200ms 重建。
+        /// </para>
+        /// <para>
+        /// 🚨 本方法**只做纯内存裁剪，绝不碰控件**，返回「行列表是否变了」。
+        /// 要不要重建 LogBox 由调用方决定 —— 因为调用方才知道日志框此刻在不在屏幕上
+        /// （见 <c>FlushLogs</c>）：没人在看的时候重建纯属白烧 CPU，
+        /// 这也是「日志多了界面卡」的另一大来源。
+        /// </para>
+        /// </summary>
+        /// <returns>true = 确实砍掉了行（视图需要重建）；false = 没动。</returns>
+        private bool TrimLogLines()
         {
             try
             {
                 if (_logAll.Count <= LogMaxLines)
-                    return;
-                int cut = _logAll.Count - LogMaxLines;
+                    return false;
+                // 一次腾出一整批，避免高频重建（见上面注释）
+                int target = LogMaxLines - TrimSweep;
+                if (target < TrimSweep) target = TrimSweep;
+                int cut = _logAll.Count - target;
+                if (cut <= 0)
+                    return false;
                 _logAll.RemoveRange(0, cut);
-                // 行列表变了（当前模式可能还显示着被砍的行）→ 按当前模式重建
-                RebuildLogBox();
+                return true;
             }
-            catch { }
+            catch
+            {
+                return false;
+            }
         }
 
 
         /// <summary>
         /// 按当前模式（<see cref="_logVerbose"/>）重建 LogBox 文本。
         /// <para>
-        /// 🚨🚨 2026-11-04 优化（用户报「切换简要/详细卡顿」）：
-        /// 原来这里是**一次性拼一个最多 2000 行的巨型字符串**再整体赋给
-        /// <c>LogBox.Text</c> —— 而 TextBox 的 Text setter 会触发
-        /// 完整文本解析 + 布局重算 + 滚动位置重置，行数越多越卡（实测 2000 行 ~300ms）。
+        /// 🚨🚨 2026-11-07 定稿（用户两轮都报「切换简要/详细卡顿」）：
+        /// 11-04 曾改成「清空 + 分段 AppendText」想做流式显示，但 LogBox 是
+        /// <c>TextWrapping="Wrap"</c> —— 每调一次 AppendText，WPF 都要把已存在的
+        /// 全部文本重新折行/量算，5 段 = 5 次全量折行，2000 行时 O(n²) 反而更卡。
         /// </para>
         /// <para>
-        /// 现在改成**分段增量追加**：
-        /// 每 <see cref="RebuildChunkSize"/> 行 AppendText 一次，
-        /// 中间用 <c>Dispatcher.Yield(Background)</c> 让出 UI 线程，
-        /// 界面不会假死、用户能感觉到进度在动。
-        /// </para>
-        /// <para>
-        /// ⚠️ 为什么不直接换虚拟化 ListBox：<c>LogBox</c> 被导出诊断包、日志搜索等多处
-        /// 按「字符串」语义使用，换控件会牵连一大片。分段追加能拿到 80% 的收益、
-        /// 改动面却小得多。
+        /// 正解：内存里一次拼好整个字符串，**一次**赋给 <c>LogBox.Text</c>，
+        /// 只触发一次布局/折行；内容没变就不重复赋值。这么做的代价是切换时
+        /// 一次性完成（2000 行约几十毫秒），换来的是不再反复折行造成假死。
+        /// 实时新增日志仍走 <see cref="FlushLogs"/> 的增量 AppendText（每次只有几行，
+        /// 折行成本可忽略），两者互不冲突。
         /// </para>
         /// </summary>
         private void RebuildLogBox()
         {
             try
             {
-                // 先把要显示的行收集到列表（纯内存操作，很快）
-                var lines = new List<string>(Math.Min(_logAll.Count, LogMaxLines) + 1);
-                bool trimmed = false;
-                var start = 0;
+                // 🚨🚨 2026-11-07 再修「切换简要/详细还是卡」：
+                //   上一版（11-04）改成「清空 + 分段 AppendText」以为能流式显示，
+                //   但 LogBox 是 TextWrapping="Wrap" —— **每调一次 AppendText，
+                //   WPF 都要把已存在的全部文本重新折行/量算一遍**，5 段就是 5 次全量折行，
+                //   2000 行时是 O(n²)，反而比一次性赋值更卡（用户实测仍卡）。
+                //   正解：先在内存里拼好整个字符串，**一次**赋给 LogBox.Text，
+                //   只触发一次布局/折行；再 ScrollToEnd。
+                var sb = new StringBuilder();
+                int start = 0;
                 if (_logAll.Count > LogMaxLines)
                 {
                     start = _logAll.Count - LogMaxLines;
-                    trimmed = true;
+                    sb.Append("…（更早的日志已省略，仅保留最近 ")
+                      .Append(LogMaxLines).Append(" 行）").Append(Environment.NewLine);
                 }
-                if (trimmed)
-                    lines.Add("…（更早的日志已省略，仅保留最近 " + LogMaxLines + " 行）");
                 for (int i = start; i < _logAll.Count; i++)
                 {
                     var l = _logAll[i];
                     if (_logVerbose || !l.Detail)
-                        lines.Add(l.Text);
+                        sb.Append(l.Text).Append(Environment.NewLine);
                 }
-
-                // 清空后分段追加（清空是 O(1) 的，TextBox 会释放旧文本）
-                LogBox.Clear();
-                AppendLogLinesChunked(lines);
+                string text = sb.ToString();
+                // 反复快速切档位时内容没变就不重新赋值，避免无谓布局
+                if (!string.Equals(LogBox.Text, text, StringComparison.Ordinal))
+                {
+                    LogBox.Text = text;
+                    LogBox.ScrollToEnd();
+                }
             }
             catch { }
         }
-
-        /// <summary>每次增量追加的行数 —— 太小会频繁让出 UI（变慢），太大又会卡顿。</summary>
-        private const int RebuildChunkSize = 400;
-
-        /// <summary>
-        /// 分段追加日志行，每段之间让出 UI 线程。
-        /// <para>
-        /// 用 async void 是**故意的**：调用方（切换按钮）不需要等它完成，
-        /// 用户能立刻看到第一段出现，后面的段落陆续补上。
-        /// 整个方法内部全 try/catch，不会有未观察异常。
-        /// </para>
-        /// </summary>
-        private async void AppendLogLinesChunked(List<string> lines)
-        {
-            if (lines == null || lines.Count == 0)
-            {
-                try { LogBox.ScrollToEnd(); } catch { }
-                return;
-            }
-
-            try
-            {
-                var sb = new StringBuilder(RebuildChunkSize * 64);
-                for (int i = 0; i < lines.Count; i++)
-                {
-                    sb.Append(lines[i]).Append(Environment.NewLine);
-                    bool chunkFull = sb.Length >= RebuildChunkSize * 64;
-                    bool isLast = i == lines.Count - 1;
-                    if (chunkFull || isLast)
-                    {
-                        LogBox.AppendText(sb.ToString());
-                        sb.Clear();
-                        // 让出 UI：Background 优先级保证进度条/动画等更重要的更新先跑
-                        await Dispatcher.Yield(System.Windows.Threading.DispatcherPriority.Background);
-                    }
-                }
-                LogBox.ScrollToEnd();
-            }
-            catch
-            {
-                // 追加过程中窗口关闭 / LogBox 已释放 —— 静默忽略，绝不能因此崩溃
-            }
-        }
-
 
         /// <summary>
         /// 启动时把 <c>GeZi.log</c> 的尾部灌回 <see cref="_logAll"/>，让「上次关掉前的日志」还在。
@@ -405,7 +693,12 @@ namespace GeZi
 
                 var info = new List<KeyValuePair<string, string>>
                 {
-                    new KeyValuePair<string, string>("单文件并发", _settings.Threads.ToString()),
+                    // 🚨 2026-11-07：全局并发下拉已删，这里改成报四家**实际生效**的连接数，
+                    //    否则诊断包里那个数已经不是"当前生效值"，排查时会误导。
+                    new KeyValuePair<string, string>("并发连接数（夸克/UC/阿里/迅雷）",
+                        string.Format("{0} / {1} / {2} / {3}",
+                            ThreadsFor(PanKind.Quark), ThreadsFor(PanKind.Uc),
+                            ThreadsFor(PanKind.Aliyun), ThreadsFor(PanKind.Xunlei))),
                     new KeyValuePair<string, string>("同时下载任务数", _settings.ConcurrentTasks.ToString()),
                     new KeyValuePair<string, string>("下载目录", _settings.OutDir ?? ""),
                     // 2026-11-01（方案 B）：设置页的分片根目录输入框已删除，
@@ -687,6 +980,13 @@ namespace GeZi
 
 
         /// <summary>把探测结果落到 UI —— 纯 UI 操作，必须在 UI 线程调用。</summary>
+        /// <remarks>
+        /// 🚨 2026-11-04 播放器卡重做后，状态拆成三个控件：
+        ///   · <c>PlayerStatusText</c> —— 一句结论（「VLC 已就绪」/「未检测到 VLC」）；
+        ///   · <c>PlayerPathText</c>  —— 路径或补充说明（一行灰字，超长省略号）；
+        ///   · <c>PlayerStatusDot</c> —— 状态圆点（绿=可用，橙=降级）。
+        /// 旧版把「结论 + 路径 + 长篇解释」全塞进一个 TextBlock，字号一样、读起来是一坨。
+        /// </remarks>
         private void ApplyPlayerStatus(PlayerLocator.Player p)
         {
             try
@@ -695,20 +995,49 @@ namespace GeZi
                 {
                     // 🚨 只提 VLC（2026-10-04 用户要求）：全项目只对 VLC 做过参数适配，
                     //    其它播放器（mpv / PotPlayer）可能行为不一致 → 干脆不提，避免给出错误预期。
-                    PlayerStatusText.Text = "未检测到 VLC。"
-                        + "「打开」将回退到系统默认程序 —— 但边下边播未必能用，"
-                        + "因为系统自带播放器通常打不开「还没下完」的文件。";
+                    PlayerStatusText.Text = "未检测到 VLC";
+                    if (PlayerPathText != null)
+                    {
+                        PlayerPathText.Text = "「打开」将回退到系统默认程序，边下边播未必可用"
+                            + "（系统自带播放器通常打不开还没下完的文件）。";
+                        PlayerPathText.ToolTip = PlayerPathText.Text;
+                    }
+                    if (PlayerStatusDot != null)
+                    {
+                        PlayerStatusDot.SetResourceReference(
+                            System.Windows.Shapes.Shape.FillProperty, "WarningBrush");
+                    }
                     GetVlcBtn.Visibility = System.Windows.Visibility.Visible;
                 }
                 else
                 {
-                    PlayerStatusText.Text = "已检测到 VLC（" + p.ExePath + "）—— 适合边下边播。";
+                    PlayerStatusText.Text = "VLC 已就绪";
+                    if (PlayerPathText != null)
+                    {
+                        PlayerPathText.Text = p.ExePath ?? "";
+                        PlayerPathText.ToolTip = p.ExePath;
+                    }
+                    if (PlayerStatusDot != null)
+                    {
+                        PlayerStatusDot.SetResourceReference(
+                            System.Windows.Shapes.Shape.FillProperty, "SuccessBrush");
+                    }
                     GetVlcBtn.Visibility = System.Windows.Visibility.Collapsed;
                 }
             }
             catch (Exception ex)
             {
-                PlayerStatusText.Text = "检测播放器失败: " + ex.Message;
+                if (PlayerStatusText != null) PlayerStatusText.Text = "检测播放器失败";
+                if (PlayerPathText != null)
+                {
+                    PlayerPathText.Text = ex.Message;
+                    PlayerPathText.ToolTip = ex.Message;
+                }
+                if (PlayerStatusDot != null)
+                {
+                    PlayerStatusDot.SetResourceReference(
+                        System.Windows.Shapes.Shape.FillProperty, "DangerBrush");
+                }
             }
         }
 

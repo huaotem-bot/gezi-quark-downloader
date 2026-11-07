@@ -58,7 +58,8 @@ namespace GeZi
             if (_release.PublishedAt.HasValue)
                 SizeText.Text = _release.PublishedAt.Value.ToLocalTime().ToString("yyyy-MM-dd") + " 发布";
             else if (_release.AssetSize > 0)
-                SizeText.Text = (_release.AssetSize / 1048576.0).ToString("0.0") + " MB";
+                // 🚨 2026-11-04：统一走 Util.FormatSize（1024 进制），不再手写 /1048576.0。
+                SizeText.Text = Util.FormatSize(_release.AssetSize);
             else
                 SizeText.Text = "v" + _release.TagName;
 

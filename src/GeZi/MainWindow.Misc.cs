@@ -317,9 +317,12 @@ namespace GeZi
                     deleted++;
                 }
             }
-            catch
+            catch (Exception ex)
             {
-                // 删不掉就交给下面的失败清单去报，不要在这里中断整轮清理
+                // 🚨 2026-11-06：原来这里 catch{} 静默吞掉，
+                //    「删不掉」根本不会进 failed，删除线程会误判「已删净」而提前退出。
+                //    必须登记失败，让 DeleteLocalFiles 继续重试。
+                failed.Add(dest + ".geziresume — " + ex.Message);
             }
 
             foreach (string p in PartsPaths.EnumeratePartialPaths(dest, AllPartsRoots()))
@@ -439,7 +442,15 @@ namespace GeZi
                 }
                 catch (Exception ex)
                 {
-                    PlayerStatusText.Text = "检测播放器失败: " + ex.Message;
+                    // 🚨 2026-11-04：播放器卡拆成「结论 + 路径 + 圆点」三个控件后，
+                    //   失败分支不能再只写 PlayerStatusText（那样圆点还停在旧颜色）。
+                    //   统一交给 ApplyPlayerStatus 的 catch 分支处理。
+                    ApplyPlayerStatus(null);
+                    if (PlayerPathText != null)
+                    {
+                        PlayerPathText.Text = "检测失败：" + ex.Message;
+                        PlayerPathText.ToolTip = PlayerPathText.Text;
+                    }
                     return;
                 }
                 ApplyPlayerStatus(p);
@@ -550,9 +561,13 @@ namespace GeZi
             //
             //   ⚠️ 默认值仍然是 Shared —— 那是被大量实测验证过的那条路径。
             //      顺序写从未启用过，第一次开放给用户时必须自己实测续传 + MD5。
-            _scheduler.FusionStorageMode = _settings.StorageMode == 0
-                ? GeZi.DownloadEngine.Storage.StorageMode.Sequential
-                : GeZi.DownloadEngine.Storage.StorageMode.Shared;
+            // 🚨🚨 2026-11-07：用户明确「不要顺序写了」。
+            //   严格连续前缀模型有队头阻塞（速度 1.67MB/s 但进度只涨 0.27MB/10s）、
+            //   进度与磁盘背离、无法边下边看三个缺陷，且机械盘友好能力**共写本来就具备**
+            //   （hdd 时 512/64MB 写合并批次 + HddMaxConcurrency 降并发）。
+            //   ⇒ 落盘方式恒定共写；枚举与 SequentialFileStorage 实现保留作兼容兜底，不删除
+            //   （老 GeZi.config.xml 存过 0/Sequential，删了会让反序列化炸掉、登录态全丢）。
+            _scheduler.FusionStorageMode = GeZi.DownloadEngine.Storage.StorageMode.Shared;
             // 0 = 用 SequentialFileStorage 的默认窗口（32 MB）。
             _scheduler.FusionSequentialWindowBytes = 0;
             // 机械盘连接上限：用户可以自己调（设置页「机械盘连接上限」）。

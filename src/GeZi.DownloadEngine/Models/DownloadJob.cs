@@ -12,6 +12,7 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/agpl-3.0>.
 
 using System;
+using System.Collections.Generic;
 using System.Threading;
 using System.Threading.Tasks;
 using GeZi.Core.Api;
@@ -85,6 +86,21 @@ namespace GeZi.DownloadEngine
         public string PartsRoot { get; set; }
 
         /// <summary>
+        /// 2026-11-04 新增：**源文件指纹**，用于识别「同一目标路径换成了另一个源文件」。
+        /// <para>
+        /// 为什么需要：`.geziresume` 是按目标路径定位的（见 PartsPaths.ResolvePaths），
+        /// 而 PathUtil.UniquePath 会把同名文件落成 `名称 (1)`。
+        /// 于是「先下夸克的 示例视频（15MB），再下 UC 的同名文件（178MB）」时，
+        /// 新任务可能命中旧路径上的续传状态 → 拿旧进度续新文件 → 拼出坏文件。
+        /// </para>
+        /// <para>
+        /// 值由 UI 层拼：<c>总长|网盘序号|源文件Fid</c>。为空表示不做这项校验
+        /// （老代码路径 / 自检），此时只按 TotalBytes 判。
+        /// </para>
+        /// </summary>
+        public string SourceKey { get; set; }
+
+        /// <summary>
         /// 重新获取本文件直链的回调。夸克直链带时效签名，长任务下到一半会过期；
         /// 提供它之后，下载器遇到 401/403/412 能自动换新链续传，而不是整个任务失败。
         /// 由 UI 层注入 —— 只有它知道这个文件对应的 fid / token / 分享上下文。
@@ -117,6 +133,55 @@ namespace GeZi.DownloadEngine
         public int MaxParallelCount { get; set; }
 
         /// <summary>
+        /// 源文件所在网盘（Quark=0 / Uc=1 / Aliyun=2 / Xunlei=3）。
+        ///
+        /// <para>
+        /// 2026-11-05 新增：下载数据面要按网盘补齐对应的客户端请求头
+        /// （Sec-Ch-Ua / Sec-Fetch-* / Accept-Language 等），
+        /// 与取链时声明的客户端身份保持一致。见
+        /// <see cref="GeZi.Core.Support.PanClientProfile"/>。
+        /// </para>
+        /// <para>
+        /// 默认 0 = 夸克，保证老调用方（自检、未填此字段的路径）行为不变。
+        /// 新建任务与重启后续传两条路都必须显式填写。
+        /// </para>
+        /// </summary>
+        public int PanKind { get; set; }
+
+        /// <summary>
+        /// 下载数据面的额外请求头（Sec-Ch-Ua / Sec-Fetch-* / Accept-Language 等）。
+        /// <para>由 UI 层按 <see cref="PanKind"/> 从 PanClientProfile 生成；
+        /// 引擎不认识具体网盘，只负责透传。null = 不追加。</para>
+        /// </summary>
+        public Dictionary<string, string> ExtraHeaders { get; set; }
+
+        /// <summary>
+        /// 这个网盘的「慢连接」绝对下限（字节/秒）。0 = 用引擎默认值 16 KB/s。
+        ///
+        /// <para>
+        /// 🚨🚨 为什么必须按网盘分档（2026-11-05）：<c>LowestSpeedLimit</c> 原来对四家
+        /// 用同一个 16 KB/s，但四家的限流方式根本不同 ——
+        /// </para>
+        /// <list type="bullet">
+        /// <item><b>夸克</b>：按**连接**限速，单连接 40~80 KB/s。16 KB/s 的判据是对的
+        /// ——低于它就真的是半死连接，换一条立刻变快。</item>
+        /// <item><b>UC</b>：单 IP 总带宽 7~8 MB/s。256 路摊下来每路 27~31 KB/s，
+        /// 但一旦并发超过 256 就掉到 13 KB/s —— 此时 16 KB/s 会把**全部连接**判成慢，
+        /// 触发重连风暴。实测 2 任务 378 连接只有 4.85 MB/s，砍到 256 反而 7.07 MB/s。
+        /// 所以 UC 的绝对下限要降到 8 KB/s，只抓真正的半死连接。</item>
+        /// <item><b>阿里</b>：单 IP 约 2.5~2.7 MB/s。64 路摊下来每路 40 KB/s，
+        /// 但服务端抖动时能掉到 10 KB/s —— 同样要降到 8 KB/s，
+        /// 否则「整体限速」判定还没触发，看门狗就已经先把连接全掐了。</item>
+        /// <item><b>迅雷</b>：单 IP 并发封 16，单连接实测 60~800 KB/s。保持 16 KB/s。</item>
+        /// </list>
+        /// <para>
+        /// 注意：这只是**绝对下限**。真正生效的阈值 = <c>max(本值, 平均单连接速度 × 0.5)</c>，
+        /// 相对阈值负责抓「掉队的个别连接」，绝对下限只负责抓「彻底半死的连接」。
+        /// </para>
+        /// </summary>
+        public long SlowFloorBps { get; set; }
+
+        /// <summary>
         /// 续传上下文（可选）。由 UI 层在创建任务时填好，用于把该任务写进
         /// 「未完成任务」持久化记录，使程序重启后能**不依赖界面上下文**地重取直链续传。
         /// 为什么放在 Job 上而不是让 UI 自己拼：UI 在写 pending 时只有 <c>TaskItem</c>，
@@ -131,6 +196,15 @@ namespace GeZi.DownloadEngine
         /// （要重新查版本、重新取链），且避免 Pending 信息残缺导致续传界面出错。
         /// </summary>
         public bool SkipPersist { get; set; }
+
+        /// <summary>
+        /// 🚨 2026-11-07：用户右键「删除并移除」时置 true。
+        /// 取消流程读到它会**跳过写 .geziresume 并主动清一次**，
+        /// 否则「取消 → 写快照」与「删除线程删快照」形成竞态，文件被反复写回来
+        /// （实测：删完又冒出「已暂停」、续传命中 177 片）。
+        /// 默认 false = 普通取消/暂停，行为逐字不变。
+        /// </summary>
+        public volatile bool DeleteAndRemoveRequested;
 
         public CancellationTokenSource Cancel { get; } = new CancellationTokenSource();
         public PauseToken Pause { get; } = new PauseToken();

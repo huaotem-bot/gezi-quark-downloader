@@ -186,8 +186,25 @@ namespace GeZi
         private void ApplyNav(NavSnapshot s)
         {
             if (s == null) return;
+
+            // 🚨 2026-11-07 修「我的网盘 → 分享链接」单向卡顿：
+            //   原来这里 foreach 把快照里**全部**条目一条条 _files.Add(...)，
+            //   而 _files 是绑在 FileList.ItemsSource 上的 ObservableCollection ——
+            //   每 Add 一条都触发一次 CollectionChanged → ListBox 增量布局重算。
+            //   用户在大分享目录里滚过几百条再切回来，就是几百次重排，界面卡住。
+            //   反向（首次进我的网盘）走 LoadDirAsync → RevealNextBatch 只露 10 条，
+            //   所以那个方向流畅 —— 这正是「单向卡顿」的来源。
+            //   正解：**暂时解绑 ItemsSource → 一次性填满 → 重新绑定**，全程只有一次布局；
+            //   已滚出来的条目一条不少地还原，可见内容与原来完全一致。
+            //   ⚠️ 不改成「只露 10 条」：快照是用户已经滚出来的那些，截断会让内容丢失。
+            //   ⚠️ 同步执行、中间没有 await，解绑窗口内不会有别的 UI 代码插进来。
+            var boundSrc = FileList != null ? FileList.ItemsSource : null;
+            try { if (FileList != null) FileList.ItemsSource = null; } catch { }
+
             _files.Clear();
             foreach (var f in s.Files) _files.Add(f);
+
+            try { if (FileList != null) FileList.ItemsSource = boundSrc ?? _files; } catch { }
 
             _curFid = s.CurFid ?? "0";
 
@@ -700,7 +717,20 @@ namespace GeZi
         }
 
 
-        private async Task LoadDirAsync(string fid)
+        /// <param name="forceRefresh">
+        /// true = **跳过目录缓存**，强制向网盘重新请求。
+        /// <para>
+        /// 🚨🚨 2026-11-04 修「删除后列表里文件还在」：
+        /// 删除成功后调的是 <c>LoadDirAsync(_curFid)</c>，而它会先查 <c>_dirCache</c>，
+        /// 命中就直接铺开、**一个请求都不发** —— 于是铺开的是删除**前**的旧数据。
+        /// 用户看到的「文件还在」，第二次再删就报 file_not_found（因为第一次真删了）。
+        /// </para>
+        /// <para>
+        /// ⚠️ 四家网盘都有这个问题 —— 它出在**界面层的目录缓存**，与哪家网盘无关。
+        /// 凡「改变目录内容」的操作（删除 / 转存 / 重命名 / 移动）都必须传 true。
+        /// </para>
+        /// </param>
+        private async Task LoadDirAsync(string fid, bool forceRefresh = false)
         {
             SetBusy(true);
             // 置位加载态并立刻刷新一次 —— 让"正在加载…"在请求发出前
@@ -712,8 +742,9 @@ namespace GeZi
             {
                 // ① 缓存命中 → 直接铺开，**一个请求都不发**（用户反馈"进文件夹再按 a
                 //    返回又要重新加载，很卡"）。
+                // ⚠️ 但 forceRefresh=true 时必须跳过 —— 见方法参数的说明。
                 DirCacheEntry hit;
-                if (_dirCache.TryGetValue(DirCacheKey(fid), out hit))
+                if (!forceRefresh && _dirCache.TryGetValue(DirCacheKey(fid), out hit))
                 {
                     ApplyDirView(hit);
                     LogDetail("目录来自缓存: 共 " + hit.Items.Count + " 项（未重新请求）");
@@ -1110,7 +1141,8 @@ namespace GeZi
                 }
 
                 Log("已从网盘删除 " + fids.Count + " 项。");
-                await LoadDirAsync(_curFid);   // 刷新列表
+                // 🚨 必须 forceRefresh —— 否则读到删除前的缓存，文件看起来还在。
+                await LoadDirAsync(_curFid, forceRefresh: true);
                 // 删文件会改变已用空间 —— 顺手把账号卡的容量也刷一下（用户要求）
                 await RefreshCapacityAsync();
             }
@@ -1506,24 +1538,50 @@ namespace GeZi
 
         private void DeleteLocalFiles(string dest, string name)
         {
-            // 单轮删除存在竞态：CancelJob() 只是发信号，
-            // worker 可能还在退避重试/ReadAsync 中没退出 —— 删完文件它又把
-            // 分片文件、目标文件"复活"了（任务已从列表移除，下载器 finally
-            // 的清理也已跑完或不会跑）→ 残留永久留下，重开显示"可续传"。
-            // 改为与「取消」同款的多轮重试（每轮先删再查，最多 12 轮 ≈ 3 秒），
-            // 给 worker 留出退出时间后再确认删净。
+            // 🚨🚨 2026-11-06 修「删除并移除了但 .geziresume 还在」的真因：
+            //   OnTaskDeleteLocal 先 CancelJob()（只发信号）→ 移除行 → 异步删文件。
+            //   而取消信号会走到 DownloadService 的 catch(OperationCanceledException)，
+            //   那里**无条件再写一次 .geziresume**（SaveResumeSnapshotAsync）。
+            //   两个线程抢同一个文件，谁后跑谁赢。
+            //
+            //   原来这里的重试判据是「failed.Count == 0 && delayed == 0」——
+            //   只盯着「删不掉」，不检查「文件是不是又被重建了」。删成功就立刻
+            //   break，此时取消流程的写盘往往还没开始，文件随后又被写回来。
+            //
+            //   正解：判据改成**看文件是否仍然存在**，并且要求连续两轮确认干净
+            //   才退出（给取消流程的写快照留出落地时间）。轮数从 12 提到 20
+            //   （5 秒），覆盖慢盘上 StopResumeSaver + 序列化 + 落盘的耗时。
+            //
+            // ⚠️ 不用「等取消完成事件」那种重方案：那要跨 UI/引擎层传 Task，
+            //    改动面大；这里用文件存在性做最终判据，无论写入方何时落地都能兜住。
             int deleted = 0, delayed = 0;
             var failed = new List<string>();
-            for (int attempt = 0; attempt < 12; attempt++)
+            int cleanRounds = 0;
+            const int Rounds = 20;
+            for (int attempt = 0; attempt < Rounds; attempt++)
             {
                 if (attempt > 0) Thread.Sleep(250);
                 deleted = 0;
                 delayed = 0;
                 failed = new List<string>();
                 DeleteRound(dest, out deleted, out delayed, failed);
-                if (failed.Count == 0 && delayed == 0)
-                    break;
+
+                bool gone = !File.Exists(dest) && !File.Exists(dest + ".geziresume");
+                if (gone && failed.Count == 0 && delayed == 0)
+                {
+                    cleanRounds++;
+                    if (cleanRounds >= 2) break;   // 连续两轮干净才算真删掉
+                }
+                else
+                {
+                    cleanRounds = 0;
+                }
             }
+
+            // 收尾再补一刀：万一中途又被取消流程写回来，最后再删一次。
+            // 这一刀是幂等的，文件不存在时 File.Delete 不会抛。
+            try { if (File.Exists(dest + ".geziresume")) File.Delete(dest + ".geziresume"); }
+            catch { }
 
             // 日志尽量只有一行（用户要求：「日志上只会显示已成功删除本地文件XXX」）。
             // 出问题时才追加说明 —— 那种情况必须让用户看到。
@@ -1623,11 +1681,22 @@ namespace GeZi
                 long doneBytes = item.Done;
                 if (doneBytes <= 0) doneBytes = curSize;
 
+                // 🚨 2026-11-06：这句原来写死「文件已预分配成完整大小」，
+                //    但**顺序写模式根本不预分配**（文件从 0 连续增长），
+                //    照抄共写的文案会让用户以为文件长度是假的、进度显示不可信。
+                //    按设置里的落盘方式分别说明。
+                bool sequentialMode = _settings != null && _settings.StorageMode == 0;
+                string sizeNote = sequentialMode
+                    ? "文件按顺序写入，长度会随下载逐步增长。"
+                    : "文件已预分配成完整大小（长度不等于已下进度）。";
+                // 🚨 2026-11-07：顺序写已跳过 moov 优先（保持连续增长），
+                //    索引在文件末尾时**必须下完才能播**，不能再写「稍等再试即可」误导用户。
+                string playNote = sequentialMode
+                    ? "顺序写为保证进度真实，不做索引预写入；若视频索引在文件末尾，需等全部下完才能播放。"
+                    : "若视频索引（moov）在文件末尾，需要等它被优先写入后才能播 —— 这属于正常现象，稍等再试即可。";
                 Log(string.Format(
-                    "提示: 该文件还没下完（当前已下 {0} / {1}）。文件已预分配成完整大小，"
-                    + "若视频索引（moov）在文件末尾，需要等它被优先写入后才能播 —— "
-                    + "这属于正常现象，稍等再试即可。",
-                    Util.FormatSize(doneBytes), Util.FormatSize(item.Total)));
+                    "提示: 该文件还没下完（当前已下 {0} / {1}）。{2}{3}",
+                    Util.FormatSize(doneBytes), Util.FormatSize(item.Total), sizeNote, playNote));
 
                 // 边下边看：告诉融合引擎「播放位置往后这段最优先」。
                 //
@@ -1773,8 +1842,10 @@ namespace GeZi
             try
             {
                 if (m == null) return;
+                // 🚨 2026-11-04：不再手写 /1048576.0 —— 统一走 Util.FormatSize（1024 进制）。
+                //   全程序只允许一份字节格式化实现，否则迟早又出现「两处显示不一样」。
                 string size = m.AssetSize > 0
-                    ? "，" + (m.AssetSize / 1048576.0).ToString("0.0") + " MB"
+                    ? "，" + Util.FormatSize(m.AssetSize)
                     : "";
                 NotifyToast.Show("发现新版本 v" + m.Version,
                     "打开「关于 → 检查更新」查看更新说明并下载" + size, null);
@@ -1903,6 +1974,7 @@ namespace GeZi
             }
             catch { }
             finally { _syncingNav = false; }
+            RefreshLogViewIfStale();
         }
 
 
@@ -1920,6 +1992,35 @@ namespace GeZi
             }
             catch { }
             finally { _syncingNav = false; }
+            RefreshLogViewIfStale();
+        }
+
+
+        /// <summary>
+        /// 切页结束后补刷日志视图（如果它在没人看时挂起了）。
+        /// <para>
+        /// 🚨 2026-11-07：日志视图在不在屏幕上时是「挂起」的（见 <c>FlushLogs</c> 的注释），
+        /// 切回来必须立刻补上，不能等下一次 200ms 心跳 —— 否则用户会先看到几百毫秒的旧内容。
+        /// </para>
+        /// <para>
+        /// ⚠️ 必须**两个入口都调**：<c>NavList</c> 与 <c>Tabs</c> 是双向同步的，
+        /// 从侧栏点进来时 <c>OnTabsSelectionChanged</c> 会因为 <c>_syncingNav</c> 提前 return，
+        /// 只在那边补就漏掉了侧栏这条最常用的路径。
+        /// </para>
+        /// <para>
+        /// ⚠️ 这里调 <c>FlushLogs</c> 而不是 <c>RebuildLogBox</c>：队列里可能还压着
+        /// 没进 <c>_logAll</c> 的条目，直接重建会漏掉它们。FlushLogs 内部会因
+        /// <c>_logViewDirty</c> 走整体重建分支，既补齐又只折行一次。
+        /// </para>
+        /// </summary>
+        private void RefreshLogViewIfStale()
+        {
+            try
+            {
+                if (_logViewDirty)
+                    FlushLogs();
+            }
+            catch { }
         }
     }
 }

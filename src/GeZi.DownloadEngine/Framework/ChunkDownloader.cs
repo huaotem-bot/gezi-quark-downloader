@@ -45,7 +45,7 @@ internal class ChunkDownloader
 
     private void ConfigurationPropertyChanged(object sender, PropertyChangedEventArgs e)
     {
-        _logger?.LogDebug($"Changed configuration {e.PropertyName} property");
+        _logger?.LogDebug($"配置项 {e.PropertyName} 已变更");
         if (e.PropertyName == nameof(_configuration.MaximumBytesPerSecond) &&
             _sourceStream?.CanRead == true)
         {
@@ -57,14 +57,47 @@ internal class ChunkDownloader
     {
         try
         {
-            _logger?.LogDebug($"Starting download the chunk {Chunk.Id}");
+            _logger?.LogDebug($"开始下载分片 {Chunk.Id}");
             await DownloadChunk(downloadRequest, pause, cancelToken).ConfigureAwait(false);
             return Chunk;
         }
         catch (FatalChunkException)
         {
             // 资源变更 / 区间不符 —— 重试无意义，直接上抛让任务失败并作废
-            _logger?.LogCritical($"Fatal chunk error on chunk {Chunk.Id}: resource changed or range mismatch");
+            _logger?.LogCritical($"分片 {Chunk.Id} 致命错误：源文件已变化或区间不符");
+            throw;
+        }
+        catch (SlowReconnectException slow)
+        {
+            // 🚨🚨 2026-11-05 新增：慢连接换连接 —— **零退避、零代价**。
+            //
+            // 与下面几个 catch 的关键区别（照抄 refs/YunX 的 PreemptedException 语义）：
+            //   · **不走 ContinueWithDelay** → 不等 150~5000ms 的指数退避；
+            //   · **不动 Chunk.FailoverCount** → 不占用「真出错」的重试预算；
+            //   · **不动 Chunk.Timeout** → 读超时窗口保持原样。
+            //
+            // 为什么可以零退避：这不是失败，是**主动放弃一条慢连接**。
+            //   已写字节全部保留在 Chunk.Position 里，下一轮 DownloadChunk 会以
+            //   `Start + Position` 作 Range 起点继续拉，一个字节都不重下。
+            //   而退避原本是给「服务器限流/503」用的 —— 那种情况立刻重连只会再撞一次；
+            //   慢连接恰恰相反：**换一条新连接本身就可能落到快节点**，等待纯属浪费。
+            //
+            // ⚠️ 上限仍由 SpeedReconnectCount < MaxSpeedReconnects 在抛出点控制（默认 3），
+            //    不会无限重连。达到上限后这条连接就老老实实慢慢啃，
+            //    剩余区间交给 PreemptRound / TryRefillTail 切给别的 worker。
+            _logger?.LogWarning(
+                $"分片 {Chunk.Id} 慢连接换连接（零退避），已下 {Chunk.Position}/{Chunk.Length}，"
+                + $"剩余 {Chunk.EmptyLength}，实测 {slow.MeasuredBps:F0} B/s");
+            return await Download(downloadRequest, pause, cancelToken).ConfigureAwait(false);
+        }
+        // 🚨🚨 2026-11-07 修「主动暂停/删除却刷几十条 [critical] 分片 N 发生致命错误」：
+        //   取消时 HTTP 层抛的可能是 WebException / IOException，不是 TaskCanceledException，
+        //   会穿过上面两个具体的 catch 落到最下面的兜底 catch，被打成「致命错误」并 throw。
+        //   175 条连接同时取消 = 175 条 critical 日志，纯噪音且刷屏卡顿。
+        //   正解：**任何**异常只要取消已请求，就静默重抛（不打日志、不重试、不计失败）。
+        //   放在所有 catch 之前，且用异常过滤器（when）不改变原有异常类型分发。
+        catch (Exception) when (cancelToken.IsCancellationRequested)
+        {
             throw;
         }
         catch (TaskCanceledException error) // when stream reader timeout occurred 
@@ -73,37 +106,37 @@ internal class ChunkDownloader
             // 以前不判 cancelToken，用户点暂停/取消时这一片会被当成超时去重试
             // （还要吃 150ms~5s 的指数退避 + 重新握手），表现就是「点了取消还在跑」。
             if (cancelToken.IsCancellationRequested) throw;
-            _logger?.LogError(error, $"Task Canceled on download chunk {Chunk.Id} with retry");
+            _logger?.LogError(error, $"分片 {Chunk.Id} 读取超时，准备重试");
             return await ContinueWithDelay(downloadRequest, pause, cancelToken).ConfigureAwait(false);
         }
         catch (ObjectDisposedException error) // when stream reader cancel/timeout occurred 
         {
             // 同上：取消时 cancelToken 注册的 stream.Close 也会抛这个。
             if (cancelToken.IsCancellationRequested) throw;
-            _logger?.LogError(error, $"Disposed object error on download chunk {Chunk.Id} with retry");
+            _logger?.LogError(error, $"分片 {Chunk.Id} 连接被关闭，准备重试");
             return await ContinueWithDelay(downloadRequest, pause, cancelToken).ConfigureAwait(false);
         }
         catch (Exception error) when (Chunk.CanTryAgainOnFailover() && error.IsMomentumError())
         {
-            _logger?.LogError(error, $"Error on download chunk {Chunk.Id} with retry");
+            _logger?.LogError(error, $"分片 {Chunk.Id} 下载出错，准备重试");
             return await ContinueWithDelay(downloadRequest, pause, cancelToken).ConfigureAwait(false);
         }
         catch (Exception error)
         {
             // Can't handle this exception
-            _logger?.LogCritical(error, $"Fatal error on download chunk {Chunk.Id}");
+            _logger?.LogCritical(error, $"分片 {Chunk.Id} 发生致命错误");
             throw;
         }
         finally
         {
-            _logger?.LogDebug($"Exit from download method of the chunk {Chunk.Id}");
+            _logger?.LogDebug($"分片 {Chunk.Id} 下载方法退出");
             await Task.Yield();
         }
     }
 
     private async Task<Chunk> ContinueWithDelay(Request request, PauseToken pause, CancellationToken cancelToken)
     {
-        _logger?.LogDebug($"ContinueWithDelay of the chunk {Chunk.Id}");
+        _logger?.LogDebug($"分片 {Chunk.Id} 进入退避重试");
         await request.ThrowIfIsNotSupportDownloadInRange().ConfigureAwait(false);
 
         // 🚨 重试间隔必须是指数退避，不能直接等 Chunk.Timeout（2026-10-24 实测）。
@@ -252,9 +285,22 @@ internal class ChunkDownloader
         // 慢连接看门狗（aria2 --lowest-speed-limit 的等价物）。
         // 已有的 Chunk.Timeout 只抓「完全卡住」，抓不到「一直很慢但没停」的连接 ——
         // 一条 20 KB/s 的连接读满 64 KB 只要 3.2 秒，永远碰不到 15 秒读超时。
-        long lowestSpeed = _configuration.LowestSpeedLimit;
+        // 🚨🚨 2026-11-05 改：慢阈值 = max(绝对下限, 动态相对阈值)。
+        //
+        // 原来只用绝对值 LowestSpeedLimit(16KB/s)。用户把并发开到 256/512 时，
+        // 带宽摊到每条连接必然低于 16KB/s（实测 512 路 ≈ 10KB/s），
+        // 于是**几乎所有连接同时被判慢** → 重连风暴 → 吞吐周期性塌陷。
+        // 用户日志里那条 `10239 B/s` 正好落在阈值下方，就是这个原因。
+        //
+        // 现在叠加「本任务平均单连接速度 × 0.5」（对齐 refs/YunX 的 avgPerConn/2）：
+        //   · 并发高、单连接普遍慢时，阈值跟着降 → 不再全员误判；
+        //   · 个别连接真的掉队时（远低于同伴），仍然会被抓住换掉；
+        //   · 绝对下限 LowestSpeedLimit 永远兜底，防「收尾只剩一两路、平均值被自己拉低」。
+        //
+        // ⚠️ 每轮循环重新读取（而不是开头读一次）：动态阈值由监控任务周期更新，
+        //    读一次就固定下来的话，这条分片永远用着建连那一刻的旧阈值。
         int lowestSpeedSeconds = _configuration.LowestSpeedLimitSeconds;
-        bool speedWatchEnabled = lowestSpeed > 0 && _configuration.MaxSpeedReconnects > 0;
+        bool speedWatchEnabled = _configuration.MaxSpeedReconnects > 0;
         long speedWindowStartTicks = DateTime.UtcNow.Ticks;
         long speedWindowBytes = 0;
 
@@ -266,6 +312,40 @@ internal class ChunkDownloader
             {
                 cancelToken.ThrowIfCancellationRequested();
                 await pauseToken.WaitWhilePausedAsync().ConfigureAwait(false);
+
+                // 🚨🚨 2026-11-05 新增：检查「外部请求换连接」。
+                //
+                // PreemptRound 的监控线程会比较「这条连接 vs 同伴的速度」，
+                // 发现它掉队就置位这个标志。这里每轮读取检查一次 ——
+                // 命中就主动断流、抛 SlowReconnectException，走零退避换连接。
+                //
+                // ⚠️ 为什么放在**每轮循环开头**而不是只在慢检测窗口里：
+                //   慢检测窗口默认 10 秒才评估一次，而外部标志可能随时被置位。
+                //   每轮检查的开销只是一次 Interlocked.Exchange，可忽略。
+                //
+                // ⚠️ 上限同样受 MaxSpeedReconnects 约束：达到上限就不再响应外部请求，
+                //   否则一条被 CDN 稳定限速的连接会无限重连，把带宽全花在握手。
+                // ⚠️ 先把标志「取出来」再判断额度：
+                //   TakeExternalReconnectRequest() 是**读并清除**语义，
+                //   如果写成 `Take() && 额度够`，额度不足时标志已被清掉，
+                //   这次请求就白丢了（下次还得等监控再置一次）。
+                //   取出来再判，额度不足时也不残留脏标志。
+                if (Chunk.TakeExternalReconnectRequest())
+                {
+                    if (Chunk.SpeedReconnectCount < _configuration.MaxSpeedReconnects)
+                    {
+                        Chunk.SpeedReconnectCount++;
+                        _logger?.LogWarning(
+                            $"分片 {Chunk.Id} 被判定为掉队连接，主动换连接（第 {Chunk.SpeedReconnectCount}/"
+                            + $"{_configuration.MaxSpeedReconnects} 次），已下 {Chunk.Position}/{Chunk.Length}");
+                        stream.Close();
+                        throw new SlowReconnectException(
+                            $"chunk {Chunk.Id} preempted by external watchdog (peer-relative slow)",
+                            0);
+                    }
+                    // 额度用尽：忽略这次请求，让这条连接继续慢慢啃。
+                    // 剩余区间会由 PreemptRound 的**切片**分支摊给别的 worker。
+                }
                 byte[] buffer = new byte[_configuration.BufferBlockSize];
                 using var innerCts = CancellationTokenSource.CreateLinkedTokenSource(cancelToken);
                 innerToken = innerCts.Token;
@@ -297,6 +377,25 @@ internal class ChunkDownloader
                         if (elapsedMs >= lowestSpeedSeconds * 1000L)
                         {
                             double bps = speedWindowBytes * 1000.0 / elapsedMs;
+                            // 每轮重算有效阈值：max(绝对下限, 动态相对阈值)。
+                            // 动态值由 DownloadService 的监控任务按实时平均速度更新，
+                            // 这里现读现用，保证「并发高时阈值自动降下来」。
+                            long dynamicFloor = _configuration.DynamicSlowThresholdBps;
+                            long absoluteFloor = _configuration.LowestSpeedLimit;
+                            // 🚨🚨 2026-11-05：整体限速期间**丢掉绝对下限**，只按相对阈值判。
+                            //
+                            // 为什么：绝对下限 16KB/s 是为了抓「半死连接」。但当服务端按 IP
+                            // 整体限速时（实测阿里/UC 约 2.5MB/s 摊到 256 路 ≈ 10KB/s），
+                            // 每条连接都稳定低于 16KB/s —— 绝对下限会把**全部连接**判成慢，
+                            // 于是 151 次重连全打在同一件事上，换回来的还是 10KB/s，
+                            // 纯属把带宽烧在 TCP 握手和 HTTP 请求头上。
+                            //
+                            // 整体限速下唯一有意义的判据是「相对同伴是否掉队」：
+                            // 大家都 10KB/s 时，10KB/s 不算慢；某条掉到 2KB/s 才算慢。
+                            // 而整体限速结束（OverallSlowActive 变 false）后，绝对下限立刻回来兜底。
+                            long lowestSpeed = _configuration.OverallSlowActive && dynamicFloor > 0
+                                ? dynamicFloor
+                                : Math.Max(absoluteFloor, dynamicFloor);
                             // 剩余量太少就不值得重连：重连要付 TCP+TLS 握手和
                             // 重发请求头的代价（实测 200~600ms）。
                             // 🚨 判据必须按「时间」而不是「字节数」：
@@ -313,12 +412,16 @@ internal class ChunkDownloader
                                     $"分片 {Chunk.Id} 速度 {bps:F0} B/s 低于下限 {lowestSpeed} B/s，" +
                                     $"主动断开重连（第 {Chunk.SpeedReconnectCount}/{_configuration.MaxSpeedReconnects} 次），" +
                                     $"已下 {Chunk.Position}/{Chunk.Length}，剩余 {Chunk.EmptyLength}");
-                                // 关流后抛 TaskCanceledException，命中 Download 里既有的
-                                // catch (TaskCanceledException) → ContinueWithDelay 分支，
-                                // 从而复用指数退避、FailoverCount 和 Range 续传逻辑。
+                                // 🚨🚨 2026-11-05 改：抛**专用异常**，不再抛 TaskCanceledException。
+                                //   原来复用它 → 被 Download() 里「读超时也重试」的分支接住 →
+                                //   走 ContinueWithDelay → 干等指数退避 + 吃掉 FailoverCount
+                                //   + 永久放大 Chunk.Timeout。三者叠加让「换连接」变得比不换还慢。
+                                //   现在由 Download() 单独 catch：立即重连、零退避、不消耗任何预算。
+                                //   已写字节全部保留（Chunk.Position 不动），重连从断点续传。
                                 stream.Close();
-                                throw new TaskCanceledException(
-                                    $"ReadAsync of the chunk {Chunk.Id} stream was too slow ({bps:F0} B/s) and has been reconnected");
+                                throw new SlowReconnectException(
+                                    $"分片 {Chunk.Id} 读取速度过慢（{bps:F0} B/s），已重新连接",
+                                    bps);
                             }
 
                             // 无论判不判慢，都开新窗口继续观察
@@ -331,18 +434,18 @@ internal class ChunkDownloader
         }
         catch (ObjectDisposedException exp) // When closing stream manually, ObjectDisposedException will be thrown
         {
-            _logger?.LogError(exp, $"ReadAsync of the chunk {Chunk.Id} stream was canceled or closed forcibly from server");
+            _logger?.LogError(exp, $"分片 {Chunk.Id} 的连接被服务端关闭或强制取消");
             cancelToken.ThrowIfCancellationRequested();
             if (innerToken?.IsCancellationRequested == true)
             {
-                _logger?.LogError(exp, $"ReadAsync of the chunk {Chunk.Id} stream has been timed out");
-                throw new TaskCanceledException($"ReadAsync of the chunk {Chunk.Id} stream has been timed out", exp);
+                _logger?.LogError(exp, $"分片 {Chunk.Id} 读取超时");
+                throw new TaskCanceledException($"分片 {Chunk.Id} 读取超时", exp);
             }
 
             throw; // throw origin stack trace of exception 
         }
 
-        _logger?.LogDebug($"ReadStream of the chunk {Chunk.Id} completed successfully");
+        _logger?.LogDebug($"分片 {Chunk.Id} 数据流读取完成");
     }
 
     private void OnDownloadProgressChanged(DownloadProgressChangedEventArgs e)

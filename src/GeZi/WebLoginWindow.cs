@@ -78,6 +78,16 @@ namespace GeZi
         /// <para>true = 登新账号；false = 自动续期（必须保留会话）。</para>
         /// </summary>
         private readonly bool _clearSessionOnStart;
+
+        /// <summary>
+        /// 2026-11-04：打开时导航到的**自定义地址**。null = 用默认登录页。
+        /// <para>
+        /// 用途：用户要求「注册账号 → 软件内注册」必须打开**指定的分享链接**，
+        /// 而不是各网盘首页/登录页。
+        /// </para>
+        /// </summary>
+        private readonly string _startUrl;
+
         private Button _manualBtn;
         // 🚨 2026-11-03：「换账号」按钮已从界面删除（用户要求），
         //   _switchBtn 字段随之移除。SwitchAccountAsync 里那几处引用已改成无操作，
@@ -120,13 +130,20 @@ namespace GeZi
         /// 清了 Cookie 这个机制会 100% 失效，用户会看到「凭证已保存但一直用不了」。
         /// </para>
         /// </param>
+        /// <param name="startUrl">
+        /// 2026-11-04 新增：打开时导航到的自定义地址；null = 用默认登录页。
+        /// <para>
+        /// 注册流程用它打开用户指定的分享链接（见 MainWindow.QrLogin 的 RegisterUrlFor）。
+        /// </para>
+        /// </param>
         public WebLoginWindow(PanKind kind, Action<string> onCaptured, Action<string> log,
-            bool clearSessionOnStart = false)
+            bool clearSessionOnStart = false, string startUrl = null)
         {
             _kind = kind;
             _onCaptured = onCaptured;
             _log = log;
             _clearSessionOnStart = clearSessionOnStart;
+            _startUrl = startUrl;
 
             Title = PanUrlParser.DisplayNameOf(kind) + " 登录";
             // 与其它弹窗统一：自绘标题栏 + 主题背景 + 主题字体。
@@ -304,7 +321,9 @@ namespace GeZi
                 }
 
                 _web.Visibility = Visibility.Visible;
-                _web.CoreWebView2.Navigate(LoginUrlFor(_kind));
+                // 2026-11-04：有自定义地址就用它（注册流程），否则用默认登录页。
+                string startUrl = string.IsNullOrEmpty(_startUrl) ? LoginUrlFor(_kind) : _startUrl;
+                _web.CoreWebView2.Navigate(startUrl);
 
                 StartPolling();
             }
@@ -665,12 +684,11 @@ namespace GeZi
             _diagLogged = true;
             try
             {
-                string keys = await DescribeStorageAsync();
-                if (!string.IsNullOrWhiteSpace(keys))
-                {
-                    _log?.Invoke("[登录] " + PanUrlParser.DisplayNameOf(_kind)
-                        + " 未找到令牌；storage：" + keys);
-                }
+                // 🚨 2026-11-07：原来把整串 storage Cookie 结构拼进日志（142 次、每行数百字符），
+                //    既是刷屏噪音、拖动日志也卡，还带环境指纹。改成一句简短说明；
+                //    DescribeStorageAsync 仍保留供调试断点查看，只是不再写进界面日志。
+                _log?.Invoke("[登录] " + PanUrlParser.DisplayNameOf(_kind)
+                    + " 未找到令牌，请点「登录账号」重新登录。");
             }
             catch
             {

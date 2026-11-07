@@ -43,6 +43,13 @@ public class DownloadProgressChangedEventArgs : EventArgs
     public double BytesPerSecondSpeed { get; internal set; }
 
     /// <summary>
+    /// 🚨 2026-11-07：界面展示用的平滑速度（5 秒滑动平均）。
+    /// 原 <see cref="BytesPerSecondSpeed"/> 仍是瞬时值，限速判定继续用它，语义不变。
+    /// 未设置时取 0，调用方回落到瞬时值（等价）。
+    /// </summary>
+    public double DisplaySpeed { get; internal set; }
+
+    /// <summary>
     ///     Average download speed
     /// </summary>
     public double AverageBytesPerSecondSpeed { get; internal set; }

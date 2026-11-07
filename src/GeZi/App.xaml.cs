@@ -68,6 +68,37 @@ namespace GeZi
         internal static Action<string, bool> LogSink;
 
         /// <summary>
+        /// startup-error.log 的体积上限（256 KB）。
+        /// 超过就只保留最后一半 —— 一个反复崩溃的进程能把这个文件写到几十 MB，
+        /// 而诊断包导出只读最后 400 行，前面那些早就没用了。
+        /// </summary>
+        private const long FatalLogMaxBytes = 256L * 1024;
+
+        /// <summary>
+        /// 追加写并做体积滚动。
+        /// <para>
+        /// 🚨 保留最后一半而不是清空：清空会把「第一次崩溃」的现场一起抹掉，
+        /// 而循环崩溃时第一次往往才是有线索的那次。
+        /// </para>
+        /// <para>任何 I/O 异常都往外抛，由调用方的 try/catch 兜住 —— 写崩溃日志本身绝不能引发新崩溃。</para>
+        /// </summary>
+        private static void AppendRolling(string path, string text, long maxBytes)
+        {
+            var fi = new System.IO.FileInfo(path);
+            if (fi.Exists && fi.Length > maxBytes)
+            {
+                // 只留后一半（按字节截断可能切断多字节字符，这里按行保留）
+                string all = System.IO.File.ReadAllText(path);
+                int keep = all.Length / 2;
+                int cut = all.IndexOf('\n', keep);
+                if (cut > 0 && cut + 1 < all.Length)
+                    all = all.Substring(cut + 1);
+                System.IO.File.WriteAllText(path, all);
+            }
+            System.IO.File.AppendAllText(path, text);
+        }
+
+        /// <summary>
         /// 启动期崩溃日志。写在 exe 同目录的 startup-error.log。
         /// 为什么需要：XAML 解析错误发生在 MainWindow 构造里，
         /// 此时 DispatcherUnhandledException 的弹窗可能还没来得及显示，
@@ -79,9 +110,10 @@ namespace GeZi
             {
                 string path = System.IO.Path.Combine(
                     AppDomain.CurrentDomain.BaseDirectory, "startup-error.log");
-                System.IO.File.AppendAllText(path,
+                AppendRolling(path,
                     DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + "  [" + where + "]\r\n"
-                    + ex + "\r\n\r\n");
+                    + ex + "\r\n\r\n",
+                    FatalLogMaxBytes);
             }
             catch { }
 

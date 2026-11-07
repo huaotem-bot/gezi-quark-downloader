@@ -100,13 +100,37 @@ namespace GeZi.Providers.Uc
         /// API 调用 UA：伪装成 UC 网盘 PC 客户端。
         /// 与夸克同理 —— 取链与下载必须用同一身份，否则 CDN 会判定为盗链。
         /// </summary>
-        public const string ApiUa =
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
-            "(KHTML, like Gecko) uc-cloud-drive/2.5.20 Chrome/100.0.4896.160 " +
-            "Electron/18.3.5.4-b478491100 Safari/537.36 Channel/pckk_other_ch";
+        /// <summary>
+        /// ⚠️ Channel 必须是 <c>ucpan_other_ch</c>（UC 自己的渠道），
+        /// 原来写成夸克的 <c>pckk_other_ch</c> 会自证「不是 UC 客户端」。
+        /// 取值与 <see cref="GeZi.Core.Support.PanClientProfile"/> 的 UC 档案一致。
+        /// </summary>
+        public static string ApiUa
+        {
+            get { return GeZi.Core.Support.PanClientProfile.For(GeZi.Core.Api.PanKind.Uc).ApiUserAgent; }
+        }
 
         /// <summary>下载直链 UA，必须与 <see cref="ApiUa"/> 同族。</summary>
-        public const string DlUa = ApiUa;
+        public static string DlUa
+        {
+            get { return GeZi.Core.Support.PanClientProfile.For(GeZi.Core.Api.PanKind.Uc).DownloadUserAgent; }
+        }
+
+        /// <summary>
+        /// UC 客户端的 Sec-CH-UA 值。refs/LinkSwift 与 refs/YunX 两家都给 UC 下发这个头；
+        /// 缺它是「非浏览器/非客户端」的明显特征。值必须与 UA 里的 Chromium/100 对齐。
+        /// </summary>
+        public static string SecChUa
+        {
+            get
+            {
+                return GeZi.Core.Support.PanClientProfile.For(GeZi.Core.Api.PanKind.Uc)
+                    .CommonHeaders["Sec-Ch-Ua"];
+            }
+        }
+
+        /// <summary>取链 URL 用的客户端版本号（sys=win32&amp;ve=1.8.8）。</summary>
+        public const string ClientVersion = "1.8.8";
 
         /// <summary>
         /// 网页端 UA：只有 <c>drive.uc.cn/account/info</c> 认它。

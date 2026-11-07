@@ -127,14 +127,14 @@ public static class DiskMedia
     }
 
     /// <summary>
-    /// 给出该路径推荐的落盘策略：
-    /// 固态盘 → <see cref="StorageMode.Shared"/>（无合并、写完即完）；
-    /// 机械盘 / 探测失败 → <see cref="StorageMode.Sequential"/>（全程顺序 I/O）。
+    /// 给出该路径推荐的落盘策略。
+    /// <para>🚨 2026-11-07：恒定返回 <see cref="StorageMode.Shared"/>。
+    /// 机械盘友好不由「换落盘模型」实现，而由共写侧的大批量写合并
+    /// （hdd 判定 → 512 包 / 64 MB 一批）+ 降低并发共同完成，这本来就是共写已有的能力。</para>
     /// </summary>
     public static StorageMode RecommendedModeForPath(string path)
     {
-        DiskMediaKind kind = DetectForPath(path);
-        return kind == DiskMediaKind.Ssd ? StorageMode.Shared : StorageMode.Sequential;
+        return StorageMode.Shared;
     }
 
     /// <summary>清空缓存（切换目标盘或用户手动改设置时用）。</summary>

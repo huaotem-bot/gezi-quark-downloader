@@ -742,6 +742,34 @@ namespace GeZi
         [DataMember(Order = 24)] public string ResumeHint { get; set; }
 
         /// <summary>
+        /// 任务创建时刻（本地时间 ticks，UTC 基准的 DateTime.Ticks + 本地偏移已折算）。
+        ///
+        /// <para>
+        /// 2026-11-05 新增：续传界面按「今天 / 昨天 / 更早」分组用。
+        /// 记的是**任务入队时刻**，不是「最后一次保存快照的时刻」——
+        /// 后者在 .geziresume 的 <c>saved</c> 行里，一个下了三天的任务它永远显示今天。
+        /// </para>
+        /// <para>
+        /// 用 <c>long</c> 而不是 <c>DateTime</c>：DataContractJsonSerializer 对
+        /// DateTime 的序列化格式在不同运行时下不稳定，ticks 是纯数字最可靠。
+        /// 旧记录缺这个字段 → 反序列化得 0，界面归到「更早」，不会误判成今天。
+        /// </para>
+        /// </summary>
+        [DataMember(Order = 25)] public long CreatedAtTicks { get; set; }
+
+        /// <summary>按本地日期返回分组标签。判据只在 Core 的 PendingDateGroup 里有一份。</summary>
+        public string DateGroupLabel()
+        {
+            return GeZi.Core.Support.PendingDateGroup.Label(CreatedAtTicks);
+        }
+
+        /// <summary>分组排序键。判据只在 Core 的 PendingDateGroup 里有一份。</summary>
+        public int DateGroupOrder()
+        {
+            return GeZi.Core.Support.PendingDateGroup.Order(CreatedAtTicks);
+        }
+
+        /// <summary>
         /// 解析出**真正**的来源类型（兼容旧记录）。
         /// <para>
         /// 旧记录 <see cref="Source"/> 恒为 0，必须从 FromShare + PanKindValue 推导：

@@ -404,31 +404,51 @@ namespace GeZi
         // 抽成静态方法是因为续传那条路原来**一个头都没设**，用的是夸克默认值 ——
         // 阿里续传必 400、迅雷必 403、UC 必 403（实测同类症状）。
 
-        /// <summary>按网盘取下载 Referer（null = 下载器默认的夸克 Referer）。</summary>
+        /// <summary>
+        /// 按网盘取下载 Referer。四家都从 <see cref="PanClientProfile"/> 取，
+        /// 不再只给 UC 特殊处理 —— 阿里/迅雷/夸克原来落到 null（回退成夸克默认值），
+        /// 与它们取链时带的头不一致。
+        /// </summary>
         internal static string DownloadRefererFor(PanKind kind)
         {
-            if (kind == PanKind.Aliyun) return AliyunConstants.DownloadReferer;
-            if (kind == PanKind.Xunlei) return XunleiConstants.Referer;
-            // UC 必须给 UC 自己的 Referer。原来这里落到 null，下载器就回退成
-            // QuarkConstants.Referer（https://pan.quark.cn/），而 UC 直链在
-            // drive.uc.cn 的防盗链白名单里 —— 带夸克 Referer 一律 403，
-            // 兜底重试再用夸克头撞一次就是 412。这就是「UC 进了任务也下不了」的根因。
-            if (kind == PanKind.Uc) return UcConstants.Referer;
-            return null;   // 夸克：沿用下载器默认值
+            return PanClientProfile.For(kind).Referer;
         }
 
 
-        /// <summary>按网盘取下载 User-Agent（null = 下载器默认的夸克 UA）。</summary>
+        /// <summary>按网盘取下载 User-Agent（与取链同族同版本）。</summary>
         internal static string DownloadUserAgentFor(PanKind kind)
         {
-            return kind == PanKind.Uc ? UcConstants.DlUa : null;
+            return PanClientProfile.For(kind).DownloadUserAgent;
         }
 
 
-        /// <summary>按网盘取下载 Origin（null = 下载器默认值）。</summary>
+        /// <summary>按网盘取下载 Origin。</summary>
         internal static string DownloadOriginFor(PanKind kind)
         {
-            return kind == PanKind.Uc ? UcConstants.Origin : null;
+            return PanClientProfile.For(kind).Origin;
+        }
+
+
+        /// <summary>
+        /// 按网盘取下载数据面的**额外请求头**（Sec-Ch-Ua / Sec-Fetch-* / Accept-Language 等）。
+        ///
+        /// <para>
+        /// 🚨🚨 2026-11-05：原来下载层只有 UA / Referer / Origin / Cookie 四个头，
+        /// 而取链层带了完整浏览器头 —— 身份自相矛盾。UC 对非会员账号的视频
+        /// 下发「请使用 UC 浏览器播放」引导流（固定 15,340,287 字节），与这个缺口相关。
+        /// </para>
+        /// <para>
+        /// 这些头会经 RequestConfiguration.Headers → ChunkDownloader.ExtraHeaders
+        /// 透传到数据面，无需改动下载引擎。
+        /// </para>
+        /// </summary>
+        internal static Dictionary<string, string> DownloadExtraHeadersFor(PanKind kind)
+        {
+            var d = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            PanClientProfile.ApplyHeaders(kind, d);
+            // Cookie / Origin / Accept / User-Agent 由调用方单独设置，别在这里重复。
+            d.Remove("Cookie");
+            return d;
         }
 
 
@@ -436,6 +456,35 @@ namespace GeZi
         internal static bool DownloadUseOpenSslFor(PanKind kind)
         {
             return kind == PanKind.Uc;
+        }
+
+
+        /// <summary>
+        /// 2026-11-04：拼「源文件指纹」，写进 .geziresume，用于识别
+        /// 「同一目标路径换成了另一个源文件」。
+        /// <para>
+        /// 🚨 为什么需要：续传状态是按**目标路径**定位的（PartsPaths.ResolvePaths 只看 dest），
+        /// 而 PathUtil.UniquePath 会把同名文件落成「名称 (1)」。
+        /// 真实事故：用户先下夸克的「示例视频」(15,340,287 字节)，
+        /// 之后从 UC 网盘下**同名**的另一个文件 (186,678,707 字节)，
+        /// 新任务命中旧路径的续传状态 → 拿旧进度续新文件。
+        /// </para>
+        /// <para>
+        /// 为什么不靠 ETag：那是服务端给的，CDN 不回 / 探测超时 / 走 OpenSSL 桥时都会缺失，
+        /// 缺失时校验被静默跳过 —— 所以这里用**本地必然有值**的三元组。
+        /// </para>
+        /// </summary>
+        /// <param name="size">源文件字节数（网盘接口给的，0 表示未知）。</param>
+        /// <param name="panKind">源文件所在网盘（PanKind 的整数值）。</param>
+        /// <param name="fid">源文件在网盘上的 fid（为空则退回只用前两项）。</param>
+        /// <remarks>
+        /// 实现放在 <see cref="GeZi.Core.Support.SourceKey"/>（Core 层），
+        /// 因为**自检项目不引用 WPF 主项目**，放这里它测不到。
+        /// 这里只做一层转发，保证 UI 侧调用点不用改。
+        /// </remarks>
+        internal static string BuildSourceKey(long size, int panKind, string fid)
+        {
+            return GeZi.Core.Support.SourceKey.Build(size, panKind, fid);
         }
 
 
@@ -920,17 +969,25 @@ namespace GeZi
                 // 统一交给 AttachWindowHooks（订阅在构造函数里，走 SourceInitialized）。
             };
 
-            // 启动自动登录：先看上次用的是哪家（ActivePanKind），
+            // 启动自动登录：**先看上次浏览的是哪一家**（LastBrowsePanKind），
+            // 没记过（-1，首次升级的用户）再退回 ActivePanKind 的旧逻辑；
             // 那家没凭证就按固定顺序找一家有凭证的（夸克 → UC → 阿里 → 迅雷）。
             // ⚠️ 顺序不能乱：旧版本只认识夸克/UC，用户升级后旧 Cookie 仍在，
             //    所以这两家必须排在前面，保持"升级后行为不变"。
             {
-                var order = new List<PanKind>
-                {
-                    _settings.ActivePanKind == (int)PanKind.Uc ? PanKind.Uc
+                // 启动时要先打开的那一家：
+                //   ① 浏览记忆优先（用户在页签里最后点的那家）
+                //   ② 没记过就退回「上次登录身份」（旧行为，逐字不变）
+                PanKind want = _settings.LastBrowsePanKind >= 0
+                    ? (PanKind)_settings.LastBrowsePanKind
+                    : (_settings.ActivePanKind == (int)PanKind.Uc ? PanKind.Uc
                         : _settings.ActivePanKind == (int)PanKind.Aliyun ? PanKind.Aliyun
                         : _settings.ActivePanKind == (int)PanKind.Xunlei ? PanKind.Xunlei
-                        : PanKind.Quark,
+                        : PanKind.Quark);
+
+                var order = new List<PanKind>
+                {
+                    want,
                     PanKind.Quark, PanKind.Uc, PanKind.Aliyun, PanKind.Xunlei,
                 };
 
@@ -1126,6 +1183,24 @@ namespace GeZi
         private bool _logVerbose;
 
 
+        /// <summary>
+        /// 日志**视图**落后于内存历史 <see cref="_logAll"/>（需要下一次可见时整体重建）。
+        /// <para>
+        /// 🚨🚨 2026-11-07 引入，是「日志多了界面就卡」的最终解法的一半。
+        /// 用户下载时根本不在日志页（日志在「任务」页最下方），
+        /// 但 <c>FlushLogs</c> 原来照样每 200ms 往 LogBox 里 <c>AppendText</c> ——
+        /// TextBox 带 <c>TextWrapping="Wrap"</c>，每次都要把已有的 2000 行重新测量折行。
+        /// 现在不看就不碰控件，只把这里置 true；等真正切到日志页时
+        /// 一次性 <see cref="RebuildLogBox"/> 补上，代价只有一次。
+        /// </para>
+        /// <para>
+        /// ⚠️ 所有「离开 → 回来」的路径都必须走 <see cref="MarkLogViewStaleIfHidden"/> 或
+        /// 直接置 true，绝不能让视图悄悄落后却没人重建。
+        /// </para>
+        /// </summary>
+        private bool _logViewDirty;
+
+
         /// <summary>日志攒批刷新器。见 <see cref="Log"/> 的注释。</summary>
         private System.Windows.Threading.DispatcherTimer _logFlushTimer;
 
@@ -1166,8 +1241,28 @@ namespace GeZi
         /// 日志最多活一次会话；现在窗口一收就能挂好几天，日志会**无限增长**，
         /// 既吃内存又让 TextBox 越来越卡（每次 AppendText 都要重排）。
         /// 2000 行足够回溯一次下载的完整过程，再多也没人翻。
+        /// 🚨 但**别靠调小这个数来解决卡顿**：卡顿的真因是「满额后每 200ms 全量重建一次」，
+        /// 行数调小只是让每次重建便宜一点，频率问题原封不动。
+        /// 正解见 <c>TrimSweep</c> 与 <c>TrimLogLines</c> 的注释。
         /// </remarks>
         private const int LogMaxLines = 2000;
+
+
+        /// <summary>
+        /// 日志满额后**一次腾出多少行**（批量裁剪的步长）。
+        /// <para>
+        /// 🚨🚨 2026-11-07 定稿：这是「界面日志用久了就卡」的真正解药。
+        /// 原来 <c>TrimLogLines</c> 每次只砍「超出的那几条」，砍完就无条件全量重建 ——
+        /// 而它被 <c>FlushLogs</c> 每 200ms 调一次，于是日志一满额就变成
+        /// 「每秒 5 次 × 2000 行全量拼串 + 全量折行」，且**永不停止**（永远退不回上限以下）。
+        /// </para>
+        /// <para>
+        /// 现在一次腾 <see cref="TrimSweep"/> 行 → 下次重建要等再攒够这么多条日志。
+        /// 500 行 ≈ 几千行日志的间隔，正常使用时几个月也碰不到几次；
+        /// 而代价只是日志视图里最多多留 500 行（<see cref="LogMaxLines"/> + 该值仍很小）。
+        /// </para>
+        /// </summary>
+        private const int TrimSweep = 500;
 
 
         /// <summary>定时刷容量的间隔（秒）。5 分钟，与保活心跳同频。</summary>
@@ -1493,6 +1588,17 @@ namespace GeZi
             /// <summary>右侧状态标记：不可续传时显示 ResumePolicy 给的徽章文字，否则空串。</summary>
             public string BadgeText { get; }
 
+            // ---- 2026-11-05：按日期分组（今天 / 昨天 / 更早）----
+
+            /// <summary>分组标题（界面 GroupStyle 显示这一行）。</summary>
+            public string DateGroup { get; }
+
+            /// <summary>分组排序键：今天 0 / 昨天 1 / 同年更早 2 / 跨年或未知 3。</summary>
+            public int DateGroupOrder { get; }
+
+            /// <summary>组内排序用（同一组内按创建时刻倒序，新的在上）。</summary>
+            public long CreatedAtTicks { get; }
+
             /// <summary>能否续传。委托给 <see cref="CanResumeValue"/>（ResumePolicy 的结论）。</summary>
             public bool CanResume => CanResumeValue;
 
@@ -1535,6 +1641,12 @@ namespace GeZi
                     ? ((chk.Reason ?? "") + (string.IsNullOrEmpty(chk.NextAction) ? "" : "\n\n" + chk.NextAction))
                     : null;
                 Display = FileName + size + (CanResumeValue ? "" : "   （" + (chk?.Badge ?? "不可续传") + "）");
+
+                // 2026-11-05：按「任务创建日期」分组。旧记录 CreatedAtTicks=0 → 归到「更早」，
+                // 绝不能 fallback 成今天（否则所有老任务一升级都变成"今天"）。
+                DateGroup = t != null ? t.DateGroupLabel() : "更早";
+                DateGroupOrder = t != null ? t.DateGroupOrder() : 3;
+                CreatedAtTicks = t != null ? t.CreatedAtTicks : 0;
             }
 
             /// <summary>这条任务到底能不能续传（由 ResumePolicy 判定，界面只展示）。</summary>

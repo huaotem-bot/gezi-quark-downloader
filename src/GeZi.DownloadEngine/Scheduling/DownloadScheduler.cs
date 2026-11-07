@@ -162,8 +162,15 @@ namespace GeZi.DownloadEngine
             // CurrentCount 还是初始值，会把 running 低估成 1，于是三个任务各算
             // 256/256/170，合计 682 > 512，第 3 个任务照样要等别人释放。
             // 用批次大小做分母，份额确定且合计不超过预算。
-            int planned = jobs.Count < _maxConcurrent ? jobs.Count : _maxConcurrent;
-            if (planned < 1) planned = 1;
+            // 🚨🚨 2026-11-07 修「单文件下载吃不满线程（长期钉在 ~170 路）」：
+            //   planned 原来是「本批入队文件数」，但取链是顺次入队的，一个批次里
+            //   可能登记了 3 个任务、实际只跑 1 个。分母按 3 算 → share=512/3≈170、
+            //   softCap=340，再叠加「超出 16 条只拿空闲额度」的循环，
+            //   单任务实际只能拿到 ~170 条租约（日志实测在飞 163~177）。
+            //   用户填 256 甚至 512 都吃不满 —— 这不是服务端限速，是这里的分母。
+            //   修法：**单文件批次按 1 算分母**，让 share=512、softCap 不再压它；
+            //   多任务（≥2）保持原有均分逻辑不变（已实测的预算分配不回退）。
+            int planned = GeZi.Core.Support.DownloadSizing.PlannedConcurrency(jobs.Count, _maxConcurrent);
             var tasks = jobs.Select(job => RunOneAsync(job, _sem, planned, progress, globalCancel)).ToArray();
             await Task.WhenAll(tasks).ConfigureAwait(false);
         }
@@ -339,8 +346,13 @@ namespace GeZi.DownloadEngine
                     want = softCap;
                 }
 
+                // 🚨 2026-11-07：把「申请值 / 实际拿到值」记下来（纯日志、零行为）。
+                //    用户问「吃不满线程」时，这条能直接区分：
+                //      · leased ≈ want → 客户端开满了，慢是服务端配额；
+                //      · leased ≪ want → 客户端被预算/分母卡住，需查这里。
                 // 保底 16 条阻塞拿（保证任务能开始）；超出部分只拿空闲额度，绝不空等。
                 // 否则又会出现「第 3 个任务永远轮不到」的情况。
+                int wantedLease = want;
                 for (int i = 0; i < want; i++)
                 {
                     if (i < MinPerFileThreads)
@@ -353,6 +365,10 @@ namespace GeZi.DownloadEngine
                         break;
                     leased++;
                 }
+
+                if (Log != null)
+                    Log("[并发] 连接租约：申请 " + wantedLease + "，实得 " + leased
+                        + "（总预算 " + ThreadAllocator.DefaultBudget + "，同批计划 " + plannedConcurrency + " 个任务）");
 
                 using (var linked = CancellationTokenSource.CreateLinkedTokenSource(globalCancel, job.Cancel.Token))
                 {

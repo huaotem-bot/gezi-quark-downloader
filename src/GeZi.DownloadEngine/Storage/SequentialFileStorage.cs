@@ -103,6 +103,29 @@ public sealed class SequentialFileStorage : IChunkStorage
             }
 
             _flushed = flushed;
+
+            // 🚨🚨 2026-11-06：把文件长度裁到「已可信的连续前缀」。
+            //
+            // 老文件可能是**共写模式下预分配成满尺寸**的（用户切换过落盘方式、
+            // 或续传状态来自旧版本），长度 45MB 但真实有效数据只有 0.6MB。
+            // 不裁的话：
+            //   ① FileInfo.Length 骗人 —— 播放器/进度判断看到 45MB 以为下完了；
+            //   ② 顺序写的 _flushed 从 0.6MB 往后长，写满后文件长度还是 45MB，
+            //      完成时的长度硬校验永远「相等」，拦不住假完成。
+            // 裁掉的部分正是 ApplyResume 按安全余量要求**重下覆盖**的区域，
+            // 与分片表语义完全一致，不会丢有效数据。
+            // ⚠️ 仅在顺序写（本类）里做，共写一行不动。
+            try
+            {
+                if (_file.Length != flushed)
+                    _file.SetLength(flushed);
+            }
+            catch (Exception ex)
+            {
+                // 截断失败不能让整个续传崩掉：退回到「不裁」，靠外层长度校验兜底。
+                System.Diagnostics.Debug.WriteLine(
+                    "[顺序落盘] 续传截断到可信前缀失败：" + ex.Message);
+            }
         }
         else
         {
@@ -183,12 +206,28 @@ public sealed class SequentialFileStorage : IChunkStorage
             //    正确做法是一直等（数据留在网络侧，由 TCP 反压），直到有空间或被取消。
             await Task.Delay(10).ConfigureAwait(false);
             waited += 10;
-            if (waited > 0 && waited % 30000 == 0)
+            if (waited > 0 && waited % 10000 == 0)
             {
-                // 每 30 秒留一条诊断痕迹，便于排查「卡住」到底是慢连接还是死锁
+                // 2026-11-05：把「最早缺口位置」也打出来 —— 这是区分
+                // 「头部慢片没到（队头阻塞）」与「真死锁」的关键信息。
+                // ⚠️ 只加诊断，绝不在这里抛异常或丢数据：窗口满是正常背压
+                //    （见上面 2026-10-24 的教训）。头部优先机制会主动去把缺口补上。
+                // 间隔从 30 秒缩到 10 秒：用户感知的「卡住」往往就几秒。
+                long earliestGap = -1;
+                // ⚠️ SortedDictionary 不是线程安全的，读 Keys 必须与
+                //    TryFlushDrain 的增删共用 _gate，否则会抛集合被修改的异常。
+                try
+                {
+                    lock (_gate)
+                    {
+                        foreach (long pos in _pending.Keys) { earliestGap = pos; break; }
+                    }
+                }
+                catch { }
                 System.Diagnostics.Debug.WriteLine(
                     "[SequentialFileStorage] 窗口已满 " + (waited / 1000) + " 秒，已刷盘 "
-                    + _flushed + " 字节，待写 " + _pendingBytes + " 字节");
+                    + _flushed + " 字节，待写 " + _pendingBytes + " 字节，最早待写偏移 "
+                    + earliestGap + "（若为 " + _flushed + " 之外的值，即头部缺口未到）");
             }
         }
 

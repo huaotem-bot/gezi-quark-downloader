@@ -63,6 +63,26 @@ public sealed class ResumeState
     /// </summary>
     public string Validator { get; set; } = "";
 
+    /// <summary>
+    /// 2026-11-04 新增：这条续传状态**属于哪个源文件**的指纹。
+    /// <para>
+    /// 事故背景：`.geziresume` 是按**目标路径**定位的（PartsPaths.ResolvePaths 只看 dest）。
+    /// 用户先下夸克的「示例视频」（15,340,287 字节），之后从 UC 网盘下**同名**的
+    /// 另一个文件（186,678,707 字节），UniquePath 把它落成「示例视频 (1)」——
+    /// 只要长度碰巧相同，引擎就会拿旧进度续新文件，拼出「长度对、内容坏」的成品。
+    /// </para>
+    /// <para>
+    /// 光靠 Validator 不够：它是**服务端**给的，CDN 不回 ETag、
+    /// 探测超时、走 OpenSSL 桥时响应头缺失，都会让它变成空串 —— 那时旧状态就会被无条件采信。
+    /// </para>
+    /// <para>
+    /// 这个字段是**本地**算的、必然存在的指纹：文件总长 + 网盘类型 + 源文件 Fid。
+    /// 三者任一不同 → 判定「不是同一个源文件」→ 整份续传作废、从零重下。
+    /// 空串表示旧版本写的状态（没有这个字段），此时退回按 TotalBytes 判。
+    /// </para>
+    /// </summary>
+    public string SourceKey { get; set; } = "";
+
     public ResumeChunk[] Chunks { get; set; } = new ResumeChunk[0];
 
     public DateTime SavedAtUtc { get; set; } = DateTime.UtcNow;

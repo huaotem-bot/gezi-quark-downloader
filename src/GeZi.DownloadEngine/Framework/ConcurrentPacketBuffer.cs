@@ -203,7 +203,7 @@ internal class ConcurrentPacketBuffer<T> : IReadOnlyCollection<T>, IDisposable w
     {
         if (BufferSize < packetSize * Count)
         {
-            _logger?.LogDebug($"ConcurrentPacketBuffer: Stop writing packets to the queue on size {packetSize * Count}bytes until the memory is free");
+            _logger?.LogDebug($"写缓冲已达 {packetSize * Count} 字节，暂停入队等待内存释放");
             StopAdding();
         }
     }
@@ -246,13 +246,13 @@ internal class ConcurrentPacketBuffer<T> : IReadOnlyCollection<T>, IDisposable w
 
     public void StopAdding()
     {
-        _logger?.LogDebug("ConcurrentPacketBuffer: stop writing new items to the list by blocking writer threads");
+        _logger?.LogDebug("写缓冲已满，暂停接收新数据");
         _addingBlocker.Pause();
     }
 
     public void ResumeAdding()
     {
-        _logger?.LogDebug("ConcurrentPacketBuffer: resume writing new item to the list");
+        _logger?.LogDebug("写缓冲已腾出空间，恢复接收新数据");
         _addingBlocker.Resume();
     }
 

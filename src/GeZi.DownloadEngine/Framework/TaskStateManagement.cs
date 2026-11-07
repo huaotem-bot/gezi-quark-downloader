@@ -59,7 +59,7 @@ public class TaskStateManagement
     internal void CancelState() => Status = TaskStatus.Canceled;
     internal void SetException(Exception exp, [CallerMemberName] string callerName = null)
     {
-        Logger?.LogCritical(exp, $"TaskStateManagement: SetException catch an exception on {callerName}");
+        Logger?.LogCritical(exp, $"任务状态记录在 {callerName} 处捕获到异常");
         Status = TaskStatus.Faulted;
         _exceptions.Enqueue(exp);
         Exception = new AggregateException(_exceptions);

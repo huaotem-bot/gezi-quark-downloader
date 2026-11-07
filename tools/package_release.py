@@ -34,7 +34,15 @@ import zipfile
 REQUIRED_BINARIES = [
     "GeZi.exe",
     "GeZi.exe.config",
+    # 🚨 五层架构（2026-10-24 重构）之后的**全部托管程序集**。
+    # 原来这里只列了 GeZi.Core.dll —— 而 GeZi.exe 现在依赖另外三个：
+    #   GeZi.Application / GeZi.DownloadEngine / GeZi.Providers
+    # 少任何一个都会在启动瞬间抛 FileNotFoundException，
+    # 而打包脚本**不会报错**（它只检查列表里的文件在不在）。
     "GeZi.Core.dll",
+    "GeZi.Application.dll",
+    "GeZi.DownloadEngine.dll",
+    "GeZi.Providers.dll",
 ]
 
 OPTIONAL_BINARIES = [
@@ -53,11 +61,24 @@ OPTIONAL_BINARIES = [
     "WebView2Loader.dll",
 ]
 
-# 符号文件：报告里明确要求「发布包带 PDB」，便于用户回报崩溃栈。
-SYMBOL_FILES = [
-    "GeZi.pdb",
-    "GeZi.Core.pdb",
-]
+# 🚨🚨 2026-11-04：**发布包不再带 PDB**。
+#
+# 原来这里列了 PDB，理由是「便于用户回报崩溃栈」。但实测打包后审计发现：
+#   PDB 里有一段 SourceLink 的 JSON：
+#     {"documents":{"C:\\Users\\<用户名>\\Desktop\\...\\repo\\*":
+#                    "https://raw.githubusercontent.com/..."}}
+#   **它是磁盘上的真实绝对路径**，会把编译机的用户名和目录结构一起发给用户。
+#
+# 为什么 PathMap 挡不住：
+#   PathMap 改的是「编译期写进 PDB 的文档路径」，
+#   而 SourceLink 的 documents 表是**另外生成的**（键 = 源码在磁盘上的位置），
+#   两者不是同一份数据。实测加了解决方案级 PathMap + 完整 Rebuild，
+#   documents 表里依然是 C:\\Users\\dove\\... —— 挡不住。
+#
+# 权衡：不带 PDB 后，用户回报的崩溃栈会少行号。
+# 但**隐私 > 调试便利** —— 用户名和目录结构属于用户信息，不该进发布包。
+# 需要符号时，作者本地的 bin 目录里一直都有（.pdb 只是不打进 zip）。
+SYMBOL_FILES = []
 
 DOC_FILES = [
     "LICENSE",
@@ -160,6 +181,41 @@ def main() -> int:
         ok &= collect(stage_files, repo_root, name, required=False)
 
     if not ok:
+        return 1
+
+    # 🚨🚨 敏感文件防线（2026-11-04 新增）。
+    # 白名单机制本身就不会带上它们，但白名单是**人维护的列表** ——
+    # 哪天有人往 REQUIRED/OPTIONAL 里加了一个通配或误加名字，
+    # 用户的登录 Cookie / 下载历史就会被打进发布包。
+    # 这里做一次**硬校验**：一旦命中就中止打包，宁可失败也不泄露。
+    FORBIDDEN = [
+        "GeZi.config.xml",      # 登录态（DPAPI 加密的 Cookie / 令牌）
+        "GeZi.state.json",      # 下载历史 + 未完成任务
+        "GeZi.cleanup.txt",     # 转存副本清理登记
+        "GeZi.log",             # 运行日志（含账号昵称、直链）
+    ]
+    FORBIDDEN_PREFIX = [
+        "accounts/",            # 账号档案目录
+        "accounts\\",
+        "webview2-data/",       # 内嵌浏览器的 Cookie/缓存
+        "webview2-data\\",
+        "profile-",             # 按网盘分的 WebView2 profile
+        "Downloads/",           # 误落进构建目录的下载文件
+    ]
+    leaked = []
+    for name in stage_files.keys():
+        if name in FORBIDDEN:
+            leaked.append(name)
+            continue
+        for pref in FORBIDDEN_PREFIX:
+            if name.startswith(pref):
+                leaked.append(name)
+                break
+    if leaked:
+        log("ERROR 发布包中出现了敏感文件，已中止：")
+        for name in leaked:
+            log("        " + name)
+        log("       这些文件含登录态 / 历史 / 账号信息，绝不可打包。")
         return 1
 
     version = read_version(repo_root)

@@ -322,7 +322,9 @@ namespace GeZi
             _applyingSettings = true;
             try
             {
-                ThreadsBox.SelectedIndex = PresetToIndex(_settings.Threads);
+                // 🚨 2026-11-07：全局并发下拉已从设置页删除（只留「四网盘分别设置」按钮）。
+                //    这里不再回填任何全局线程控件；_settings.Threads 保留作为老配置回落基准，
+                //    由下方「四网盘分别设置」弹窗按各家上限给出具体值。
                 HddThreadsBox.SelectedIndex = HddPresetToIndex(_settings.HddMaxConcurrency);
                 // 2026-11-02：并发数改成下拉（1~6），索引 = 值 - 1。
                 // 老配置里可能是 8/10/64，这里夹取到 [1,6]，避免下拉没有对应项。
@@ -336,14 +338,9 @@ namespace GeZi
                 // 这里不再回填任何控件。
                 // ⚠️ 不要顺手把 PartsRoot 也清空 —— 老配置里它可能指向一个真实存在的老分片目录，
                 //    AllPartsRoots() 还要靠它去扫历史 .qparts 残留（见 MainWindow.Download.cs）。
-                // 落盘方式（2026-11-03 恢复为用户可选）：0 = 顺序写，1 = 共写
-                if (StorageSequentialRadio != null && StorageSharedRadio != null)
-                {
-                    if (_settings.StorageMode == 0)
-                        StorageSequentialRadio.IsChecked = true;
-                    else
-                        StorageSharedRadio.IsChecked = true;
-                }
+                // 🚨 2026-11-07：设置页不再有落盘方式单选（用户明确「不要顺序写了」）。
+                //    这里只把旧值归一到共写，保证老配置读进来后写回去也是 1。
+                _settings.StorageMode = 1;
                 CloseActionBox.SelectedIndex = (int)_settings.OnCloseButton;
                 // 剪贴板自动解析（默认开）。注意这里**只回填控件**：真正的注册在窗口句柄
                 // 建好之后由 AttachWindowHooks→ApplyClipboardListener 做。
@@ -389,6 +386,177 @@ namespace GeZi
             ShellLaunch.Log = Log;
             // 探测本机播放器，供设置页展示 + 「打开」按钮选用
             RefreshPlayerStatus();
+        }
+
+
+        /// <summary>
+        /// 2026-11-05：「四网盘分别设置」弹窗。
+        ///
+        /// <para>
+        /// 🚨 2026-11-07：设置页的全局并发下拉已删，这里成了唯一的连接数设置入口。
+        /// 每家一个下拉，**直接显示当前生效的连接数**（没有「跟随全局」占位项）：
+        /// 没单独改过就显示按各家上限取好的默认值，改过就显示改过的值。
+        /// 选完立刻写进 Settings、走 <see cref="ApplySettings"/> 落盘并重建调度器，与其它设置项同一条路径。
+        /// 「恢复默认」把四家重置为 <c>DefaultThreadsFor</c> 的默认值。
+        /// </para>
+        /// <para>
+        /// ⚠️ 服务端硬上限（迅雷 16 / 阿里 64 / UC 256）由 <c>ThreadsFor</c> 保留，
+        /// 这里只是让用户能**调低**或按网盘区分，不能突破阈值搞挂下载。
+        /// </para>
+        /// </summary>
+        private void OnPerPanThreadsClick(object sender, RoutedEventArgs e)
+        {
+            // 🚨 2026-11-07 重做为现代简约风：
+            //   旧版是「一段长说明 + 4 行裸 Grid + 按钮行」，信息挤、层次弱。
+            //   新版：标题 + 一行短说明 + 一张 Card 包住四行（名称 / 说明 / 下拉三栏），
+            //   留白充足、颜色全部走主题资源，不手写任何色值。
+            var dlg = new Window
+            {
+                Owner = this,
+                Title = "四网盘连接数",
+                ResizeMode = ResizeMode.NoResize,
+                WindowStartupLocation = WindowStartupLocation.CenterOwner,
+            };
+            // 🚨 2026-11-07 修「下方控件被盖住不完整」：
+            //   原高度 360 的内容区放不下「标题 + 说明 + 4 行(每行34+14) + 卡片内边距 + 按钮行」，
+            //   底部按钮行被挤出可视区。加高到 440，并让卡片行(Row 2)=Star 自适应、按钮行固定在底部。
+            DialogChrome.StyleWindow(dlg, 460, 440);
+
+            var root = DialogChrome.DialogRoot();
+            root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+            root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+            root.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
+            root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+
+            var title = DialogChrome.PageTitle("四网盘连接数");
+            Grid.SetRow(title, 0);
+            root.Children.Add(title);
+
+            var hint = DialogChrome.Hint("默认已按各家服务端上限取好连接数，可单独调整；选得太高会自动降下来。", 6, 12);
+            hint.TextWrapping = TextWrapping.Wrap;
+            Grid.SetRow(hint, 1);
+            root.Children.Add(hint);
+
+            var rows = new StackPanel { Margin = new Thickness(0, 0, 0, 0) };
+            var boxes = new Dictionary<PanKind, ComboBox>();
+
+            AddPerPanRow(rows, boxes, PanKind.Quark, "夸克网盘", "按连接限速，加连接线性有效");
+            AddPerPanRow(rows, boxes, PanKind.Uc, "UC 网盘", "单 IP 总带宽约 7~8 MB/s");
+            AddPerPanRow(rows, boxes, PanKind.Aliyun, "阿里云盘", "单 IP 约 2.5 MB/s 硬限速");
+            AddPerPanRow(rows, boxes, PanKind.Xunlei, "迅雷云盘", "超过 16 条会大面积 503");
+
+            var card = DialogChrome.Card(rows);
+            Grid.SetRow(card, 2);
+            root.Children.Add(card);
+
+            // 🚨 2026-11-07：下拉里已没有「跟随全局」占位项，直接显示各家**当前生效**的连接数
+            //    （单独改过就显示改过的值，没改过就显示按各家上限取好的默认值）。
+            //    ThreadPresets = 16/32/64/128/256/512，迅雷16 / 阿里64 / UC256 / 夸克256 都能精确命中。
+            //    注意：这里先赋初值、后面才挂 SelectionChanged 事件，所以不会误触发写盘。
+            foreach (var kv in boxes)
+                kv.Value.SelectedIndex = Math.Max(0, Math.Min(ThreadPresets.Length - 1,
+                    PresetToIndex(ThreadsFor(kv.Key))));
+
+            var resetBtn = DialogChrome.SecondaryButton("恢复默认");
+            resetBtn.ToolTip = "把四家网盘的连接数恢复成按各家上限取好的默认值";
+            var okBtn = DialogChrome.PrimaryButton("完成");
+            okBtn.MinWidth = 96;
+
+            resetBtn.Click += (s2, e2) =>
+            {
+                foreach (var kv in boxes)
+                    kv.Value.SelectedIndex = Math.Max(0, Math.Min(ThreadPresets.Length - 1,
+                        PresetToIndex(DefaultThreadsFor(kv.Key))));
+            };
+            okBtn.Click += (s2, e2) => { dlg.Close(); };
+
+            var btns = DialogChrome.ButtonRow(resetBtn, okBtn);
+            btns.Margin = new Thickness(0, 14, 0, 0);
+            Grid.SetRow(btns, 3);
+            root.Children.Add(btns);
+
+            dlg.Content = root;
+
+            // 每个下拉改动都即时写盘，与主设置页「选中即生效」保持一致。
+            // 用闭包捕获 PanKind，避免循环变量被最后一项覆盖。
+            foreach (var kv in boxes)
+            {
+                PanKind kind = kv.Key;
+                ComboBox box = kv.Value;
+                box.SelectionChanged += (s2, e2) =>
+                {
+                    if (box.SelectedIndex < 0 || box.SelectedIndex >= ThreadPresets.Length) return;
+                    // 🚨 2026-11-07：没有「跟随全局」占位项了，索引直接对应档位。
+                    //    选中即写 per-pan 覆盖值（迅雷/阿里等仍会被 ThreadsFor 的上限夹住）。
+                    int val = ThreadPresets[box.SelectedIndex];
+                    WritePerPanThreads(kind, val);
+                };
+            }
+
+            dlg.ShowDialog();
+        }
+
+        /// <summary>往卡片里加一行「网盘名 + 简短说明 + 下拉」三栏（现代简约）。</summary>
+        private void AddPerPanRow(StackPanel parent, Dictionary<PanKind, ComboBox> boxes,
+            PanKind kind, string label, string hint)
+        {
+            var line = new Grid { Margin = new Thickness(0, 0, 0, 14) };
+            line.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(96) });
+            line.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            line.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(132) });
+
+            var name = new TextBlock
+            {
+                Text = label,
+                FontSize = 13,
+                FontWeight = FontWeights.SemiBold,
+                VerticalAlignment = VerticalAlignment.Center,
+            };
+            name.SetResourceReference(TextBlock.ForegroundProperty, "TextPrimaryBrush");
+            Grid.SetColumn(name, 0);
+            line.Children.Add(name);
+
+            var desc = new TextBlock
+            {
+                Text = hint,
+                FontSize = 11.5,
+                TextWrapping = TextWrapping.Wrap,
+                VerticalAlignment = VerticalAlignment.Center,
+                Margin = new Thickness(0, 0, 10, 0),
+            };
+            desc.SetResourceReference(TextBlock.ForegroundProperty, "TextTertiaryBrush");
+            Grid.SetColumn(desc, 1);
+            line.Children.Add(desc);
+
+            var box = new ComboBox
+            {
+                Height = 34,
+                Style = TryFindResource("AppComboBox") as Style,
+                ItemContainerStyle = TryFindResource("AppComboBoxItem") as Style,
+                ToolTip = hint,
+            };
+            // 🚨 2026-11-07：不再加「跟随全局」这一项 —— 设置页的全局并发下拉已删，
+            //    四家直接显示各自当前生效的默认线程数（按各家服务端上限取好）。
+            foreach (int v in ThreadPresets)
+                box.Items.Add(new ComboBoxItem { Content = v.ToString() + " 条" });
+            Grid.SetColumn(box, 2);
+            line.Children.Add(box);
+
+            boxes[kind] = box;
+            parent.Children.Add(line);
+        }
+
+        /// <summary>写一个网盘的线程覆盖值并即时落盘 + 重建调度器。</summary>
+        private void WritePerPanThreads(PanKind kind, int value)
+        {
+            switch (kind)
+            {
+                case PanKind.Uc: _settings.ThreadsUc = value; break;
+                case PanKind.Aliyun: _settings.ThreadsAliyun = value; break;
+                case PanKind.Xunlei: _settings.ThreadsXunlei = value; break;
+                default: _settings.ThreadsQuark = value; break;
+            }
+            ApplySettings();
         }
 
 
@@ -445,11 +613,14 @@ namespace GeZi
         {
             try
             {
-                int threads = SelectedThreads();
                 // 2026-11-02：下拉选择，索引 + 1 = 并发数；空选时回落默认 3。
                 int conc = ConcurrentBox.SelectedIndex >= 0 ? ConcurrentBox.SelectedIndex + 1 : 3;
 
-                _settings.Threads = threads;
+                // 🚨 2026-11-07：**不再写 `_settings.Threads`**。
+                //   全局并发下拉已删除，并发数唯一来源是 per-pan 的 ThreadsFor(PanKind)。
+                //   这里原来有 `_settings.Threads = SelectedThreads();`，
+                //   它会把这个只该当「回落基准」的字段回写成"当前生效值"，
+                //   导致 per-pan 调高永远被压回基准（夸克设 512 无效的真因之一）。
 
                 if (conc < 1) conc = 1;
                 if (conc > 6) conc = 6;   // 2026-11-02 用户要求：上限 6
@@ -470,11 +641,9 @@ namespace GeZi
                 _settings.AutoClean = AutoCleanCheck.IsChecked == true;
                 // 2026-11-01（方案 B）：输入框已删除，这里不再取值、不再改写 PartsRoot，
                 // 也不再调 RegisterPartsDirHistory（没有入口能再改它，记历史已无意义）。
-                // 🚨 2026-11-03：落盘方式恢复成**用户可选**（用户明确要求）。
-                //   原来这里恒写 1（共写），把选择权写死了。
-                //   现在读设置页的单选：0 = 顺序写（机械盘推荐），1 = 共写（默认）。
-                _settings.StorageMode = (StorageSequentialRadio != null
-                    && StorageSequentialRadio.IsChecked == true) ? 0 : 1;
+                // 🚨 2026-11-07：落盘方式固定共写（用户明确「不要顺序写了」）。
+                //    机械盘友好由共写侧的大批量写合并 + HddMaxConcurrency 自动完成。
+                _settings.StorageMode = 1;
                 // 机械盘连接上限：用户自己选档位（32~256）。固态盘任务不受影响。
                 int hddIdx = HddThreadsBox.SelectedIndex;
                 if (hddIdx < 0 || hddIdx >= HddThreadPresets.Length) hddIdx = 3;   // 默认 128
@@ -514,7 +683,12 @@ namespace GeZi
                 // 凭证可能刚被粘贴或清空 → 四张网盘卡的状态跟着变
                 RefreshPanCards();
 
-                Log(string.Format("设置已生效（单文件并发 {0} 路，同时下载 {1} 个）", threads, conc));
+                // 🚨 2026-11-07：日志改用**各网盘实际生效值**，不再报那个已被删除的全局值。
+                //    这样用户改完设置看日志就能直接核对「我设的到底生效没有」。
+                Log(string.Format(
+                    "设置已生效（并发：夸克 {0} / UC {1} / 阿里 {2} / 迅雷 {3} 路，同时下载 {4} 个）",
+                    ThreadsFor(PanKind.Quark), ThreadsFor(PanKind.Uc),
+                    ThreadsFor(PanKind.Aliyun), ThreadsFor(PanKind.Xunlei), conc));
             }
             catch (Exception ex)
             {

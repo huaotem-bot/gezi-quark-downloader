@@ -14,10 +14,33 @@ public class Bandwidth
     public double AverageSpeed { get; private set; }
     public long BandwidthLimit { get; set; }
 
+    /// <summary>
+    /// 🚨 2026-11-07：界面用的**平滑速度**（最近 5 秒滑动窗口平均）。
+    /// 原 <see cref="Speed"/> 是单秒瞬时值 —— CDN 抖动时会在 0 B/s 与 10 MB/s 之间跳，
+    /// 用户感知「一会儿快一会儿慢」。参照 refs/gopeed model.go 的 calcSpeed（5 秒窗口）。
+    /// ⚠️ 原 Speed / AverageSpeed 语义一字不改（限速判断与内部逻辑仍用原值），
+    ///    只是新增一个供界面展示的平滑值，默认等价、零行为风险。
+    /// </summary>
+    private readonly double[] _speedWindow = new double[5];
+    private int _speedWindowCount;
+    private int _speedWindowIndex;
+    public double SmoothedSpeed { get; private set; }
+
     public Bandwidth()
     {
         BandwidthLimit = long.MaxValue;
         Reset();
+    }
+
+    /// <summary>把一个 1 秒采样喂进滑动窗口，重算平滑值。</summary>
+    private void PushSpeedSample(double sample)
+    {
+        _speedWindow[_speedWindowIndex] = sample;
+        _speedWindowIndex = (_speedWindowIndex + 1) % _speedWindow.Length;
+        if (_speedWindowCount < _speedWindow.Length) _speedWindowCount++;
+        double sum = 0;
+        for (int i = 0; i < _speedWindowCount; i++) sum += _speedWindow[i];
+        SmoothedSpeed = _speedWindowCount > 0 ? sum / _speedWindowCount : 0;
     }
 
     public void CalculateSpeed(long receivedBytesCount)
@@ -34,6 +57,9 @@ public class Bandwidth
             Speed = momentSpeed;
             AverageSpeed = ((AverageSpeed * _count) + Speed) / (_count + 1);
             _count++;
+            // 🚨 2026-11-07：每个 1 秒检查点喂一次滑动窗口（5 秒平均），
+            //    界面改读 SmoothedSpeed，避免瞬时值剧烈跳动。
+            PushSpeedSample(momentSpeed);
             SecondCheckpoint();
         }
 
@@ -55,6 +81,10 @@ public class Bandwidth
         _count = 0;
         Speed = 0;
         AverageSpeed = 0;
+        for (int i = 0; i < _speedWindow.Length; i++) _speedWindow[i] = 0;
+        _speedWindowCount = 0;
+        _speedWindowIndex = 0;
+        SmoothedSpeed = 0;
     }
 
     private void SecondCheckpoint()
