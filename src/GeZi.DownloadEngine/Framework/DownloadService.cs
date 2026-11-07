@@ -1959,6 +1959,35 @@ public class DownloadService : AbstractDownloadService
                     catch (OperationCanceledException) { return; }
                 }
 
+                // 🚨🚨 2026-11-07 新增：放行后**错峰建连**（对齐 refs/YunX 的
+                //   `min(i, 8) × 25ms`，见 `DownloadManager.kt` 的 STAGGER_CAP / STAGGER_MS）。
+                //
+                // 问题：慢启动闸门是「一批一批放行」——1 → 2 → 4 → 16 → 256。
+                //   最后一跳一次放行 240 个 worker，它们**同时**发起 TCP + TLS 握手。
+                //   代价有两块：
+                //     · TLS 握手是 CPU 密集的（RSA/ECDHE），240 个同时做会把 CPU 打满，
+                //       而这段时间没有一个字节在下载；
+                //     · 绝大部分家用宽带/家宽路由的 NAT 表与 PPS 都吃不下瞬时 240 个新建，
+                //       表现为「前面速度慢、要等好几秒才爬起来」。
+                //
+                // 做法：只对前 8 个 worker 拉开 25ms 间隔（第 9 个起跟第 8 个一起走），
+                //   总延迟最多 175ms —— 相对于「爬满 512 路要 3~5 秒」可以忽略，
+                //   但足以把瞬时握手的山峰削平。
+                //   ⚠️ 上限 8 是照抄 YunX 的实测值：超过 8 之后削峰收益递减，
+                //      再拉长只会拖慢起步。
+                {
+                    const int staggerCap = 8;
+                    const int staggerMs = 25;
+                    int slots = workerIndex < staggerCap ? workerIndex : staggerCap - 1;
+                    if (slots > 0)
+                    {
+                        if (cancel.IsCancellationRequested)
+                            return;
+                        try { await Task.Delay(slots * staggerMs, cancel).ConfigureAwait(false); }
+                        catch (OperationCanceledException) { return; }
+                    }
+                }
+
                 bool tookFirstChunk = false;
 
                 while (!cancel.IsCancellationRequested)
@@ -2179,6 +2208,21 @@ public class DownloadService : AbstractDownloadService
             if (!c.IsDownloadCompleted())
                 return false;
         }
+
+        // 🚨🚨 2026-11-07 修「前快后慢 / 卡在 99% 却永远等下去」的一个分支：
+        //   抢占与末段补片会把一个分片从中间切开 —— 原片 End 被改小、后半段作为新片
+        //   登记进 _splitChunks。此时原片的 IsDownloadCompleted() 立刻变 true，
+        //   若只看 Package.Chunks，就会在尾巴片还没下完时判定「全部完成」，
+        //   让所有 worker 退出，尾巴片留在 _splitChunks 里没人管。
+        //   （数据最终会被 VerifyChunkCoverage 拦下报失败 —— 等于白下。）
+        //   ⇒ 必须把 _splitChunks 一起算上。
+        foreach (var kv in _splitChunks)
+        {
+            Chunk extra = kv.Value;
+            if (extra != null && !extra.IsDownloadCompleted())
+                return false;
+        }
+
         return true;
     }
 
@@ -2233,7 +2277,16 @@ public class DownloadService : AbstractDownloadService
             lastTick[kv.Key] = now;
         }
 
-        if (speeds.Count < 2)
+        // 🚨🚨 2026-11-07 修「前面很快、最后特别慢」的最后一个分支：
+        //   原来这里是无条件 `if (speeds.Count < 2) return;`，于是收尾期
+        //   （只剩 1 路在磨最后几 MB）**整轮抢占直接返回**，谁都不会被换掉。
+        //   而收尾恰恰是最需要抢占的时刻：那一路的速度就是用户此刻看到的总速度。
+        //
+        //   现在只在「非收尾期」要求至少 2 个样本（1 个样本算不出中位数、
+        //   也无法判断谁掉队）；收尾期允许 1 个样本，改用**绝对下限**判定 ——
+        //   只剩一路时没有同伴可比，只能问「它是不是真的慢」。
+        bool endgameNow = active.Count <= Options.PreemptEndgameInflight;
+        if (speeds.Count < 2 && !(endgameNow && speeds.Count == 1))
             return;
 
         // 2) 中位数（每连接）—— **不是平均值**。
