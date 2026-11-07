@@ -132,6 +132,7 @@ namespace GeZi.SelfTest
     Run("planned_concurrency", TestPlannedConcurrency);
     Run("pan_bucket_budget", TestPanBucketBudget);
     Run("pan_conn_budget", TestPanConnBudget);
+    Run("chunk_splitter", TestChunkSplitter);
     Run("bandwidth_smoothing", TestBandwidthSmoothing);
     Run("log_redactor", TestLogRedactor);
         Run("pending_canresume", TestPendingCanResume);
@@ -2251,7 +2252,137 @@ namespace GeZi.SelfTest
         }
 
         /// <summary>
-        /// 2026-11-07：按网盘独立的连接预算（多网盘同时下载不再互相侵占）。
+        /// 2026-11-07：分片切分的**覆盖完整性**与「片数 ≈ 并发 × 8」。
+        ///
+        /// <para>
+        /// 🚨 这个函数过去**零自检**。2026-10-14 就因此吃过大亏：变长头部切片里
+        /// `nMid` 被夹小后重算 `midSeg`，`while (s < total)` 提前退出，
+        /// **尾部 15.4MB 被静默丢掉** —— 所有分片显示 100%、meta 完整，
+        /// 但目标文件就是差一截，且 .qparts 已清空无法续传。
+        /// 所以「首尾相接、完整覆盖 [0, total-1]」是最高优先级的断言。
+        /// </para>
+        /// </summary>
+        private static void TestChunkSplitter()
+        {
+            // ---- 断言工具：覆盖完整性（首尾相接 + 起点 0 + 终点 total-1）----
+            Func<List<(long Start, long End)>, long, string> coverageError =
+                (parts, total) =>
+                {
+                    if (parts.Count == 0) return total > 0 ? "片列表为空" : "";
+                    if (parts[0].Start != 0) return "起点不是 0（实际 " + parts[0].Start + "）";
+                    if (parts[parts.Count - 1].End != total - 1)
+                        return "终点不是 total-1（实际 " + parts[parts.Count - 1].End +
+                               "，应为 " + (total - 1) + "）";
+                    for (int i = 1; i < parts.Count; i++)
+                    {
+                        if (parts[i].Start != parts[i - 1].End + 1)
+                            return "第 " + i + " 片与上一片不连续（" +
+                                   parts[i - 1].End + " -> " + parts[i].Start + "）";
+                    }
+                    long sum = 0;
+                    foreach (var p in parts) sum += p.End - p.Start + 1;
+                    if (sum != total) return "总字节 " + sum + " != total " + total;
+                    return "";
+                };
+
+            // ---- ① 覆盖完整性：五档典型大小 × 四个典型并发 ----
+            long[] sizes =
+            {
+                1L * 1024 * 1024,                    // 1MB
+                5L * 1024 * 1024,                    // 5MB
+                88L * 1024 * 1024,                   // 88MB（用户实测「吃不满线程」的那个量级）
+                1024L * 1024 * 1024,                 // 1GB
+                10L * 1024 * 1024 * 1024,            // 10GB
+                100L * 1024 * 1024 * 1024,           // 100GB（用户报「分片太大」的量级）
+            };
+            int[] threadsArr = { 16, 64, 256, 512 };
+            bool allCover = true;
+            string firstCoverErr = "";
+            foreach (long sz in sizes)
+            {
+                foreach (int th in threadsArr)
+                {
+                    var ps = GeZi.DownloadEngine.Planning.ChunkSplitter.Split(sz, th);
+                    string err = coverageError(ps, sz);
+                    if (err.Length > 0)
+                    {
+                        allCover = false;
+                        if (firstCoverErr.Length == 0)
+                            firstCoverErr = sz + "B/" + th + "路: " + err;
+                    }
+                }
+            }
+            Check("split.full_coverage", allCover,
+                "任何大小×任何并发都必须首尾相接、完整覆盖" + (allCover ? "" : "（首个失败：" + firstCoverErr + "）"));
+
+            // ---- ② 片数必须 ≈ 并发 × 8（吃满并发的前提）----
+            // 88MB + 512 路：旧实现被 total/512KB 钉死在 176 片（336 条连接永远闲着）。
+            var big = GeZi.DownloadEngine.Planning.ChunkSplitter.Split(88L * 1024 * 1024, 512);
+            Check("split.88mb_reaches_concurrency", big.Count >= 512,
+                "88MB + 512 路必须切出 ≥512 片（旧实现只有 176 片，吃不满线程），实际 " + big.Count);
+
+            // 1GB + 512 路：目标 512×8 = 4096 片，但头部 64MB 会被合并成 1MB 的粗片
+            // （头部变长切片的既定行为：中后部才按 finalSeg 细切），所以实际略少于 4096。
+            // 判据取「≥ 并发数 × 4」—— 低于这个数说明又退化回按片数反向夹取了。
+            var oneG = GeZi.DownloadEngine.Planning.ChunkSplitter.Split(1024L * 1024 * 1024, 512);
+            Check("split.1gb_parts", oneG.Count >= 2048,
+                "1GB + 512 路应切出 ≥2048 片（吃满并发的前提），实际 " + oneG.Count);
+
+            // ---- ③ 大文件单片不许超过 16MB（旧实现 100GB 出 25.6MB 巨片）----
+            var huge = GeZi.DownloadEngine.Planning.ChunkSplitter.Split(100L * 1024 * 1024 * 1024, 512);
+            long maxSeg = 0;
+            foreach (var p in huge)
+            {
+                long len = p.End - p.Start + 1;
+                if (len > maxSeg) maxSeg = len;
+            }
+            Check("split.100gb_max_seg", maxSeg <= 16L * 1024 * 1024,
+                "100GB 的单片不得超过 16MB（旧实现是 25.6MB），实际 " + maxSeg + " 字节");
+
+            // ---- ④ 小文件不许被切碎（握手开销）----
+            // 1MB 切 2 片是有意的：512KB/片，两路并行比单路快将近一倍，
+            // 而多出的一次握手只占 0.8%。但不能更多 —— 再细就是纯亏。
+            var small1 = GeZi.DownloadEngine.Planning.ChunkSplitter.Split(1L * 1024 * 1024, 512);
+            Check("split.1mb_few_parts", small1.Count <= 4,
+                "1MB 文件最多切 4 片（再细就是纯亏握手），实际 " + small1.Count);
+            var small5 = GeZi.DownloadEngine.Planning.ChunkSplitter.Split(5L * 1024 * 1024, 512);
+            Check("split.5mb_few_parts", small5.Count <= 32,
+                "5MB 文件的片数不该超过 32（否则握手开销吃掉收益），实际 " + small5.Count);
+
+            // ---- ⑤ 病态入参不抛异常、不返回非法区间 ----
+            Check("split.zero",
+                GeZi.DownloadEngine.Planning.ChunkSplitter.Split(0, 256).Count == 0,
+                "0 字节返回空列表");
+            Check("split.negative",
+                GeZi.DownloadEngine.Planning.ChunkSplitter.Split(-1, 256).Count == 0,
+                "负数返回空列表");
+            Check("split.threads_zero",
+                GeZi.DownloadEngine.Planning.ChunkSplitter.Split(10L * 1024 * 1024, 0).Count >= 1,
+                "并发为 0 时按 1 处理，仍要切出片");
+            Check("split.threads_huge",
+                coverageError(
+                    GeZi.DownloadEngine.Planning.ChunkSplitter.Split(10L * 1024 * 1024, int.MaxValue),
+                    10L * 1024 * 1024).Length == 0,
+                "并发给 int.MaxValue 仍必须完整覆盖（被 MaxRealConcurrency 夹住）");
+
+            // ---- ⑥ 纯函数性：同样的入参必须给出逐字节相同的分片表 ----
+            // RunSegmentedAsync 每次都会重算 parts 与 .qmeta 比对，不一致就重建 plan、
+            // 进度全部归零 —— 这是「续传进度莫名清零」的经典来源。
+            var a1 = GeZi.DownloadEngine.Planning.ChunkSplitter.Split(9L * 1024 * 1024 * 1024, 256);
+            var a2 = GeZi.DownloadEngine.Planning.ChunkSplitter.Split(9L * 1024 * 1024 * 1024, 256);
+            bool same = a1.Count == a2.Count;
+            if (same)
+            {
+                for (int i = 0; i < a1.Count; i++)
+                {
+                    if (a1[i].Start != a2[i].Start || a1[i].End != a2[i].End) { same = false; break; }
+                }
+            }
+            Check("split.deterministic", same,
+                "同一入参必须给出逐字节相同的分片表（否则续传每次都被判不一致、进度清零）");
+        }
+
+        /// <summary>
         ///
         /// <para>
         /// 钉死四件事：①四家的预算数字就是既有实测值（夸克 512 / UC 256 / 阿里 64 / 迅雷 16），

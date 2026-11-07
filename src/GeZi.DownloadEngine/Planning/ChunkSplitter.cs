@@ -70,69 +70,66 @@ namespace GeZi.DownloadEngine.Planning
             if (total <= 0)
                 return new List<(long, long)>();
 
-            // 🚨🚨 封顶必须 ≥ `有效并发 × 8`，**不能照抄云析的 512**。
-            // 云析的 `min(…, 512)` 是**和它「并发上限 32」配套**的：
-            //   云析：并发 32 × 8 = 256 片，被 512 封顶**碰不到** → 实际 8 片/连接，有窃取余量 ✓
-            //   我们：并发 512 × 8 = 4096 → **被 512 压回 512** → **1 片/连接，零窃取余量** ✗
-            // 实测踩到（2026-10-11）：照抄 512 后分片变成「512 片 × 18.64MB」，
-            // 等于每个连接领一整片、干完就闲，慢连接没有任何片可以补 —— 速度反而崩。
-            // `片数 = 并发 × 8`（工作窃取深度 8），封顶只是**防爆护栏**，
-            // 必须留够余量：`封顶 = max(4096, 并发 × 8)`。
-            // 9.5GB + 512 并发 → 4096 片 × 2.3MB（= 2026-10-02 实测与 Python 持平 1.01x 的那套配置）
-            // 9.5GB + 256 并发 → 2048 片 × 4.65MB
-            // 单分片下限 512KB（原 256KB）：256KB 的小片只在「文件大到必须
-            // 用 4096 片」时才需要；对中小文件，256KB 会把片切得过碎
-            // （100MB → 400 片），每条连接反复建连，得不偿失。
-            const long MinSegBytes = 512L * 1024;
+            // 🚨🚨 2026-11-07 重构：从「先算片数、再反推片大小」改成「先定片大小、再算片数」。
+            //
+            // 旧结构的病根是**双向夹取**，两个方向都会出错：
+            //   ① 小文件被 `capByMinChunk = total / 512KB` 钉死片数
+            //      → 88MB 只能切 176 片，512 条连接里 336 条永远闲着（用户报「吃不满线程」）；
+            //   ② 大文件被 `if (n > maxSegments) n = maxSegments` 反向夹回
+            //      → 100GB 变成 4096 片 × 25.6MB，上面刚夹过的 `maxSegBytes = 16MB` 被**彻底绕过**
+            //      （用户报「大文件哪怕开了最高线程分片也太大了」）。
+            // 两者同源，改一处不改另一处必然原地打转。
+            //
+            // 新结构只有三步，没有反向夹取：
+            //   seg = clamp(total / (并发 × 8), 最小片, 最大片)
+            //   n   = ceil(total / seg)          ← 片数由覆盖关系算出，不再被任何上限压低
+            // 片数上限退化为「元数据护栏」（只防病态输入，不参与调优）：
+            //   4096 那个值当年是调优手段，现在改成 65536 只做护栏 ——
+            //   100GB + 512 线程算出来是 6400 片，离护栏还很远。
+            //
+            // 为什么是「并发 × 8」：工作窃取深度 8。慢连接被抢占后要立刻有片可领，
+            // 深度不足会退化成「每连接一片、干完就闲」（2026-10-11 照抄云析封顶 512 踩过，
+            // 速度崩到 27KB/s）。这是本项目唯一被反复验证过的比例，不要动。
+            int eff = threads > 0 ? Math.Min(threads, MaxRealConcurrency) : 1;
+            if (eff < 1) eff = 1;
 
-            // 文件越大，片可以越大 —— 因为大文件总时长长，单片大一点
-            // 也不会显著拖长尾；而小文件必须用小片，否则片数不够分。
+            // 最小片长（三档）。**不能为了「片数够分」就把小文件的片切到 128KB** ——
+            // 小文件切碎的唯一后果是「一堆 TLS 握手换几十 KB」，净亏。
+            //   <8MB   → 512KB（5MB 文件 = 10 片，8MB = 16 片）
+            //   8~64MB → 256KB（64MB = 256 片）
+            //   ≥64MB  → 128KB（88MB = 704 片，能真正吃满 512 条连接）
+            // ⚠️ 128KB 是硬底线，不能再往下：单片 64KB 在 13KB/s 的连接上只要 4.7 秒，
+            //    而一次 TLS 握手 0.3~0.6 秒 —— 握手开销要吃掉 6%~13%，净亏。
+            long minSegBytes;
+            if (total < 8L * 1024 * 1024) minSegBytes = 512L * 1024;                 // 512KB
+            else if (total < 64L * 1024 * 1024) minSegBytes = 256L * 1024;           // 256KB
+            else minSegBytes = 128L * 1024;                                          // 128KB
+
+            // 最大片长：文件越大，单片可以越大（总时长久，单片大一点也不显著拖长尾）。
+            // 但必须有上限 —— 否则 100GB 会出 25.6MB 的巨片，一条慢连接就能拖死收尾。
             long maxSegBytes;
             if (total < 32L * 1024 * 1024) maxSegBytes = 1L * 1024 * 1024;            // <32MB → 1MB
             else if (total < 256L * 1024 * 1024) maxSegBytes = 2L * 1024 * 1024;      // <256MB → 2MB
             else if (total < 2L * 1024 * 1024 * 1024) maxSegBytes = 8L * 1024 * 1024; // <2GB → 8MB
             else maxSegBytes = 16L * 1024 * 1024;                                      // ≥2GB → 16MB
 
-            int eff = threads > 0 ? Math.Min(threads, MaxRealConcurrency) : 1;
-            if (eff < 1) eff = 1;
+            // 元数据护栏（不是调优参数）：只防病态输入把 .qmeta 撑爆。
+            // 4096 那个老值是当年「先算片数」结构的调优结果，在「先定片长」结构里已无意义。
+            const long MaxPartsGuard = 65536;
 
-            // 片数封顶 = max(4096, 并发 × 8) —— 保证「每连接至少 8 片」的窃取深度。
-            // 详见上方长注释：**不能照抄云析的 512**（那是和它「并发上限 32」配套的）。
-            int maxSegments = Math.Max(4096, eff * 8);
-
-            long bySize;
-            if (total < 5L * 1024 * 1024) bySize = 1;
-            else if (total < 32L * 1024 * 1024) bySize = 4;
-            else if (total < 256L * 1024 * 1024) bySize = 16;
-            else if (total < 2L * 1024 * 1024 * 1024) bySize = 32;
-            else bySize = 64;
-
-            long wantParts = Math.Max(bySize, (long)eff * 8);
-            if (wantParts < 1) wantParts = 1;
-
-            // 夹取一：片数不超过「按最小片长能切出的片数」—— 小文件不该被切太碎。
-            // 🚨 2026-10-26 修正：这里原来写死 256KB，与下面的 MinSegBytes(512KB) 不一致，
-            //    导致这个上限**永远达不到**（先允许 total/256KB 片，随后 seg 又被抬到 ≥512KB，
-            //    片数实际被压回 total/512KB）。统一用 MinSegBytes，上限才真正生效；
-            //    唯一可见差异：512KB~1MB 的文件从「2 片」变成「1 片」（本来也不该拆）。
-            long capByMinChunk = total / MinSegBytes;
-            if (capByMinChunk < 1) capByMinChunk = 1;
-            if (wantParts > capByMinChunk) wantParts = capByMinChunk;
-
-            // 夹取二：硬封顶
-            if (wantParts > maxSegments) wantParts = maxSegments;
-
-            long seg = (total + wantParts - 1) / wantParts;
-            if (seg < MinSegBytes) seg = MinSegBytes;
+            long seg = total / ((long)eff * 8);
+            if (seg < 1) seg = 1;
+            if (seg < minSegBytes) seg = minSegBytes;
             if (seg > maxSegBytes) seg = maxSegBytes;
+            if (seg < 1) seg = 1;
 
-            // 由上一步的片大小算出片数
+            // 片数由「片长覆盖整个文件」自然得出 —— 这里**不做任何反向夹取**。
             long n = (total + seg - 1) / seg;
             if (n < 1) n = 1;
-            if (n > maxSegments) n = maxSegments;
+            if (n > MaxPartsGuard) n = MaxPartsGuard;
             if (n > int.MaxValue) n = int.MaxValue;
 
-            // 重算一次对齐后的片大小（避免因夹取导致最后一片畸形）
+            // 重算一次对齐后的片大小（n 被护栏夹过时才会变化，正常情况逐字节等于 seg）
             long finalSeg = (total + n - 1) / n;
             if (finalSeg < 1) finalSeg = 1;
 
@@ -155,7 +152,7 @@ namespace GeZi.DownloadEngine.Planning
             // ⚠️ **必须是纯函数**：RunSegmentedAsync 每次都会重算 parts 并与 .qmeta 比对
             //    （PartsEqual），一旦不一致就重建 plan、W 全部归零 → **进度全丢**。
             //    所以这里只允许用 total/threads 推导常量，绝不能用随机数或时钟。
-            // ⚠️ **不能突破 maxSegments**：那是「元数据上限」护栏（防 100GB+ 失控）。
+            // ⚠️ **不能突破元数据护栏**（<see cref="MaxPartsGuard"/>，防 100GB+ 失控）。
             // 头部阈值 2026-10-24 从 1GB 降到 8MB、占比从 1/16 提到 1/4、上限 64→256 片。
             // 原因（实测）：顺序落盘只认「从 0 连续的已刷盘前缀」。24MB 文件 + 16 线程时，
             // 若第一条连接被限速到 20KB/s，磁盘文件会一路保持 0 字节直到它下完（22 秒），
@@ -174,7 +171,7 @@ namespace GeZi.DownloadEngine.Planning
                 // 至少 2 片才有并行意义；剩余部分还要够切（否则不如不分）
                 long headEnd = headParts * HeadSegBytes - 1;
                 long remainTotal = total - (headEnd + 1);
-                if (headParts >= 2 && remainTotal >= MinSegBytes)
+                if (headParts >= 2 && remainTotal >= minSegBytes)
                 {
                     // 中后部**必须沿用上面已经验证过能覆盖到 total 的 finalSeg**，
                     // 绝不能按 nMid 重新算 midSeg = remainTotal / nMid ——
