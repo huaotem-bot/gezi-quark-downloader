@@ -134,6 +134,7 @@ namespace GeZi.SelfTest
     Run("pan_conn_budget", TestPanConnBudget);
     Run("chunk_splitter", TestChunkSplitter);
     Run("slow_watchdog", TestSlowWatchdog);
+    Run("disk_conn_budget", TestDiskConnBudget);
     Run("bandwidth_smoothing", TestBandwidthSmoothing);
     Run("log_redactor", TestLogRedactor);
         Run("pending_canresume", TestPendingCanResume);
@@ -2634,6 +2635,78 @@ namespace GeZi.SelfTest
                 && SlowWatchdog.Median(new List<double>()) == 0
                 && SlowWatchdog.Median(new List<double> { -100, -200 }) == 0,
                 "空集合 / null / 全负数都返回 0，不抛异常");
+        }
+
+        /// <summary>
+        /// 2026-11-07：机械盘并发按**盘**聚合（原来是逐任务判定）。
+        ///
+        /// <para>
+        /// 钉死：
+        /// ① 单个任务时结果必须与改造前**逐字等价**（128）；
+        /// ② 同一块盘 N 个任务时，单任务软上限随 N 下降（3 个任务 = 85，6 个 = 42）；
+        /// ③ 固态盘返回 0 = 不限制（多任务反而更快，绝不能夹）；
+        /// ④ 盘符聚合键要能把 C:\a\b、c:/x、C: 认成同一个盘，UNC 按共享名聚合。
+        /// </para>
+        /// </summary>
+        private static void TestDiskConnBudget()
+        {
+            // ① 单任务：与改造前的「want > HddMaxConcurrency → 夹到 128」完全一致
+            Check("disk.single_task_equivalent",
+                DiskConnBudget.SoftCap(DiskConnBudget.DefaultHddCap, 1) == DiskConnBudget.DefaultHddCap
+                && DiskConnBudget.Apply(512, DiskConnBudget.SoftCap(128, 1)) == 128,
+                "本盘只有 1 个任务时，软上限必须等于盘配额 128（与逐任务判定逐字等价）");
+
+            // ② 多任务递减
+            Check("disk.two_tasks",
+                DiskConnBudget.SoftCap(128, 2) == 128,
+                "2 个任务时 share=64，×2=128，仍为盘配额");
+            Check("disk.three_tasks",
+                DiskConnBudget.SoftCap(128, 3) == 84,
+                "3 个任务时 share=42（整除去零），×2=84");
+            Check("disk.six_tasks",
+                DiskConnBudget.SoftCap(128, 6) == 42,
+                "6 个任务时 share=21，×2=42");
+            Check("disk.many_tasks_never_zero",
+                DiskConnBudget.SoftCap(128, 200) >= 1,
+                "任务再多也不能算出 0（否则连接数变 0 直接下不动）");
+
+            // ③ 固态盘不限制
+            Check("disk.ssd_unlimited",
+                DiskConnBudget.DiskCapFor(false, 128) == 0
+                && DiskConnBudget.Apply(512, 0) == 512,
+                "固态盘 DiskCap 必须为 0（不限制），Apply 原样返回 512");
+
+            // ④ 盘符聚合键
+            Check("disk.key_normalizes_case",
+                DiskConnBudget.DriveKey(@"C:\a\b.mp4") == "C:"
+                && DiskConnBudget.DriveKey("c:/x/y.mkv") == "C:"
+                && DiskConnBudget.DriveKey(@"C:\") == "C:",
+                "同一块盘的不同写法必须归到同一个键（大小写、正反斜杠、有无目录）");
+            Check("disk.key_different_drives",
+                DiskConnBudget.DriveKey(@"C:\a.mp4") != DiskConnBudget.DriveKey(@"D:\a.mp4"),
+                "不同盘符必须是不同的键（否则会误把两块盘的配额合到一起，反而更慢）");
+            Check("disk.key_unc",
+                DiskConnBudget.DriveKey(@"\\nas\share\a\b.mp4") == @"\\nas\share",
+                "UNC 路径按 \\\\server\\share 聚合");
+            Check("disk.key_empty_safe",
+                DiskConnBudget.DriveKey(null) == DiskConnBudget.UnknownDrive
+                && DiskConnBudget.DriveKey("") == DiskConnBudget.UnknownDrive,
+                "空路径归到 UnknownDrive 桶（宁可保守共用配额）");
+
+            // ⑤ 按盘统计
+            var counts = DiskConnBudget.CountByDrive(new List<string> { "C:", "c:", "D:", "C:" });
+            Check("disk.count_by_drive",
+                counts["C:"] == 3 && counts["D:"] == 1,
+                "CountByDrive 必须大小写不敏感地累加（C: 出现 3 次 = 3 个任务）");
+
+            // ⑥ 保守性：算出来的软上限绝不能超过盘配额
+            bool neverExceed = true;
+            for (int n = 1; n <= 20; n++)
+            {
+                if (DiskConnBudget.SoftCap(128, n) > 128) neverExceed = false;
+            }
+            Check("disk.never_exceeds_cap", neverExceed,
+                "任何任务数下软上限都不得超过盘配额（否则聚合就白做了）");
         }
 
         /// <summary>最小落盘替身：只用来验证 EffectiveReceivedBytes 的分流判据。</summary>

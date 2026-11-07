@@ -107,6 +107,58 @@ namespace GeZi.DownloadEngine
         /// </summary>
         private static readonly int[] PanRunning = new int[GeZi.Core.Support.PanConnBudget.PanCount];
 
+        /// <summary>
+        /// 每个**磁盘**当前正在跑的任务数（用于机械盘并发按盘聚合）。
+        ///
+        /// <para>
+        /// 🚨🚨 2026-11-07 新增：原来机械盘限制是**逐任务**判定的
+        /// （<c>DiskMedia.DetectForPath(job.Dest) == Hdd</c> 就把自己要的并发夹到 128），
+        /// 谁也不知道别人也在同一块盘上。于是 3 个任务写同一块 HDD = 3×128 = 384 路
+        /// 随机写同一颗磁头，比单任务 512 路还糟（三个任务各有各的写合并窗口，
+        /// 磁头要在三套偏移之间来回跳）。机械盘是寻道物理限制，加连接只会更慢。
+        /// </para>
+        /// <para>
+        /// 现在按盘符聚合：同一块盘上 N 个任务时，单任务软上限 =
+        /// min(盘配额 ÷ N × 2, 盘配额)。N=1 时结果与改造前**逐字等价**。
+        /// </para>
+        /// <para>
+        /// 键用 <see cref="GeZi.Core.Support.DiskConnBudget.DriveKey"/>（大写盘符 / UNC 共享名）。
+        /// 用 <see cref="StringComparer.OrdinalIgnoreCase"/> 避免大小写重复计数。
+        /// </para>
+        /// </summary>
+        private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, int> DiskRunning =
+            new System.Collections.Concurrent.ConcurrentDictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>登记一个任务进入某块盘（返回进入后的在跑数）。</summary>
+        private static int EnterDisk(string path)
+        {
+            string key = GeZi.Core.Support.DiskConnBudget.DriveKey(path);
+            return DiskRunning.AddOrUpdate(key, 1, (k, v) => v + 1);
+        }
+
+        /// <summary>撤销登记（<c>&lt; 0</c> 时归零，绝不出现负数导致份额算错）。</summary>
+        private static void LeaveDisk(string path)
+        {
+            string key = GeZi.Core.Support.DiskConnBudget.DriveKey(path);
+            try
+            {
+                DiskRunning.AddOrUpdate(key, 0, (k, v) => v > 1 ? v - 1 : 0);
+            }
+            catch
+            {
+                // 计数器异常绝不拖垮下载
+            }
+        }
+
+        /// <summary>该盘上当前在跑的任务数（&lt; 1 时返回 1，避免除零）。</summary>
+        private static int RunningOnDisk(string path)
+        {
+            string key = GeZi.Core.Support.DiskConnBudget.DriveKey(path);
+            int n;
+            if (DiskRunning.TryGetValue(key, out n) && n > 0) return n;
+            return 1;
+        }
+
         /// <summary>取该网盘的租约信号量（越界按夸克）。</summary>
         private static SemaphoreSlim LeaseOf(int panKind)
         {
@@ -334,6 +386,9 @@ namespace GeZi.DownloadEngine
             // 后续任务的份额会被越摊越小（假死在跑数）。
             // ⚠️ 用 try/finally 而不是在 if 分支里登记：路径互斥失败时也必须减。
             bool panEntered = false;
+            // 磁盘「在跑任务数」的成对登记标记（与 panEntered 同理，
+            // 只在自己登记成功后才能在 finally 里减，否则会把别人的计数减掉）。
+            bool diskEntered = false;
             try
             {
                 if (!_activeDests.TryAdd(destKey, 0))
@@ -348,6 +403,12 @@ namespace GeZi.DownloadEngine
                 EnterPan(job.PanKind);
                 panEntered = true;
 
+                // 登记本盘「在跑任务数」：同理，必须在自己算磁盘软上限**之前**登记。
+                // 这样 3 个任务同时下到同一块 HDD 时，第三个进来看到的是 3，
+                // 而不是 1（否则三个都按「本盘只有我一个」算，各拿满 128 路）。
+                EnterDisk(job.Dest);
+                diskEntered = true;
+
                 // ---- 本网盘连接预算租约 ----
                 // 申请“期望值”个额度；额度不足就在这里等前一个任务释放，
                 // 而不是让三个任务各开 256 路把账号连接数顶穿。
@@ -359,18 +420,30 @@ namespace GeZi.DownloadEngine
                 if (want > panCap) want = panCap;
                 if (want > ThreadAllocator.DefaultBudget) want = ThreadAllocator.DefaultBudget;
 
-                // 🚨 机械盘限制并发（2026-10-24 补的缺口）。
+                // 🚨 机械盘限制并发（2026-10-24 补的缺口，2026-11-07 改为**按盘聚合**）。
                 // HDD 的随机写代价是寻道的物理限制：512 条连接各写各的位置，
                 // 写合并再强也压不住磁头来回跳。实测推断（本机无 HDD，按寻道 10 ms 估算）：
                 //   512 并发 → 每 4 MB 约 64 次寻道 → 上限约 6 MB/s；
                 //    32 并发 → 每 32 MB 约 32 次寻道 → 上限约 60 MB/s。
                 // 也就是说机械盘上「并发越低越快」，与固态盘完全相反。
-                // 32 是折中值：既能吃满家用宽带，又不会把磁头打散。
-                if (DiskMedia.DetectForPath(job.Dest) == DiskMediaKind.Hdd && want > HddMaxConcurrency)
+                //
+                // 🚨🚨 2026-11-07：原来是**逐任务**判定，3 个任务写同一块盘 = 3×128 = 384 路，
+                //   比单任务 512 路还糟（三个任务各有各的 16MB 写合并窗口，磁头在三套偏移间跳）。
+                //   现在按盘符聚合：单任务软上限 = min(盘配额 ÷ 本盘任务数 × 2, 盘配额)。
+                //   本盘只有 1 个任务时算出 = 盘配额，**与改造前逐字等价**。
+                if (DiskMedia.DetectForPath(job.Dest) == DiskMediaKind.Hdd)
                 {
-                    Log("[落盘] 目标在机械盘，并发从 " + want + " 降到 " + HddMaxConcurrency
-                        + "（HDD 随机写受寻道限制，并发越低越快）");
-                    want = HddMaxConcurrency;
+                    int diskCap = GeZi.Core.Support.DiskConnBudget.DiskCapFor(true, HddMaxConcurrency);
+                    int diskRunning = RunningOnDisk(job.Dest);
+                    int diskSoft = GeZi.Core.Support.DiskConnBudget.SoftCap(diskCap, diskRunning);
+                    int before = want;
+                    want = GeZi.Core.Support.DiskConnBudget.Apply(want, diskSoft);
+                    if (want < before)
+                    {
+                        Log("[落盘] 目标在机械盘，本盘同时 " + diskRunning + " 个任务共享 "
+                            + diskCap + " 条连接，本任务并发从 " + before + " 降到 " + want
+                            + "（HDD 随机写受寻道限制，并发越低越快）");
+                    }
                 }
 
                 // 🚨 按网盘封顶（2026-10-25 补的真 bug）。
@@ -507,6 +580,9 @@ namespace GeZi.DownloadEngine
                 // 拿到过大的 want 却抢不到额度（无害，但日志会对不上）。
                 if (panEntered)
                     LeavePan(job.PanKind);
+                // 退出本盘的「在跑任务数」。同样放在额度归还之后。
+                if (diskEntered)
+                    LeaveDisk(job.Dest);
                 // 下载结束（含成功/失败/取消/异常）必然走到这里，
                 // 立即释放目标路径，供"删除后重下"继续。
                 if (owned)
