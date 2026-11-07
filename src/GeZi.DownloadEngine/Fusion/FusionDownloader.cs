@@ -647,6 +647,10 @@ namespace GeZi.DownloadEngine
                 // 🚨 2026-11-07：注入「删除并移除」意图查询，取消分支据此不再写续传快照。
                 //    默认 false，普通暂停/取消行为逐字不变。
                 IsDeleteRemoveRequested = () => job.DeleteAndRemoveRequested,
+                // 🚨 2026-11-07：每个**任务**一个容忍闸门，绝不跨任务共享 ——
+                //    共享会让 A 任务的偶发 200 累加到 B 任务上，把好好的任务作废。
+                //    语义见 RangeDowngradeGate：窗口内 ≤3 次只重试，超过才判致命。
+                RangeDowngrade = new GeZi.Core.Support.RangeDowngradeGate(),
             };
         }
 

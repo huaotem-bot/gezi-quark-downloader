@@ -119,6 +119,12 @@ public class DownloadConfiguration : ICloneable, INotifyPropertyChanged
     private long _preemptMinBps = 12L * 1024;
     /// <summary>2026-11-05：收尾期在飞连接数门槛，默认 3。</summary>
     private int _preemptEndgameInflight = 3;
+    /// <summary>2026-11-07：「服务端忽略 Range 回 200」的容忍闸门（每个任务一个实例，可为 null）。</summary>
+    private GeZi.Core.Support.RangeDowngradeGate _rangeDowngrade;
+    /// <summary>2026-11-07：忽略 Range 的容忍次数，默认 3（对齐 refs/YunX）。</summary>
+    private int _rangeDowngradeTolerance = GeZi.Core.Support.RangeDowngradeGate.DefaultTolerance;
+    /// <summary>2026-11-07：忽略 Range 的统计窗口，默认 60 秒。</summary>
+    private long _rangeDowngradeWindowMs = GeZi.Core.Support.RangeDowngradeGate.DefaultWindowMs;
     /// <summary>2026-11-05：慢启动开关，默认开启。</summary>
     private bool _enableSlowStart = true;
     /// <summary>2026-11-05：慢启动硬超时，默认 10 秒。</summary>
@@ -544,6 +550,67 @@ public class DownloadConfiguration : ICloneable, INotifyPropertyChanged
         {
             if (value == _overallSlowActive) return;
             _overallSlowActive = value;
+            OnPropertyChanged();
+        }
+    }
+
+    /// <summary>
+    /// 「服务端忽略 Range 回 200」的容忍闸门（2026-11-07 新增）。
+    ///
+    /// <para>
+    /// 🚨🚨 原行为：任一请求了区间的分片拿到 200 而非 206 → 抛
+    /// <c>FatalChunkException</c> → 整个任务失败**并清掉续传文件**。
+    /// 一个下到 90% 的大文件，因为某个 CDN 节点偶发忽略一次 Range 就全部作废。
+    /// </para>
+    ///
+    /// <para>
+    /// 对照 refs/YunX 的 <c>RANGE_IGNORED_TOLERANCE = 3</c>：前 3 次只当普通失败重试，
+    /// 第 4 次才认定「服务端真的不支持 Range」。本属性提供同一个计数器，
+    /// 由 <c>ChunkDownloader</c> 在 <c>GuardChunk</c> 判出 ResourceChanged 时调用。
+    /// </para>
+    ///
+    /// <para>
+    /// ⚠️ 每个下载任务自己 new 一个（由 <c>FusionDownloader.BuildOptions</c> 或
+    /// <c>DownloadService</c> 在开始时创建），**不要跨任务共享** ——
+    /// 共享会让「A 任务的偶发」累加到「B 任务」上，把好好的任务作废。
+    /// 传 null 时 <c>ChunkDownloader</c> 退回老行为（直接致命错误），保证默认等价。
+    /// </para>
+    /// </summary>
+    public GeZi.Core.Support.RangeDowngradeGate RangeDowngrade
+    {
+        get { return _rangeDowngrade; }
+        set
+        {
+            if (ReferenceEquals(value, _rangeDowngrade)) return;
+            _rangeDowngrade = value;
+            OnPropertyChanged();
+        }
+    }
+
+    /// <summary>
+    /// 「服务端忽略 Range」的容忍次数（默认 3，对齐 refs/YunX 的 RANGE_IGNORED_TOLERANCE）。
+    /// 只在不传 <see cref="RangeDowngrade"/> 时无意义；≤0 时按默认值处理。
+    /// </summary>
+    public int RangeDowngradeTolerance
+    {
+        get { return _rangeDowngradeTolerance; }
+        set
+        {
+            _rangeDowngradeTolerance = value;
+            OnPropertyChanged();
+        }
+    }
+
+    /// <summary>
+    /// 「服务端忽略 Range」的统计窗口（毫秒，默认 60 秒）。
+    /// 没有窗口的话，一个下了三小时的文件中途偶发三次 200 也会被累加成超容忍。
+    /// </summary>
+    public long RangeDowngradeWindowMs
+    {
+        get { return _rangeDowngradeWindowMs; }
+        set
+        {
+            _rangeDowngradeWindowMs = value;
             OnPropertyChanged();
         }
     }

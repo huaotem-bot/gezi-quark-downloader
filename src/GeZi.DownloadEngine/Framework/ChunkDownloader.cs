@@ -67,6 +67,21 @@ internal class ChunkDownloader
             _logger?.LogCritical($"分片 {Chunk.Id} 致命错误：源文件已变化或区间不符");
             throw;
         }
+        catch (RangeIgnoredException ignored)
+        {
+            // 🚨🚨 2026-11-07 新增：「服务端这次没按规矩回 206，但还在容忍范围内」。
+            //   与 SlowReconnectException 的区别：那个是「换一条更快的连接」，零退避；
+            //   这个是「服务端这次没按规矩回」，应当**稍等再试** —— 真降级时
+            //   立刻重连只会再撞一次，退避能让服务端缓过来。
+            //   这一步走普通重试路径（吃 FailoverCount、并放大 Timeout），
+            //   因为它确实是「一次失败的请求」，不是主动放弃。
+            //   ⚠️ 关键差别在任务层：**不再抛致命错误、不再清续传**，
+            //   只有窗口内超过容忍次数才会由 DownloadChunk 抛 FatalChunkException。
+            _logger?.LogWarning(
+                $"分片 {Chunk.Id} 服务端忽略了 Range（第 {ignored.Occurrence} 次，仍在容忍范围内），"
+                + "本次按普通失败重试，不判定下载失败");
+            return await ContinueWithDelay(downloadRequest, pause, cancelToken).ConfigureAwait(false);
+        }
         catch (SlowReconnectException slow)
         {
             // 🚨🚨 2026-11-05 新增：慢连接换连接 —— **零退避、零代价**。
@@ -189,6 +204,28 @@ internal class ChunkDownloader
                     ChunkGuardResult guard = _validator.GuardChunk(chunkRequest, response);
                     if (guard == ChunkGuardResult.ResourceChanged)
                     {
+                        // 🚨🚨 2026-11-07 修「大文件下到 90% 因为一次偶发 200 全部作废」：
+                        //   原实现无条件抛 FatalChunkException → DownloadService 走
+                        //   ClearResumeAsync()，任务失败 + 续传文件一并删除。
+                        //   现在先问容忍闸门（对齐 refs/YunX 的 RANGE_IGNORED_TOLERANCE = 3）：
+                        //     · 窗口内未超容忍 → 抛 RangeIgnoredException，由 Download() 接住当普通失败重试；
+                        //     · 窗口内超过容忍 → 才认定「服务端真的不支持 Range」，保持原致命行为不变。
+                        //   ⚠️ 闸门为 null（老调用方没注入）时**完全退回原行为**，默认等价。
+                        GeZi.Core.Support.RangeDowngradeGate gate = _configuration.RangeDowngrade;
+                        if (gate != null)
+                        {
+                            bool exceeded = gate.Observe(
+                                Environment.TickCount,
+                                _configuration.RangeDowngradeTolerance,
+                                _configuration.RangeDowngradeWindowMs);
+                            if (!exceeded)
+                            {
+                                throw new RangeIgnoredException(
+                                    $"分片 {Chunk.Id} 请求区间但服务端回了 200（第 {gate.Count} 次，在容忍范围内）",
+                                    gate.Count);
+                            }
+                        }
+
                         throw new FatalChunkException(
                             $"资源在下载期间发生变化（分片 {Chunk.Id} 请求区间，服务端回了 200 而非 206）。" +
                             "为避免产出损坏文件，本次下载作废。");

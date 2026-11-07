@@ -135,6 +135,7 @@ namespace GeZi.SelfTest
     Run("chunk_splitter", TestChunkSplitter);
     Run("slow_watchdog", TestSlowWatchdog);
     Run("disk_conn_budget", TestDiskConnBudget);
+    Run("range_downgrade_gate", TestRangeDowngradeGate);
     Run("bandwidth_smoothing", TestBandwidthSmoothing);
     Run("log_redactor", TestLogRedactor);
         Run("pending_canresume", TestPendingCanResume);
@@ -3201,6 +3202,85 @@ namespace GeZi.SelfTest
                 && !string.IsNullOrEmpty(DiskMedia.Describe(DiskMediaKind.Ssd)), "");
 
             Console.WriteLine("NOTE disk.actual_media=" + c + " (" + DiskMedia.Describe(c) + ")");
+        }
+
+        /// <summary>
+        /// 「服务端忽略 Range 回 200」的容忍闸门（2026-11-07 新增）。
+        ///
+        /// <para>
+        /// 钉住的语义：窗口内 ≤3 次只是重试，超过才判致命。
+        /// 🚨 最容易写错的是**窗口过期必须重置计数**，而不是只换起点 ——
+        /// 只换起点的话「每分钟偶发一次」一小时也会累加到 60，等于没有窗口。
+        /// </para>
+        /// </summary>
+        private static void TestRangeDowngradeGate()
+        {
+            // 1) 默认容忍 3 次：第 1/2/3 次都在容忍内，第 4 次才超
+            var g = new RangeDowngradeGate();
+            bool e1 = g.Observe(1000, RangeDowngradeGate.DefaultTolerance, RangeDowngradeGate.DefaultWindowMs);
+            bool e2 = g.Observe(1100, RangeDowngradeGate.DefaultTolerance, RangeDowngradeGate.DefaultWindowMs);
+            bool e3 = g.Observe(1200, RangeDowngradeGate.DefaultTolerance, RangeDowngradeGate.DefaultWindowMs);
+            bool e4 = g.Observe(1300, RangeDowngradeGate.DefaultTolerance, RangeDowngradeGate.DefaultWindowMs);
+            Check("range.first_three_tolerated", !e1 && !e2 && !e3,
+                "前 3 次必须只是重试，不能判任务失败");
+            Check("range.fourth_exceeds", e4, "第 4 次应认定服务端不支持 Range");
+            Check("range.count_accumulates", g.Count == 4, "窗口内计数应累加到 4，实际 " + g.Count);
+
+            // 2) 窗口过期必须重置计数（不能只换起点）
+            var g2 = new RangeDowngradeGate();
+            g2.Observe(1000, 3, 60_000);
+            g2.Observe(2000, 3, 60_000);
+            g2.Observe(3000, 3, 60_000);
+            // 距第一次已超窗口 → 重新起算，第 4 次不应超容忍
+            bool reboot = g2.Observe(61_000 + 1000, 3, 60_000);
+            Check("range.window_expiry_resets", !reboot && g2.Count == 1,
+                "窗口过期必须重新起算，实际 Count=" + g2.Count);
+
+            // 3) Reset 清零
+            g2.Reset();
+            Check("range.reset", g2.Count == 0, "Reset 后计数应为 0");
+
+            // 4) 时间回退（Environment.TickCount 会绕回负数）也要重新起算
+            var g3 = new RangeDowngradeGate();
+            g3.Observe(50_000, 3, 60_000);
+            g3.Observe(51_000, 3, 60_000);
+            g3.Observe(52_000, 3, 60_000);
+            bool back = g3.Observe(-2_000_000_000, 3, 60_000);
+            Check("range.clock_rewind_safe", !back && g3.Count == 1,
+                "TickCount 绕回负数时必须重新起算，实际 Count=" + g3.Count);
+
+            // 5) 容忍次数非法（≤0）时按默认 3 处理，不能变成 0 容忍
+            var g4 = new RangeDowngradeGate();
+            bool z1 = g4.Observe(1000, 0, 0);
+            Check("range.zero_tolerance_uses_default", !z1,
+                "容忍次数 ≤0 应退回默认 3，第一次不能直接判超");
+            g4.Observe(1100, 0, 0);
+            g4.Observe(1200, 0, 0);
+            Check("range.zero_tolerance_fourth", g4.Observe(1300, 0, 0),
+                "默认容忍 3 时第 4 次应判超");
+
+            // 6) 频率对比：偶发（间隔远超窗口）永不触发；
+            //    真降级（同一秒内几十条连接同时收到 200）立刻触发。
+            //    这一条是「为什么必须有窗口」的直接证据。
+            var occasional = new RangeDowngradeGate();
+            bool everExceeded = false;
+            for (int i = 0; i < 50; i++)
+            {
+                // 每 5 分钟偶发一次，共 50 次 = 4 小时
+                everExceeded |= occasional.Observe(i * 300_000L, 3, 60_000);
+            }
+            Check("range.occasional_never_burns_task", !everExceeded,
+                "四小时里偶发 50 次也不该作废任务（这正是加窗口的目的）");
+
+            var realDowngrade = new RangeDowngradeGate();
+            bool hit = false;
+            for (int i = 0; i < 50; i++)
+            {
+                // 同一秒内 50 条连接全收到 200
+                hit |= realDowngrade.Observe(1000 + i, 3, 60_000);
+            }
+            Check("range.real_downgrade_detected", hit,
+                "同一秒内 50 条连接全回 200 必须被识别为真降级");
         }
 
         private static string Short(string s, int max = 12)
