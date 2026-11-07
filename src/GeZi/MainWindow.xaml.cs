@@ -1672,7 +1672,7 @@ namespace GeZi
         /// 注意这个数组的顺序必须与 XAML 里 ComboBoxItem 的顺序严格一致。
         /// 一致性由下面的静态构造函数在启动时自检，改漏了会直接抛异常暴露。
         /// </summary>
-        private static readonly int[] ThreadPresets = { 16, 32, 64, 128, 256, 512, 1024 };
+        private static readonly int[] ThreadPresets = { 16, 32, 64, 128, 256, 512, 1024, 2048 };
 
 
         /// <summary>

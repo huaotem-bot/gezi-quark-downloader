@@ -2407,14 +2407,22 @@ namespace GeZi.SelfTest
                 GeZi.Core.Support.PanConnBudget.Quark == GeZi.DownloadEngine.Planning.ChunkSplitter.MaxRealConcurrency,
                 "夸克预算必须等于单文件并发天花板，否则「不限」与「上限」会互相打架");
             Check("pan.budget_uc",
-                GeZi.Core.Support.PanConnBudget.BudgetFor(1) == 256,
-                "UC = 256（单 IP 7~8 MB/s，超过 256 每条掉到 13 KB/s 跌破看门狗）");
+                GeZi.Core.Support.PanConnBudget.BudgetFor(1) == GeZi.Core.Support.PanConnBudget.Uc,
+                "UC = " + GeZi.Core.Support.PanConnBudget.Uc);
             Check("pan.budget_aliyun",
-                GeZi.Core.Support.PanConnBudget.BudgetFor(2) == 64,
-                "阿里 = 64（单 IP 2.5~2.7 MB/s，128 只多 11% 却更容易触发限流）");
+                GeZi.Core.Support.PanConnBudget.BudgetFor(2) == GeZi.Core.Support.PanConnBudget.Aliyun,
+                "阿里 = " + GeZi.Core.Support.PanConnBudget.Aliyun);
             Check("pan.budget_xunlei",
-                GeZi.Core.Support.PanConnBudget.BudgetFor(3) == 16,
-                "迅雷 = 16（137 片全开时 CDN 大面积 503）");
+                GeZi.Core.Support.PanConnBudget.BudgetFor(3) == GeZi.Core.Support.PanConnBudget.Xunlei,
+                "迅雷 = " + GeZi.Core.Support.PanConnBudget.Xunlei);
+            // 🚨 测试期四家全部放开：任何一家的预算都不得超过单文件并发天花板，
+            //    否则「预算」和「引擎实际能开的连接数」会对不上，租约会虚拟分配。
+            Check("pan.budget_never_exceeds_ceiling",
+                GeZi.Core.Support.PanConnBudget.Quark <= GeZi.DownloadEngine.Planning.ChunkSplitter.MaxRealConcurrency
+                && GeZi.Core.Support.PanConnBudget.Uc <= GeZi.DownloadEngine.Planning.ChunkSplitter.MaxRealConcurrency
+                && GeZi.Core.Support.PanConnBudget.Aliyun <= GeZi.DownloadEngine.Planning.ChunkSplitter.MaxRealConcurrency
+                && GeZi.Core.Support.PanConnBudget.Xunlei <= GeZi.DownloadEngine.Planning.ChunkSplitter.MaxRealConcurrency,
+                "四家预算都必须 ≤ MaxRealConcurrency=" + GeZi.DownloadEngine.Planning.ChunkSplitter.MaxRealConcurrency);
 
             // ---- 非法网盘号一律当夸克，绝不抛异常 ----
             Check("pan.normalize_negative",

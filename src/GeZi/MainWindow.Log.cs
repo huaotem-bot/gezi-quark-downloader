@@ -185,7 +185,7 @@ namespace GeZi
         /// 每个网盘能承受的最大并发连接数（0 = 不限，交给全局预算均分）。
         ///
         /// <para>
-        /// 这是「不同网盘不同策略」的落点。实测依据：
+        /// 这是「不同网盘不同策略」的落点。**正常态**实测依据：
         /// </para>
         /// <list type="bullet">
         /// <item><b>迅雷 = 16</b>：单 IP 并发上限。137 分片全开时 CDN 大面积 503，
@@ -195,24 +195,30 @@ namespace GeZi
         /// <item><b>夸克 = 0（不限）</b>：没有这个限制，256 并发能跑 20+ MB/s。</item>
         /// <item><b>UC = 256</b>：单 IP 总带宽约 7~8 MB/s，连接再多只会把每条摊薄到看门狗下限以下。</item>
         /// </list>
+        ///
+        /// <para>
+        /// 🚨 2026-11-07 用户要求「四家全部放开，最高 2048」做实测，
+        /// 所以现在**四家统一返回 <see cref="ChunkSplitter.MaxRealConcurrency"/>（2048）**，
+        /// 不再按网盘区分。各家服务端真实限额交给运行时去撞：
+        /// 日志里「在飞 vs 目标」的差、以及 503 / 掉速出现的位置，就是撞出来的结果。
+        /// 这是**测试期取值**，不是新的实测结论。
+        /// 恢复安全默认就把下面四个分支改回 16 / 64 / 0 / 256（原始依据见上方列表）。
+        /// </para>
         /// </summary>
         private static int MaxParallelFor(PanKind kind)
         {
+            // 测试期：四家一律放开到天花板，由 user 在弹窗里自己决定具体用多少。
+            // 注意保留 switch 结构，方便以后一键恢复分网盘上限。
             switch (kind)
             {
                 case PanKind.Xunlei:
-                    return 16;
+                    return GeZi.DownloadEngine.Planning.ChunkSplitter.MaxRealConcurrency;
                 case PanKind.Aliyun:
-                    return 64;
-                // UC 与夸克共用 QuarkClient，但两者的 CDN 限流表现不同：
-                // UC 单 IP 总带宽约 7~8 MB/s，连接堆到 300+ 时每条只剩 13 KB/s 左右，
-                // 正好掉到慢连接看门狗下限（16 KB/s）以下 → 大面积断开重连 →
-                // 握手开销把总速度压得更低（实测 2 任务 378 连接只有 4.85 MB/s，
-                // 关掉一个降到 256 连接反而涨到 7.07 MB/s）。封 256 让单连接保持在 27 KB/s 上下。
+                    return GeZi.DownloadEngine.Planning.ChunkSplitter.MaxRealConcurrency;
                 case PanKind.Uc:
-                    return 256;
+                    return GeZi.DownloadEngine.Planning.ChunkSplitter.MaxRealConcurrency;
                 default:
-                    return 0;   // 夸克：不限
+                    return GeZi.DownloadEngine.Planning.ChunkSplitter.MaxRealConcurrency;
             }
         }
 

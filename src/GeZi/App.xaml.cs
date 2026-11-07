@@ -233,7 +233,11 @@ namespace GeZi
             MainWin.Show();
 
             MainShown = true;
-            NetworkConfig.Apply();
+            // ⚠️ 不能写无参调用：Apply 的默认参数是 64，会在主窗口构造
+            //    （里面已经按 ThreadAllocator.DefaultBudget 建过调度器）之后
+            //    把 ServicePointManager.DefaultConnectionLimit 又压回 64，
+            //    等于把高并发档位悄悄废掉。这里必须显式传同一个预算。
+            NetworkConfig.Apply(ThreadAllocator.DefaultBudget);
         }
 
         /// <summary>

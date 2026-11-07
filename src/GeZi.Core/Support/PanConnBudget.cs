@@ -31,31 +31,32 @@ namespace GeZi.Core.Support
     /// </para>
     ///
     /// <para>
-    /// ⚠️ 这些数字**不是**新的猜测，全部来自既有实测记录（见 AGENTS.md 第四节、
-    /// 记忆/59-整体限速与慢启动、记忆/4-融合引擎与落盘.md:617-625），
-    /// 与 UI 层 <c>MainWindow.MaxParallelFor</c> 逐字一致。
-    /// 唯一差异：夸克在 UI 层返回 0（表示「不限」），这里必须给一个具体数字，
-    /// 而全程序的实际天花板就是 <c>ChunkSplitter.MaxRealConcurrency = 512</c>，
-    /// 所以取 512 —— 与「不限」在现行代码里**行为完全相同**（用户配不出更大的值）。
+    /// ⚠️ 上面四条是**正常态**的实测值，也是安全默认。
+    /// 🚨 2026-11-07 用户要求「四家全部放开，最高 2048」做实测，
+    /// 所以 <see cref="Quark"/> / <see cref="Uc"/> / <see cref="Aliyun"/> / <see cref="Xunlei"/>
+    /// 现在**统一是 2048**（= <c>ChunkSplitter.MaxRealConcurrency</c>），
+    /// 各家服务端真实限额交给运行时自己去撞，日志里「在飞 vs 目标」就是撞出来的结果。
+    /// 这是**测试期取值**，不是新的实测结论；要恢复安全默认就把四个常量改回
+    /// 512 / 256 / 64 / 16（原始依据见 AGENTS.md 第四节、记忆/59-整体限速与慢启动、
+    /// 记忆/4-融合引擎与落盘.md:617-625）。
     /// </para>
     /// </summary>
     public static class PanConnBudget
     {
         /// <summary>
-        /// 夸克：按账号限连接。2026-11-07 测试期从 512 提到 1024，
-        /// 与 <c>ChunkSplitter.MaxRealConcurrency</c>、<c>ThreadAllocator.DefaultBudget</c> 同步；
-        /// 其余三家（UC 256 / 阿里 64 / 迅雷 16）保持实测值不动。
+        /// 夸克：测试期全放开到 2048（与 <c>ChunkSplitter.MaxRealConcurrency</c>、
+        /// <c>ThreadAllocator.DefaultBudget</c> 同步）。正常态实测值是 512。
         /// </summary>
-        public const int Quark = 1024;
+        public const int Quark = 2048;
 
-        /// <summary>UC：单 IP 总带宽 7~8 MB/s，超过 256 条每条掉到 13 KB/s。</summary>
-        public const int Uc = 256;
+        /// <summary>UC：测试期全放开到 2048。正常态实测值是 256（单 IP 7~8 MB/s）。</summary>
+        public const int Uc = 2048;
 
-        /// <summary>阿里云盘：单 IP 约 2.5~2.7 MB/s，64 条已到顶。</summary>
-        public const int Aliyun = 64;
+        /// <summary>阿里云盘：测试期全放开到 2048。正常态实测值是 64（单 IP 2.5~2.7 MB/s）。</summary>
+        public const int Aliyun = 2048;
 
-        /// <summary>迅雷云盘：单 IP 封 16 条，再多触发 CDN 503。</summary>
-        public const int Xunlei = 16;
+        /// <summary>迅雷云盘：测试期全放开到 2048。正常态实测值是 16（单 IP 封 16 条，再多 503）。</summary>
+        public const int Xunlei = 2048;
 
         /// <summary>支持的网盘数量（PanKind: Quark=0 / Uc=1 / Aliyun=2 / Xunlei=3）。</summary>
         public const int PanCount = 4;
