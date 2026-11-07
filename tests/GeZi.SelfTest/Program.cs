@@ -278,7 +278,7 @@ namespace GeZi.SelfTest
         {
             using (var scheduler = new DownloadScheduler(3, 512))
             {
-                Check("scheduler.budget", scheduler.ConnectionBudget == 512,
+                Check("scheduler.budget", scheduler.ConnectionBudget == ThreadAllocator.DefaultBudget,
                     "budget=" + scheduler.ConnectionBudget);
                 Check("scheduler.leased_zero", scheduler.LeasedConnections == 0,
                     "leased=" + scheduler.LeasedConnections);
@@ -2398,9 +2398,14 @@ namespace GeZi.SelfTest
         private static void TestPanConnBudget()
         {
             // ---- 四家预算（既有实测值，改动必须同步 AGENTS.md 与记忆）----
+            // 夸克用常量比对而不是写死数字：2026-11-07 测试期把夸克从 512 提到 1024，
+            // 写死数字会让「改常量」变成「改两处」，正是这个自检要防的事。
             Check("pan.budget_quark",
-                GeZi.Core.Support.PanConnBudget.BudgetFor(0) == 512,
-                "夸克 = 512（按账号限连接，512 条跑满带宽的实测拐点）");
+                GeZi.Core.Support.PanConnBudget.BudgetFor(0) == GeZi.Core.Support.PanConnBudget.Quark,
+                "夸克 = " + GeZi.Core.Support.PanConnBudget.Quark + "（按账号限连接）");
+            Check("pan.budget_quark_follows_chunk_splitter",
+                GeZi.Core.Support.PanConnBudget.Quark == GeZi.DownloadEngine.Planning.ChunkSplitter.MaxRealConcurrency,
+                "夸克预算必须等于单文件并发天花板，否则「不限」与「上限」会互相打架");
             Check("pan.budget_uc",
                 GeZi.Core.Support.PanConnBudget.BudgetFor(1) == 256,
                 "UC = 256（单 IP 7~8 MB/s，超过 256 每条掉到 13 KB/s 跌破看门狗）");
@@ -2419,7 +2424,7 @@ namespace GeZi.SelfTest
                 GeZi.Core.Support.PanConnBudget.NormalizePanKind(99) == 0,
                 "越界网盘号归一成夸克");
             Check("pan.budget_unknown",
-                GeZi.Core.Support.PanConnBudget.BudgetFor(42) == 512,
+                GeZi.Core.Support.PanConnBudget.BudgetFor(42) == GeZi.Core.Support.PanConnBudget.Quark,
                 "未知网盘号按夸克预算，不抛异常");
 
             // ---- 单任务软上限 = 份额 × 2，且永不超过本网盘预算 ----
@@ -2454,10 +2459,10 @@ namespace GeZi.SelfTest
                 "迅雷四个任务各拿 4，仍然不会低于 1");
             Check("pan.block_quark_never_capped",
                 GeZi.Core.Support.PanConnBudget.BlockingMinimum(512, 1) == 16,
-                "夸克单任务阻塞下限就是 16，不会被放大（对既有行为零影响）");
+                "预算 512 的单任务阻塞下限就是 16，不会被放大（对既有行为零影响）");
             Check("pan.block_quark_many",
                 GeZi.Core.Support.PanConnBudget.BlockingMinimum(512, 6) == 16,
-                "夸克六任务份额 85 仍大于 16，阻塞下限保持 16");
+                "预算 512 配六任务时份额 85 仍大于 16，阻塞下限保持 16");
             Check("pan.block_running_zero",
                 GeZi.Core.Support.PanConnBudget.BlockingMinimum(16, 0) == 16,
                 "在跑任务数为 0 时按 1 处理，不除零");

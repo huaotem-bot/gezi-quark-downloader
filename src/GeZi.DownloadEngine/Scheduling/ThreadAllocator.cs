@@ -34,9 +34,12 @@ namespace GeZi.DownloadEngine
     public static class ThreadAllocator
     {
         /// <summary>
-        /// 总连接预算。夸克按账号限制总连接数，Python 版实测 512 为最优总量。
+        /// 单网盘的总连接预算（2026-11-07 测试期从 512 提到 1024，与
+        /// <c>PanConnBudget.Quark</c> 和 <c>ChunkSplitter.MaxRealConcurrency</c> 同步）。
+        /// 这个值只是「分配器可用的水池」，真正的天花板仍是各网盘自己的预算：
+        /// 夸克 1024 / UC 256 / 阿里 64 / 迅雷 16，由 <c>PanConnBudget.BudgetFor</c> 决定。
         /// </summary>
-        public const int DefaultBudget = 512;
+        public const int DefaultBudget = 1024;
 
         /// <summary>单个文件至少给几条连接 —— 保证小文件也下得动，不会被大文件挤成 0。</summary>
         public const int MinPerFile = 4;

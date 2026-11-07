@@ -247,7 +247,7 @@ namespace GeZi.DownloadEngine
             catch { return dest; }
         }
 
-        public DownloadScheduler(int maxConcurrent = 3, int connBudget = 512)
+        public DownloadScheduler(int maxConcurrent = 3, int connBudget = ThreadAllocator.DefaultBudget)
         {
             _maxConcurrent = Math.Max(1, maxConcurrent);
             _sem = new SemaphoreSlim(_maxConcurrent);

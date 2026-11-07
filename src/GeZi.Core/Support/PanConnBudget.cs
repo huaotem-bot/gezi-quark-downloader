@@ -41,8 +41,12 @@ namespace GeZi.Core.Support
     /// </summary>
     public static class PanConnBudget
     {
-        /// <summary>夸克：按账号限连接，512 条可跑满带宽（实测拐点）。</summary>
-        public const int Quark = 512;
+        /// <summary>
+        /// 夸克：按账号限连接。2026-11-07 测试期从 512 提到 1024，
+        /// 与 <c>ChunkSplitter.MaxRealConcurrency</c>、<c>ThreadAllocator.DefaultBudget</c> 同步；
+        /// 其余三家（UC 256 / 阿里 64 / 迅雷 16）保持实测值不动。
+        /// </summary>
+        public const int Quark = 1024;
 
         /// <summary>UC：单 IP 总带宽 7~8 MB/s，超过 256 条每条掉到 13 KB/s。</summary>
         public const int Uc = 256;
