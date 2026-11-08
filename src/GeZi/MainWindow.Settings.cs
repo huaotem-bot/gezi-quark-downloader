@@ -426,11 +426,12 @@ namespace GeZi
             //   440 是「标题 + 说明 + 卡片 + 按钮」四行估出来的，但标题是重复的
             //   （见下），且卡片行用了 Star 把四行网盘拉满整卡，多出约 150px 死白。
             //   删掉重复标题 + 卡片贴内容（Auto）后，实际内容 ≈ 340，窗口跟着收。
-            // 🚨🚨 2026-11-08 第四次修正：窗口 400 → 370。
-            //   实测 400 底部多出约 35px 死白。精确算一遍内容高：
-            //   上边距 20 + hint(折两行 38 + 下距 12) + card(内边距 18+四行34+4×14+18 ≈ 228)
-            //   + btns(32 + 上距 14) + 下边距 20 ≈ 364。取 370 留 6px 呼吸，刚好不挡按钮也不空。
-            DialogChrome.StyleWindow(dlg, 460, 370);
+            // 🚨🚨 2026-11-08 第五次修正：窗口 370 → 350。
+            //   精确内容高：上边距 20 + hint(单行 19 + 下距 12) + card(内边距 18×2 + 四行 34+4×14 ≈ 228)
+            //   + btns(32 + 上距 14) + 下边距 20 ≈ 305。
+            //   370 时底部多出约 25px 死白。收到 350（可用 310）留 5px 呼吸，刚好不挡也不空。
+            //   ⚠️ 前提：hint 必须**单行**（两行会撑高 19px、又会挡按钮），所以下方文字已缩短。
+            DialogChrome.StyleWindow(dlg, 460, 350);
 
             var root = DialogChrome.DialogRoot();
             // 🚨 2026-11-08 修「标题画两遍」：`StyleWindow` 的窗口标题已经画在自绘标题栏里，
@@ -440,7 +441,7 @@ namespace GeZi
             root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });   // card（贴内容）
             root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });   // btns
 
-            var hint = DialogChrome.Hint("默认已按各家服务端上限取好连接数，可单独调整；选得太高会自动降下来。", 0, 12);
+            var hint = DialogChrome.Hint("默认已按各家服务端上限取好，可单独调整；选太高会自动降下来。", 0, 12);
             hint.TextWrapping = TextWrapping.Wrap;
             Grid.SetRow(hint, 0);
             root.Children.Add(hint);
