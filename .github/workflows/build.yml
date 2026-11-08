@@ -42,6 +42,11 @@ jobs:
         run: dotnet run --project tests/GeZi.SelfTest/GeZi.SelfTest.csproj -c Release --no-build
 
       - name: Package (LICENSE / SHA256 / SBOM / PDB)
+        # runner 的控制台默认不是 UTF-8，脚本里的中文日志会撞 UnicodeEncodeError。
+        # 脚本内部已 reconfigure，这里再兜一层环境变量，双保险。
+        env:
+          PYTHONIOENCODING: utf-8
+          PYTHONUTF8: "1"
         run: python tools/package_release.py --from-build --out artifacts
 
       - name: Upload artifact

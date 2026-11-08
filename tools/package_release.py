@@ -28,6 +28,19 @@ import sys
 import zipfile
 
 # ---------------------------------------------------------------------------
+# 控制台编码兜底。
+# GitHub Actions 的 Windows runner 默认 stdout 是 cp1252，打一行中文日志就会
+# 抛 UnicodeEncodeError 直接 exit 1（本地中文系统多为 GBK，同样可能缺字）。
+# 这里统一把两个流切到 UTF-8；重定向成非 TextIOWrapper 时没有 reconfigure，
+# 吞掉异常即可。
+# ---------------------------------------------------------------------------
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
+
+# ---------------------------------------------------------------------------
 # 白名单：发布包里**只允许**出现这些文件。
 # 新增原生依赖时，这里必须同步（libssl/libcrypto 是 TLS 桥接用的，见 GeZi.Core.csproj）。
 # ---------------------------------------------------------------------------
