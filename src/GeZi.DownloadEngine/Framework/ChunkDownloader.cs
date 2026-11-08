@@ -399,6 +399,15 @@ internal class ChunkDownloader
                     await _storage.WriteAsync(Chunk.Start + Chunk.Position - _configuration.RangeLow, buffer, readSize).ConfigureAwait(false);
                     Chunk.Position += readSize;
 
+                    // 🚨 2026-11-08：分片可能在写期间被抢占/末段补片切分（End 缩小）。
+                    // 切分线程会把原片 Position 夹回新 Length，但若本 worker 在切分**之后**才
+                    // 完成 `Position += readSize`，又会让 Position 越过新 Length（竞态）。
+                    // 这里补一道防御性夹取：Position 永不超过 Length，保证「进度账」与
+                    // 「完成判据」不漂移（真正写进尾片区间的字节由尾片重新下，无害）。
+                    long clampLen = Chunk.Length;
+                    if (Chunk.Position > clampLen)
+                        Chunk.Position = clampLen;
+
                     OnDownloadProgressChanged(new DownloadProgressChangedEventArgs(Chunk.Id) {
                         TotalBytesToReceive = Chunk.Length,
                         ReceivedBytesSize = Chunk.Position,

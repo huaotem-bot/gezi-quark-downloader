@@ -2936,23 +2936,32 @@ public class DownloadService : AbstractDownloadService
         // 保存快照期间不切分（方案 E）：切分是「下次再切也行」的优化，跳过一轮无感知。
         if (_chunkSplitPaused) return false;
 
-        long pos = Interlocked.Read(ref chunk.PositionRaw);
-        long curStart = chunk.Start + pos;
-        long curEnd = chunk.End;
-
-        long remain = curEnd - curStart + 1;
-        // 切完尾巴后，原片剩下的部分也得够看（至少还能跑一小段）。
-        if (remain <= tailBytes)
-            return false;
-
-        long tailStart = curEnd - tailBytes + 1;
-        long newEnd = tailStart - 1;
-
-        // 先改原片 End，再入队 —— 顺序与 TrySplitChunk 一致（理由见那里的注释）。
-        // 同 TrySplitChunk：改 End 与登记新片必须原子（方案 A）。
+        // 🚨🚨 2026-11-08 修「进度 100% 却还在下载、必须重启续传才完成」的真根因：
+        //   之前在**锁外**读 Position/End，并发写该片的 worker 会在「读」与「改 End」
+        //   之间推进 Position，造成「原片 Position 越过新 End（多算）+ 尾片从 0 开始（少算）」，
+        //   一加一减总量碰巧 = 总长 → 进度 100%，但逐片看尾片没下满 → AllChunksDone 恒 false。
+        //   现在所有读都挪进锁内，并用 ChunkSplitAccounting 把「原片已写但越过新 End」的
+        //   字节转记到尾片，进度与完成判据永远同源。
         lock (_chunkTableLock)
         {
+            long start = chunk.Start;
+            long pos = Interlocked.Read(ref chunk.PositionRaw);
+            long curEnd = chunk.End;
+
+            long remain = curEnd - (start + pos) + 1;
+            // 切完尾巴后，原片剩下的部分也得够看（至少还能跑一小段）。
+            if (remain <= tailBytes)
+                return false;
+
+            long tailStart = curEnd - tailBytes + 1;
+            long newEnd = tailStart - 1;
+
+            // 对账：原片已写但越过新 End 的字节，转记到尾片（这些字节实际落在尾片区间）。
+            long newPos, carried;
+            GeZi.Core.Support.ChunkSplitAccounting.Reconcile(start, pos, newEnd, out newPos, out carried);
+
             chunk.End = newEnd;
+            chunk.Position = newPos;   // 夹回新 Length，避免「Position 越过 End」虚高
 
             var tail = new Chunk(tailStart, curEnd)
             {
@@ -2960,10 +2969,11 @@ public class DownloadService : AbstractDownloadService
                 MaxTryAgainOnFailover = chunk.MaxTryAgainOnFailover,
                 Timeout = chunk.Timeout
             };
+            tail.Position = carried;   // 尾片继承原片已写进它区间的字节，不多算也不少算
 
             queue.Enqueue(tail);
             _splitChunks[tail.Id] = tail;
-            _logger?.LogDebug($"末段补片：分片 {chunk.Id} 切出尾部 {tail.Id}（{tailBytes} 字节，{tailStart}-{curEnd}）");
+            _logger?.LogDebug($"末段补片：分片 {chunk.Id} 切出尾部 {tail.Id}（{tailBytes} 字节，{tailStart}-{curEnd}，转记 {carried} 字节）");
         }
         return true;
     }
@@ -2984,25 +2994,27 @@ public class DownloadService : AbstractDownloadService
         // 保存快照期间不切分（方案 E）。
         if (_chunkSplitPaused) return false;
 
-        long pos = Interlocked.Read(ref chunk.PositionRaw);
-        long curStart = chunk.Start + pos;
-        long curEnd = chunk.End;
-
-        long remain = curEnd - curStart + 1;
-        if (remain < minBytes * 2)
-            return false;   // 切完两半都太小，没意义
-
-        long mid = curStart + remain / 2 - 1;
-
-        // 先改原分片的 End（让它尽快收尾），再把后半段入队。
-        // 顺序很重要：若先入队再改 End，后半段可能被 worker 立刻领走并开始下载，
-        // 而原分片仍以为 End 是旧值，两边就会下同一段（虽然写盘位置不同不会损坏，
-        // 但白白浪费带宽）。
-        // 2026-11-01（方案 A）：「改 End + 登记新片」必须原子，否则保存快照会撞进中间态。
-        // 锁内不含任何 I/O，微秒级，对吞吐无影响。
+        // 🚨🚨 2026-11-08 修「进度 100% 却还在下载」：与 TrySplitChunkTail 同一个竞态
+        //   —— 锁外读 Position、锁内改 End，worker 并发推进会漏算/多算。
+        //   改成锁内读 + ChunkSplitAccounting 对账（原片超额字节转记到尾片）。
         lock (_chunkTableLock)
         {
+            long start = chunk.Start;
+            long pos = Interlocked.Read(ref chunk.PositionRaw);
+            long curEnd = chunk.End;
+
+            long remain = curEnd - (start + pos) + 1;
+            if (remain < minBytes * 2)
+                return false;   // 切完两半都太小，没意义
+
+            long mid = start + pos + remain / 2 - 1;
+
+            // 对账：原片已写但越过新 End 的字节，转记到尾片。
+            long newPos, carried;
+            GeZi.Core.Support.ChunkSplitAccounting.Reconcile(start, pos, mid, out newPos, out carried);
+
             chunk.End = mid;
+            chunk.Position = newPos;
 
             var tail = new Chunk(mid + 1, curEnd)
             {
@@ -3010,10 +3022,11 @@ public class DownloadService : AbstractDownloadService
                 MaxTryAgainOnFailover = chunk.MaxTryAgainOnFailover,
                 Timeout = chunk.Timeout
             };
+            tail.Position = carried;
 
             queue.Enqueue(tail);
             _splitChunks[tail.Id] = tail;
-            _logger?.LogDebug($"抢占分片 {chunk.Id}：在 {mid} 处切开，尾部 {tail.Id}（{curEnd - mid} 字节）");
+            _logger?.LogDebug($"抢占分片 {chunk.Id}：在 {mid} 处切开，尾部 {tail.Id}（{curEnd - mid} 字节，转记 {carried} 字节）");
         }
         return true;
     }

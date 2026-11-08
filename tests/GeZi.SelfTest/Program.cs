@@ -134,6 +134,7 @@ namespace GeZi.SelfTest
     Run("pan_conn_budget", TestPanConnBudget);
     Run("chunk_splitter", TestChunkSplitter);
     Run("slow_watchdog", TestSlowWatchdog);
+    Run("chunk_split_accounting", TestChunkSplitAccounting);
     Run("connection_climber", TestConnectionClimber);
     Run("disk_conn_budget", TestDiskConnBudget);
     Run("range_downgrade_gate", TestRangeDowngradeGate);
@@ -2694,6 +2695,37 @@ namespace GeZi.SelfTest
             Check("watch.endgame_dead_still_reconnect",
                 SlowWatchdog.ShouldReconnect(0, 40 * 1024, SlowWatchdog.EndgameReconnectCostMs),
                 "收尾期读到 0 字节（彻底挂死）仍必须换，不受门槛抬高影响");
+        }
+
+        /// <summary>
+        /// 2026-11-08：分片切分记账对账（进度 100% 却还在下载的真根因）。
+        /// </summary>
+        private static void TestChunkSplitAccounting()
+        {
+            // 正常情况：Position 未越过新 End，无超额，carriedBytes=0。
+            long p, carried;
+            ChunkSplitAccounting.Reconcile(0, 75, 100, out p, out carried);
+            Check("splitacct.no_overflow",
+                p == 75 && carried == 0,
+                "Position 75 ≤ 新长度 101，原样保留、无转记");
+
+            // 竞态情况：原片已写到 90，但新 End 只到 80（新长度 81）→ 超额 9 字节要转记到尾片。
+            ChunkSplitAccounting.Reconcile(0, 90, 80, out p, out carried);
+            Check("splitacct.overflow_carried",
+                p == 81 && carried == 9,
+                "原片写到 90、新 End=80 → 原片夹回 81、转记 9 字节到尾片");
+
+            // 非零起点：Start=1000、Position=50（写到 1049）、新 End=1040（新长度 41）。
+            ChunkSplitAccounting.Reconcile(1000, 50, 1040, out p, out carried);
+            Check("splitacct.nonzero_start",
+                p == 41 && carried == 9,
+                "Start=1000 时 Position 相对起点，50 越过新长度 41 → 夹回 41、转记 9");
+
+            // 负 Position 防御：不崩溃、归 0。
+            ChunkSplitAccounting.Reconcile(0, -5, 100, out p, out carried);
+            Check("splitacct.negative_position",
+                p == 0 && carried == 0,
+                "Position 为负时归 0、不抛异常");
         }
 
         /// <summary>
