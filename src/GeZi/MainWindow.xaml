@@ -1790,7 +1790,12 @@
                                     <Grid Grid.Column="0" Margin="0,0,12,0">
                                         <Grid.RowDefinitions>
                                             <RowDefinition Height="Auto"/>
-                                            <RowDefinition Height="Auto"/>
+                                            <!-- 🚨 2026-11-08 第二行 Auto → *：左列原来两行都是 Auto，
+                                                 右列比左列高时，左列 Grid 被拉到右列同高、但两张卡都是自然高度
+                                                 → 「窗口与后台」下方露出大片纯白（用户报「下方这么多空白」）。
+                                                 改成 * 让「窗口与后台」卡 stretch 填满左列剩余高度，
+                                                 与右列「播放器」卡（* 行）对称，两列底部严格对齐。 -->
+                                            <RowDefinition Height="*"/>
                                         </Grid.RowDefinitions>
                                     <!-- ① 网络与下载 -->
                                     <!-- ① 网络与下载：跨 Row 0-1（用户指定的红框范围）。

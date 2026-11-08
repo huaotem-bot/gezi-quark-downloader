@@ -236,10 +236,13 @@ public class DownloadService : AbstractDownloadService
     }
 
     /// <summary>
-    /// 收尾期降并发的下限：再怎么收尾也不压到 4 路以下，
-    /// 否则最后几 MB 会被压得比多开几条还慢。
+    /// 收尾期降并发的下限：再怎么收尾也不压到 64 路以下。
+    /// 🚨 2026-11-08 实测：原来 4 路会把最后 1~2% 压成「只剩个位数片、
+    /// 每个片靠 1 条连接下、这条连接被限速后反复重连磨 40 秒」（日志 12:59~13:00 段）。
+    /// 抬到 64 保留「少空转抢锁」的好处，但绝不把最后一段逼成孤军奋战——
+    /// 64 路足以让 TryRefillTail 把大片尾巴切碎后多路并行冲完。
     /// </summary>
-    private const int EndgameMinCap = 4;
+    private const int EndgameMinCap = 64;
 
     /// <summary>
     /// 降并发时给「补片探针」留的余量：始终允许少量空闲 worker 越过上限去调

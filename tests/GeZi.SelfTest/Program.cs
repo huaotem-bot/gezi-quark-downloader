@@ -3177,29 +3177,18 @@ namespace GeZi.SelfTest
             Check("slowstart.non_power_of_two", a100 == 100,
                 "max=100 时 16²=256 应封顶到 100，实际=" + a100);
 
-            // ⑤ 溢出保护：见下方 slowstart.huge_no_overflow（线性段的 long 加法）。
-            //    ⚠️ 2026-11-08 改了增长规则以后，这一段不再是"平方封顶"，
-            //    原来的 `NextAllowed(65536, 1<<30) == 1<<30` 已不成立（现在是 65536+125）。
+            // ⑤ 溢出保护：纯平方阶段 current² 超过 max 直接封顶（2026-11-08 改回纯平方）。
             Check("slowstart.square_stage_ceiling",
-                SlowStartGate.NextAllowed(16, 1 << 30) == SlowStartGate.LinearStart,
-                "前段平方必须停在 LinearStart=256 而不再继续平方，实际="
-                + SlowStartGate.NextAllowed(16, 1 << 30));
-
-            // ⑤b 后段改为线性：>=256 之后每跳固定 +125（2026-11-08 用户要求）
-            Check("slowstart.linear_from_256",
-                SlowStartGate.NextAllowed(256, 4096) == 381,
-                "256 之后应 +125 到 381，实际=" + SlowStartGate.NextAllowed(256, 4096));
-            Check("slowstart.linear_step_125",
-                SlowStartGate.NextAllowed(381, 4096) == 506,
-                "381 之后应 +125 到 506，实际=" + SlowStartGate.NextAllowed(381, 4096));
-            Check("slowstart.linear_capped",
-                SlowStartGate.NextAllowed(4000, 4096) == 4096,
-                "4000+125 超过上限应封顶 4096，实际=" + SlowStartGate.NextAllowed(4000, 4096));
+                SlowStartGate.NextAllowed(16, 1 << 30) == 256,
+                "前段平方 16² 应到 256，实际=" + SlowStartGate.NextAllowed(16, 1 << 30));
+            Check("slowstart.square_next_jump_to_max",
+                SlowStartGate.NextAllowed(256, 4096) == 4096,
+                "256² 超过 4096 应一步封顶到 4096，实际=" + SlowStartGate.NextAllowed(256, 4096));
             Check("slowstart.huge_no_overflow",
                 SlowStartGate.NextAllowed(int.MaxValue - 10, int.MaxValue) == int.MaxValue,
                 "接近 int.MaxValue 时不能溢出成负数");
 
-            // ⑤c 平滑性：整条 1→4096 的序列，256 之后每跳涨幅不得超过 125
+            // ⑤c 纯平方序列：1→2→4→16→256→4096，5 跳封顶
             var seq = new System.Collections.Generic.List<int>();
             int cursor = 1;
             seq.Add(cursor);
@@ -3208,20 +3197,10 @@ namespace GeZi.SelfTest
                 cursor = SlowStartGate.NextAllowed(cursor, 4096);
                 seq.Add(cursor);
             }
-            bool smooth = true;
-            int worstJump = 0;
-            for (int i = 1; i < seq.Count; i++)
-            {
-                int jump = seq[i] - seq[i - 1];
-                if (jump > worstJump) worstJump = jump;
-                if (seq[i - 1] >= SlowStartGate.LinearStart && jump > SlowStartGate.LinearStep) smooth = false;
-            }
-            Check("slowstart.smooth_after_256", smooth,
-                "256 之后每跳不得超过 125，实际最大跳=" + worstJump);
             Check("slowstart.reaches_ceiling", seq[seq.Count - 1] == 4096,
                 "序列必须能爬到 4096，实际=" + seq[seq.Count - 1]);
-            Check("slowstart.jumps_within_budget", seq.Count - 1 <= 40,
-                "爬满 4096 的跳数应 ≤40（每跳 150ms ⇒ 不超过 6 秒），实际=" + (seq.Count - 1));
+            Check("slowstart.jumps_within_budget", seq.Count - 1 <= 10,
+                "纯平方爬满 4096 的跳数应 ≤10（1→2→4→16→256→4096 共 5 跳），实际=" + (seq.Count - 1));
 
             // ⑥ 非法输入：max=0 / 负数按 1 处理；current=0 按 1 处理
             Check("slowstart.invalid_max", new SlowStartGate(0).MaxWorkers == 1,

@@ -40,21 +40,13 @@ namespace GeZi.DownloadEngine.Framework
     /// </summary>
     public class SlowStartGate
     {
-        /// <summary>
-        /// 平方增长阶段的终点：<c>current &gt;= 256</c> 之后改为每跳固定 +<see cref="LinearStep"/>。
-        ///
-        /// <para>
-        /// 为什么是 256：①它正好是平方序列 1→2→4→16→256 的最后一项（不用改前段序列）；
-        /// ②低于 256 时连接还少，平方增长不会触发风控；
-        /// ③高于 256 之后，实测 256→2048 这样一步跳 8 倍会被 CDN 判成异常流量。
-        /// </para>
-        /// </summary>
-        public const int LinearStart = 256;
-
-        /// <summary>
-        /// 平方阶段之后每一跳固定增加的连接数（用户 2026-11-08 指定 125）。
-        /// </summary>
-        public const int LinearStep = 125;
+        // 🚨 2026-11-08 用户实测后拍板：「线程爬升确实有点慢了改回以前的吧」。
+        // 原「前段平方 + 后段每跳 +125」的分段增长已整体删除，恢复为**纯平方增长**：
+        //   1 → 2 → 4 → 16 → 256 → 65536（直接封顶到上限）
+        // 256 的下一跳是 256²=65536，一步跳到顶。前段「先确认少量连接能通、且没触发风控」
+        // 的保护完整保留（1→2→4→16→256 五步 ≈ 0.6 秒），后段不再磨蹭。
+        // ⚠️ 当初分段是 2026-11-08 用户要求「每次只加 125 线程」，实测爬满 3000 路要 31 跳 ≈ 4.8 秒，
+        //    用户嫌慢，所以又改回纯平方。别再把线性分段加回来。
 
         private readonly int _maxWorkers;
         private int _allowed;
@@ -80,23 +72,14 @@ namespace GeZi.DownloadEngine.Framework
         /// 算出「再放一批」之后应该是多少路。纯计算，不改状态。
         ///
         /// <para>
-        /// 🚨🚨 2026-11-08 改成分段增长（用户要求原话：「咱们 1→2→4→16→256→2048→3000
-        /// 这么走还是不够平缓，我希望每次跳跃只加 125 线程，这样足够缓慢足够好」）：
+        /// 🚨🚨 2026-11-08 恢复为纯平方增长（用户要求「改回以前的吧」）。
+        /// 规则与 git <c>7b6f378</c> 版本完全一致：
         /// </para>
         /// <list type="bullet">
-        /// <item><b>前段（&lt; 256）仍走平方</b>：1 → 2 → 4 → 16 → 256，4 步 ≈ 0.6 秒。
-        /// 这一段必须保留平方，因为它的作用是「先确认少量连接能通、且没触发风控」，
-        /// 平方能在 1 秒内完成这个验证；换成 +125 的话第一跳就开 126 条，
-        /// 等于把「握手风暴」的保护直接扔掉。</item>
-        /// <item><b>后段（≥ 256）每跳固定 +125</b>：256 → 381 → 506 → 631 …
-        /// 原来 256→2048 是一步跳 8 倍，实测这一跳会让 CDN 瞬间判定为异常流量
-        /// （大量 503 + 慢连接），爬坡期反而比平缓增长更慢。</item>
+        /// <item>1 → 2 → 4 → 16 → 256 → 65536（&gt; max 时封顶到 max）。</item>
+        /// <item>平方（不是翻倍）是关键：翻倍要 8 步才到 256，平方只要 4 步，
+        /// 爬坡延迟从数秒降到 1 秒出头，同时保留「先确认少量连接可用再放量」的保护。</item>
         /// </list>
-        ///
-        /// <para>
-        /// 代价（已算过，可接受）：3000 路从 6 跳变成 31 跳，
-        /// 每跳 150ms ⇒ 爬满约 4.8 秒（原 0.9 秒）。
-        /// </para>
         /// </summary>
         public static int NextAllowed(int current, int maxWorkers)
         {
@@ -105,19 +88,10 @@ namespace GeZi.DownloadEngine.Framework
             if (current >= max) return max;
             if (current == 1) return Math.Min(2, max);
 
-            // 后段：线性 +125（用户指定步长）。用 long 相加防溢出。
-            if (current >= LinearStart)
-            {
-                long next = (long)current + LinearStep;
-                return next > max ? max : (int)next;
-            }
-
-            // 前段：平方增长，但**不得越过** LinearStart（否则 16² = 256 之后的下一跳
-            // 会从 256 直接平方到 4096，又变回「一步跳 16 倍」）。
-            int ceiling = max < LinearStart ? max : LinearStart;
-            if (current > ceiling / current) return ceiling;
+            // 纯平方：current² 超过 max 时直接封顶（256²=65536 对 3000/4096 上限就是一步到顶）。
+            if (current > max / current) return max;
             int nextSquared = current * current;
-            return nextSquared > ceiling ? ceiling : nextSquared;
+            return nextSquared > max ? max : nextSquared;
         }
 
         /// <summary>
