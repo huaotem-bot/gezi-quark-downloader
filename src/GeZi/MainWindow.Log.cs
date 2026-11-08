@@ -244,13 +244,23 @@ namespace GeZi
 
         /// <summary>
         /// 🚨 2026-11-07：这个网盘的**默认**并发连接数（不看 per-pan 覆盖）。
-        /// 全局 <c>Threads</c>（默认 256）→ 再叠加各服务端硬上限。
+        /// 🚨🚨 2026-11-08：默认值改为按网盘各定一档（用户拍板）：
+        /// 夸克 512 / UC 256 / 阿里 64 / 迅雷 16 —— 不再统一读全局 <c>Threads</c>。
+        /// 依据是各家服务端实测拐点：夸克按连接限速加连接线性有效、UC 单 IP 7~8 MB/s 超 256 掉速、
+        /// 阿里单 IP 约 2.5~2.7 MB/s、迅雷单 IP 封 16 条再多 503。
         /// 设置页全局下拉已删、弹窗不再有「跟随全局」项 —— 用这个直接把默认数字显示出来，
-        /// 也用作「恢复默认」按钮的目标值。
+        /// 也用作「恢复默认」按钮的目标值。最后仍叠加档位天花板 <see cref="MaxParallelFor"/>。
         /// </summary>
         private int DefaultThreadsFor(PanKind kind)
         {
-            int want = _settings.Threads > 0 ? _settings.Threads : 256;
+            int want;
+            switch (kind)
+            {
+                case PanKind.Uc: want = 256; break;
+                case PanKind.Aliyun: want = 64; break;
+                case PanKind.Xunlei: want = 16; break;
+                default: want = 512; break; // 夸克
+            }
             int cap = MaxParallelFor(kind);
             if (cap > 0 && want > cap) return cap;
             return want;
