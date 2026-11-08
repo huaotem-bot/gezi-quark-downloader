@@ -136,6 +136,7 @@ namespace GeZi.SelfTest
     Run("slow_watchdog", TestSlowWatchdog);
     Run("disk_conn_budget", TestDiskConnBudget);
     Run("range_downgrade_gate", TestRangeDowngradeGate);
+    Run("speed_tier", TestSpeedTier);
     Run("bandwidth_smoothing", TestBandwidthSmoothing);
     Run("log_redactor", TestLogRedactor);
         Run("pending_canresume", TestPendingCanResume);
@@ -2928,6 +2929,91 @@ namespace GeZi.SelfTest
         }
 
 
+        /// <summary>
+        /// 速度档位（标准/输出/超载）的纯函数。语义是「天花板」不是「预设值」：
+        /// 档位只决定最多能开多少连接，实际并发仍由四家网盘各自的值决定。
+        /// </summary>
+        private static void TestSpeedTier()
+        {
+            // ① 常量本身
+            Check("tier.constant_count", GeZi.Core.Support.SpeedTier.TierCount == 3,
+                "档位数应为 3");
+            Check("tier.standard_ceiling",
+                GeZi.Core.Support.SpeedTier.Ceiling(GeZi.Core.Support.SpeedTier.Standard) == 512,
+                "标准档天花板应为 512（与改造前行为一致）");
+            Check("tier.boost_ceiling",
+                GeZi.Core.Support.SpeedTier.Ceiling(GeZi.Core.Support.SpeedTier.Boost) == 2048,
+                "输出档天花板应为 2048");
+            Check("tier.overload_ceiling",
+                GeZi.Core.Support.SpeedTier.Ceiling(GeZi.Core.Support.SpeedTier.Overload) == 4096,
+                "超载档天花板应为 4096");
+            Check("tier.ceiling_never_exceeds_hard_limit",
+                GeZi.Core.Support.SpeedTier.Ceiling(GeZi.Core.Support.SpeedTier.Overload)
+                    <= GeZi.DownloadEngine.Planning.ChunkSplitter.MaxRealConcurrency,
+                "超载档天花板不能超过 ChunkSplitter.MaxRealConcurrency，否则设置页档位与上限不一致");
+
+            // ② Normalize：越界一律夹回合法档位，绝不抛异常
+            Check("tier.normalize_negative",
+                GeZi.Core.Support.SpeedTier.Normalize(-5) == GeZi.Core.Support.SpeedTier.Standard,
+                "负数应归到标准档");
+            Check("tier.normalize_overflow",
+                GeZi.Core.Support.SpeedTier.Normalize(99) == GeZi.Core.Support.SpeedTier.Overload,
+                "超界应归到最高档（不能变成 0 以外的东西）");
+            Check("tier.normalize_keeps_valid",
+                GeZi.Core.Support.SpeedTier.Normalize(1) == GeZi.Core.Support.SpeedTier.Boost,
+                "合法值必须原样返回");
+
+            // ③ Clamp：0 表示「未单独配置」，必须原样保留；正数才夹
+            Check("tier.clamp_zero_untouched",
+                GeZi.Core.Support.SpeedTier.Clamp(0, GeZi.Core.Support.SpeedTier.Standard) == 0,
+                "0 表示未单独配置，不能被夹成别的值（否则会丢掉回落语义）");
+            Check("tier.clamp_standard",
+                GeZi.Core.Support.SpeedTier.Clamp(4096, GeZi.Core.Support.SpeedTier.Standard) == 512,
+                "标准档下 4096 应被夹到 512");
+            Check("tier.clamp_boost",
+                GeZi.Core.Support.SpeedTier.Clamp(4096, GeZi.Core.Support.SpeedTier.Boost) == 2048,
+                "输出档下 4096 应被夹到 2048");
+            Check("tier.clamp_overload_keeps",
+                GeZi.Core.Support.SpeedTier.Clamp(4096, GeZi.Core.Support.SpeedTier.Overload) == 4096,
+                "超载档下 4096 应保持 4096");
+            Check("tier.clamp_below_ceiling_keeps",
+                GeZi.Core.Support.SpeedTier.Clamp(64, GeZi.Core.Support.SpeedTier.Standard) == 64,
+                "低于天花板的合法值必须原样保留");
+
+            // ④ VisiblePresets：下拉候选必须按档位过滤，否则标准档还能选到 4096
+            int[] all = { 16, 32, 64, 128, 256, 512, 1024, 2048, 4096 };
+            int[] std = GeZi.Core.Support.SpeedTier.VisiblePresets(all, GeZi.Core.Support.SpeedTier.Standard);
+            Check("tier.presets_standard", std.Length == 6 && std[std.Length - 1] == 512,
+                "标准档应只暴露到 512，实际档位=" + string.Join(",", std));
+            int[] boost = GeZi.Core.Support.SpeedTier.VisiblePresets(all, GeZi.Core.Support.SpeedTier.Boost);
+            Check("tier.presets_boost", boost.Length == 8 && boost[boost.Length - 1] == 2048,
+                "输出档应只暴露到 2048，实际档位=" + string.Join(",", boost));
+            int[] over = GeZi.Core.Support.SpeedTier.VisiblePresets(all, GeZi.Core.Support.SpeedTier.Overload);
+            Check("tier.presets_overload_keeps_all", over.Length == all.Length,
+                "超载档应保留全部档位，实际=" + string.Join(",", over));
+            int[] tiny = GeZi.Core.Support.SpeedTier.VisiblePresets(new[] { 4096 }, GeZi.Core.Support.SpeedTier.Standard);
+            Check("tier.presets_never_empty", tiny.Length >= 1,
+                "一个档位都不满足时也必须返回至少一项，否则下拉会是空的");
+            int[] none = GeZi.Core.Support.SpeedTier.VisiblePresets(null, GeZi.Core.Support.SpeedTier.Standard);
+            Check("tier.presets_null_safe", none != null && none.Length == 0,
+                "传 null 应安全返回空数组（调用方传的都是真实档位表，不会走到这里）");
+
+            // ⑤ Name / Hint 不能是空串（界面直接显示）
+            for (int t = 0; t < GeZi.Core.Support.SpeedTier.TierCount; t++)
+            {
+                Check("tier.name_not_empty." + t,
+                    !string.IsNullOrWhiteSpace(GeZi.Core.Support.SpeedTier.Name(t)),
+                    "档位名不能为空");
+                Check("tier.hint_not_empty." + t,
+                    !string.IsNullOrWhiteSpace(GeZi.Core.Support.SpeedTier.Hint(t)),
+                    "档位说明不能为空");
+            }
+            Check("tier.names_distinct",
+                GeZi.Core.Support.SpeedTier.Name(0) != GeZi.Core.Support.SpeedTier.Name(1)
+                    && GeZi.Core.Support.SpeedTier.Name(1) != GeZi.Core.Support.SpeedTier.Name(2),
+                "三个档位名必须互不相同");
+        }
+
         private static void TestSlowStartGate()
         {
             // ① 256 路的标准序列
@@ -2963,10 +3049,51 @@ namespace GeZi.SelfTest
             Check("slowstart.non_power_of_two", a100 == 100,
                 "max=100 时 16²=256 应封顶到 100，实际=" + a100);
 
-            // ⑤ 溢出保护：max 很大时 current² 不能溢出成负数
-            int big = SlowStartGate.NextAllowed(65536, 1 << 30);
-            Check("slowstart.no_overflow", big == 1 << 30,
-                "65536² 溢出前应先封顶，实际=" + big);
+            // ⑤ 溢出保护：见下方 slowstart.huge_no_overflow（线性段的 long 加法）。
+            //    ⚠️ 2026-11-08 改了增长规则以后，这一段不再是"平方封顶"，
+            //    原来的 `NextAllowed(65536, 1<<30) == 1<<30` 已不成立（现在是 65536+125）。
+            Check("slowstart.square_stage_ceiling",
+                SlowStartGate.NextAllowed(16, 1 << 30) == SlowStartGate.LinearStart,
+                "前段平方必须停在 LinearStart=256 而不再继续平方，实际="
+                + SlowStartGate.NextAllowed(16, 1 << 30));
+
+            // ⑤b 后段改为线性：>=256 之后每跳固定 +125（2026-11-08 用户要求）
+            Check("slowstart.linear_from_256",
+                SlowStartGate.NextAllowed(256, 4096) == 381,
+                "256 之后应 +125 到 381，实际=" + SlowStartGate.NextAllowed(256, 4096));
+            Check("slowstart.linear_step_125",
+                SlowStartGate.NextAllowed(381, 4096) == 506,
+                "381 之后应 +125 到 506，实际=" + SlowStartGate.NextAllowed(381, 4096));
+            Check("slowstart.linear_capped",
+                SlowStartGate.NextAllowed(4000, 4096) == 4096,
+                "4000+125 超过上限应封顶 4096，实际=" + SlowStartGate.NextAllowed(4000, 4096));
+            Check("slowstart.huge_no_overflow",
+                SlowStartGate.NextAllowed(int.MaxValue - 10, int.MaxValue) == int.MaxValue,
+                "接近 int.MaxValue 时不能溢出成负数");
+
+            // ⑤c 平滑性：整条 1→4096 的序列，256 之后每跳涨幅不得超过 125
+            var seq = new System.Collections.Generic.List<int>();
+            int cursor = 1;
+            seq.Add(cursor);
+            for (int i = 0; i < 200 && cursor < 4096; i++)
+            {
+                cursor = SlowStartGate.NextAllowed(cursor, 4096);
+                seq.Add(cursor);
+            }
+            bool smooth = true;
+            int worstJump = 0;
+            for (int i = 1; i < seq.Count; i++)
+            {
+                int jump = seq[i] - seq[i - 1];
+                if (jump > worstJump) worstJump = jump;
+                if (seq[i - 1] >= SlowStartGate.LinearStart && jump > SlowStartGate.LinearStep) smooth = false;
+            }
+            Check("slowstart.smooth_after_256", smooth,
+                "256 之后每跳不得超过 125，实际最大跳=" + worstJump);
+            Check("slowstart.reaches_ceiling", seq[seq.Count - 1] == 4096,
+                "序列必须能爬到 4096，实际=" + seq[seq.Count - 1]);
+            Check("slowstart.jumps_within_budget", seq.Count - 1 <= 40,
+                "爬满 4096 的跳数应 ≤40（每跳 150ms ⇒ 不超过 6 秒），实际=" + (seq.Count - 1));
 
             // ⑥ 非法输入：max=0 / 负数按 1 处理；current=0 按 1 处理
             Check("slowstart.invalid_max", new SlowStartGate(0).MaxWorkers == 1,

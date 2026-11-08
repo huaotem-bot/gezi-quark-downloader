@@ -57,7 +57,7 @@ namespace GeZi.DownloadEngine.Planning
         /// ⚠️ 这里是单文件并发上限的**唯一权威定义**（自研引擎已删除）：
         /// 用户把线程数填得再大，引擎也开不出更多连接，切片时就不该按更大的数去切。
         /// </summary>
-        public const int MaxRealConcurrency = 3000;
+        public const int MaxRealConcurrency = 4096;
 
         /// <summary>
         /// 把文件切成若干区间，供多 worker 以「工作窃取」方式领取。

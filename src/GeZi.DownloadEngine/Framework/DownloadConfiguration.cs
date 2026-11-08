@@ -98,8 +98,21 @@ public class DownloadConfiguration : ICloneable, INotifyPropertyChanged
     private int _retryMaxDelayMs = 5000;
     private int _preemptIntervalMs = 2000;
     private long _preemptMinBytes = 512L * 1024;
-    /// <summary>末段补片的最小切分粒度（默认 256KB，对齐 refs/YunX 的 MIN_ELASTIC_BLOCK）。</summary>
-    private long _tailRefillMinBytes = 256L * 1024;
+    /// <summary>
+    /// 末段补片的最小切分粒度（默认 64KB，对齐 refs/YunX 的 MIN_ELASTIC_BLOCK）。
+    /// <para>
+    /// 🚨🚨 2026-11-08 从 256KB 降到 64KB（**这是修回归，不是调参**）。
+    /// <see cref="DownloadService.TryRefillTail"/> 的判据是
+    /// <c>bestRemain &lt; TailRefillMinBytes * 2 → return false</c>、
+    /// <c>maxSlices = maxRemain / TailRefillMinBytes</c>、<c>maxSlices &lt; 2 → return false</c>。
+    /// 而 2026-11-07 的分片公式改造把常规片长从 512KB 降到 128KB 以后，
+    /// 128 / 256 = 0 ⇒ **收尾期一刀都切不出来，直接 return false**，
+    /// 末段退化成「剩余片数 × 单连接速度」。
+    /// 实测症状：`24.20 MB/s / 88.9%` → 十秒后 `1.83 MB/s / 95.9%`（掉 13 倍）。
+    /// 64KB 保证哪怕只剩一个 128KB 的片也能切成两刀。
+    /// </para>
+    /// </summary>
+    private long _tailRefillMinBytes = 64L * 1024;
     private int _preemptMaxPerRound = 3;
     private double _preemptSpeedRatio = 0.34;
     private long _lowestSpeedLimit = 16L * 1024;

@@ -1807,13 +1807,75 @@
                                             Margin="0,0,0,12" HorizontalAlignment="Stretch">
                                         <StackPanel>
                                             <Grid Style="{StaticResource SettingsCardHeader}">
-                                                <StackPanel Orientation="Horizontal">
+                                                <Grid.ColumnDefinitions>
+                                                    <ColumnDefinition Width="*"/>
+                                                    <ColumnDefinition Width="Auto"/>
+                                                </Grid.ColumnDefinitions>
+                                                <StackPanel Grid.Column="0" Orientation="Horizontal">
                                                     <Path Data="{StaticResource IconActivity}" Stretch="Uniform"
                                                           Width="16" Height="16" VerticalAlignment="Center"
                                                           Stroke="{DynamicResource TextTertiaryBrush}" StrokeThickness="1.7"/>
                                                     <TextBlock Text="网络与下载" Style="{StaticResource SettingsCardTitle}"
                                                                Margin="10,0,0,0"/>
                                                 </StackPanel>
+
+                                                <!-- ============ 速度档位（2026-11-08 新增） ============
+                                                     用户原话：「在这张卡片的红色框位置我希望增加一个滑块选择动画.
+                                                     默认是标准,往右又可以选输出,再选就是超载.原本标准是滑块是白色
+                                                     到输出时变为金色到超载时变为红色.标准模式就是让线程只能选择到
+                                                     最高512,输出模式可以最高到2048.超载模式最高可选...4096」。
+
+                                                     ⚠️ 语义是「**天花板**」不是「预设值」：
+                                                       · 标准 = 最高 512（与改造前行为一致，默认）
+                                                       · 输出 = 最高 2048
+                                                       · 超载 = 最高 4096
+                                                     实际并发仍由「线程设置」里四家网盘各自的值决定，
+                                                     档位只是在上面再夹一道（见 SpeedTier.Clamp）。
+
+                                                     🚨 thumb 的 x:Name 必须全局唯一 ——
+                                                        已有 ModeThumb / FilterThumb / ThemeThumb，这里是 SpeedThumb。
+
+                                                     🚨 thumb 的 Background **故意不绑 DynamicResource**：
+                                                        档位要换颜色（白/金/红），而主题画刷是共享的、可能被冻结，
+                                                        对冻结画刷做 ColorAnimation 会直接抛异常。
+                                                        颜色由 MainWindow.Settings.cs 的 ApplySpeedTierVisual()
+                                                        在代码里赋 new SolidColorBrush 并做 200ms 动画。 -->
+                                                <Border Grid.Column="1" HorizontalAlignment="Right"
+                                                        VerticalAlignment="Center"
+                                                        CornerRadius="8"
+                                                        Background="{DynamicResource SurfaceSunkenBrush}"
+                                                        Padding="3">
+                                                    <Grid local:SegmentedSlider.IsEnabled="True"
+                                                          local:SegmentedSlider.Thumb="{x:Reference SpeedThumb}">
+                                                        <Border x:Name="SpeedThumb" CornerRadius="6"
+                                                                HorizontalAlignment="Left"
+                                                                VerticalAlignment="Stretch"
+                                                                IsHitTestVisible="False"/>
+                                                        <StackPanel Orientation="Horizontal">
+                                                            <RadioButton x:Name="SpeedStandardRadio" Content="标准"
+                                                                         GroupName="SpeedTier"
+                                                                         Checked="OnSpeedTierChanged"
+                                                                         Style="{StaticResource SegmentedRadio}"
+                                                                         AutomationProperties.Name="标准速度档位，最高 512 连接"
+                                                                         ToolTip="最高 512 条连接。日常与多任务并行最稳的一档。"
+                                                                         Margin="0"/>
+                                                            <RadioButton x:Name="SpeedBoostRadio" Content="输出"
+                                                                         GroupName="SpeedTier"
+                                                                         Checked="OnSpeedTierChanged"
+                                                                         Style="{StaticResource SegmentedRadio}"
+                                                                         AutomationProperties.Name="输出速度档位，最高 2048 连接"
+                                                                         ToolTip="最高 2048 条连接。单文件大文件提速用。"
+                                                                         Margin="2,0,0,0"/>
+                                                            <RadioButton x:Name="SpeedOverloadRadio" Content="超载"
+                                                                         GroupName="SpeedTier"
+                                                                         Checked="OnSpeedTierChanged"
+                                                                         Style="{StaticResource SegmentedRadio}"
+                                                                         AutomationProperties.Name="超载速度档位，最高 4096 连接"
+                                                                         ToolTip="最高 4096 条连接。抢带宽用，连接多容易被网盘限速。"
+                                                                         Margin="2,0,0,0"/>
+                                                        </StackPanel>
+                                                    </Grid>
+                                                </Border>
                                             </Grid>
 
                                             <!-- ============ 分区 ①：连接 ============

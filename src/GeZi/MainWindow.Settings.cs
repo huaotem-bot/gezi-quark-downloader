@@ -349,6 +349,8 @@ namespace GeZi
                 UseSystemProxyCheck.IsChecked = _settings.UseSystemProxy;
                 // 外观主题：把配置里的选择回填到三个单选（_applyingSettings 已挡掉 Checked）
                 SyncThemeRadios();
+                // 速度档位（标准/输出/超载）：同样在 _applyingSettings 里回填，不回写配置。
+                SyncSpeedTierRadios();
 
                 // 多网盘凭证回填。明文直接显示在输入框里 —— 它们只在本机、只给本机用户看，
                 // 且落盘是加密的；这里再遮成圆点反而会让用户没法核对是否粘对。
@@ -440,10 +442,15 @@ namespace GeZi
             var rows = new StackPanel { Margin = new Thickness(0, 0, 0, 0) };
             var boxes = new Dictionary<PanKind, ComboBox>();
 
-            AddPerPanRow(rows, boxes, PanKind.Quark, "夸克网盘", "按连接限速，加连接线性有效");
-            AddPerPanRow(rows, boxes, PanKind.Uc, "UC 网盘", "单 IP 总带宽约 7~8 MB/s");
-            AddPerPanRow(rows, boxes, PanKind.Aliyun, "阿里云盘", "单 IP 约 2.5 MB/s 硬限速");
-            AddPerPanRow(rows, boxes, PanKind.Xunlei, "迅雷云盘", "超过 16 条会大面积 503");
+            // 🚨 2026-11-08：下拉候选必须按当前速度档位的天花板过滤，
+            //    否则「标准」档下用户还能在下拉里选到 4096，等于档位形同虚设。
+            //    VisiblePresets 至少会返回一项（最小那档），不会出现空下拉。
+            int[] presets = SpeedTier.VisiblePresets(ThreadPresets, _settings.SpeedTier);
+
+            AddPerPanRow(rows, boxes, presets, PanKind.Quark, "夸克网盘", "按连接限速，加连接线性有效");
+            AddPerPanRow(rows, boxes, presets, PanKind.Uc, "UC 网盘", "单 IP 总带宽约 7~8 MB/s");
+            AddPerPanRow(rows, boxes, presets, PanKind.Aliyun, "阿里云盘", "单 IP 约 2.5 MB/s 硬限速");
+            AddPerPanRow(rows, boxes, presets, PanKind.Xunlei, "迅雷云盘", "超过 16 条会大面积 503");
 
             var card = DialogChrome.Card(rows);
             Grid.SetRow(card, 2);
@@ -451,11 +458,10 @@ namespace GeZi
 
             // 🚨 2026-11-07：下拉里已没有「跟随全局」占位项，直接显示各家**当前生效**的连接数
             //    （单独改过就显示改过的值，没改过就显示按各家上限取好的默认值）。
-            //    ThreadPresets = 16/32/64/128/256/512，迅雷16 / 阿里64 / UC256 / 夸克256 都能精确命中。
-            //    注意：这里先赋初值、后面才挂 SelectionChanged 事件，所以不会误触发写盘。
+            // 🚨 2026-11-08：档位可能把候选列表截短了，所以这里按**过滤后的 presets** 找最近项；
+            //    先赋初值、后面才挂 SelectionChanged 事件，所以不会误触发写盘。
             foreach (var kv in boxes)
-                kv.Value.SelectedIndex = Math.Max(0, Math.Min(ThreadPresets.Length - 1,
-                    PresetToIndex(ThreadsFor(kv.Key))));
+                kv.Value.SelectedIndex = PresetIndexIn(presets, ThreadsFor(kv.Key));
 
             var resetBtn = DialogChrome.SecondaryButton("恢复默认");
             resetBtn.ToolTip = "把四家网盘的连接数恢复成按各家上限取好的默认值";
@@ -465,8 +471,7 @@ namespace GeZi
             resetBtn.Click += (s2, e2) =>
             {
                 foreach (var kv in boxes)
-                    kv.Value.SelectedIndex = Math.Max(0, Math.Min(ThreadPresets.Length - 1,
-                        PresetToIndex(DefaultThreadsFor(kv.Key))));
+                    kv.Value.SelectedIndex = PresetIndexIn(presets, DefaultThreadsFor(kv.Key));
             };
             okBtn.Click += (s2, e2) => { dlg.Close(); };
 
@@ -485,10 +490,11 @@ namespace GeZi
                 ComboBox box = kv.Value;
                 box.SelectionChanged += (s2, e2) =>
                 {
-                    if (box.SelectedIndex < 0 || box.SelectedIndex >= ThreadPresets.Length) return;
+                    // 🚨 2026-11-08：索引对的是**按档位过滤后**的 presets，不是全局 ThreadPresets。
+                    if (box.SelectedIndex < 0 || box.SelectedIndex >= presets.Length) return;
                     // 🚨 2026-11-07：没有「跟随全局」占位项了，索引直接对应档位。
                     //    选中即写 per-pan 覆盖值（迅雷/阿里等仍会被 ThreadsFor 的上限夹住）。
-                    int val = ThreadPresets[box.SelectedIndex];
+                    int val = presets[box.SelectedIndex];
                     WritePerPanThreads(kind, val);
                 };
             }
@@ -498,7 +504,7 @@ namespace GeZi
 
         /// <summary>往卡片里加一行「网盘名 + 简短说明 + 下拉」三栏（现代简约）。</summary>
         private void AddPerPanRow(StackPanel parent, Dictionary<PanKind, ComboBox> boxes,
-            PanKind kind, string label, string hint)
+            int[] presets, PanKind kind, string label, string hint)
         {
             var line = new Grid { Margin = new Thickness(0, 0, 0, 14) };
             line.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(96) });
@@ -537,7 +543,8 @@ namespace GeZi
             };
             // 🚨 2026-11-07：不再加「跟随全局」这一项 —— 设置页的全局并发下拉已删，
             //    四家直接显示各自当前生效的默认线程数（按各家服务端上限取好）。
-            foreach (int v in ThreadPresets)
+            // 🚨 2026-11-08：候选档位由调用方按速度档位的天花板过滤后传进来。
+            foreach (int v in presets)
                 box.Items.Add(new ComboBoxItem { Content = v.ToString() + " 条" });
             Grid.SetColumn(box, 2);
             line.Children.Add(box);
@@ -557,6 +564,145 @@ namespace GeZi
                 default: _settings.ThreadsQuark = value; break;
             }
             ApplySettings();
+        }
+
+
+        // ======================= 速度档位：标准 / 输出 / 超载（2026-11-08） =======================
+        // 用户原话：「默认是标准,往右又可以选输出,再选就是超载.原本标准是滑块是白色
+        // 到输出时变为金色到超载时变为红色.标准模式就是让线程只能选择到最高512,
+        // 输出模式可以最高到2048.超载模式最高可选...4096」。
+        //
+        // 🚨 语义是「**天花板**」不是「预设值」：
+        //    档位只决定「最多能开多少连接」，实际并发仍由「线程设置」里四家各自的值决定
+        //    （ThreadsFor / DefaultThreadsFor → MaxParallelFor → SpeedTier.Ceiling）。
+        //    缩进那个滑块只是表达当前档位的颜色，本身不控制任何东西。
+        //
+        // 🚨 颜色绝不能直接拿主题画刷：主题画刷是共享实例，可能已被 Freeze，
+        //    对冻结画刷做 ColorAnimation 会抛 InvalidOperationException。
+        //    所以这里一律 new SolidColorBrush，并对它做动画。
+        private static readonly Color SpeedStandardColor = Color.FromRgb(0xFF, 0xFF, 0xFF);   // 白
+        private static readonly Color SpeedBoostColor = Color.FromRgb(0xD4, 0xA0, 0x17);      // 金
+        private static readonly Color SpeedOverloadColor = Color.FromRgb(0xD9, 0x3F, 0x3F);   // 红
+
+        /// <summary>档位单选被切换。写盘 → 夹掉四家超额值 → 重建调度器 → 动画换色。</summary>
+        private void OnSpeedTierChanged(object sender, RoutedEventArgs e)
+        {
+            if (_applyingSettings) return;
+
+            int tier;
+            if (ReferenceEquals(sender, SpeedBoostRadio)) tier = SpeedTier.Boost;
+            else if (ReferenceEquals(sender, SpeedOverloadRadio)) tier = SpeedTier.Overload;
+            else if (ReferenceEquals(sender, SpeedStandardRadio)) tier = SpeedTier.Standard;
+            else tier = SpeedTier.Normalize(_settings.SpeedTier);   // 不认识的来源 → 保持原档
+
+            bool changed = SpeedTier.Normalize(_settings.SpeedTier) != tier;
+            _settings.SpeedTier = tier;
+            ApplySpeedTierVisual(true);
+            if (!changed) return;
+
+            // 切到更低档位时，四家里**已经配得比新天花板还高**的值必须夹下来，
+            // 否则用户会以为「我选了标准，怎么还跑 4096」。
+            // ⚠️ 只夹 > ceiling 的；0 表示「未单独配置」，必须原样保留（0 走回落基准）。
+            int ceiling = SpeedTier.Ceiling(tier);
+            bool clamped = false;
+            if (_settings.ThreadsQuark > ceiling) { _settings.ThreadsQuark = ceiling; clamped = true; }
+            if (_settings.ThreadsUc > ceiling) { _settings.ThreadsUc = ceiling; clamped = true; }
+            if (_settings.ThreadsAliyun > ceiling) { _settings.ThreadsAliyun = ceiling; clamped = true; }
+            if (_settings.ThreadsXunlei > ceiling) { _settings.ThreadsXunlei = ceiling; clamped = true; }
+
+            // 🚨 不回写 _settings.Threads（2026-11-07 红线）：它只是「未单独配置」时的回落基准，
+            //    被 SpeedTier 的 ceiling 通过 MaxParallelFor 再夹一道就够了。
+
+            SettingsStore.Save(_settings);
+            RecreateScheduler();
+
+            Log(string.Format("速度档位：{0}（{1}）", SpeedTier.Name(tier), SpeedTier.Hint(tier)));
+            if (clamped)
+                ShowIslandNotice(string.Format("已切到「{0}」，高于 {1} 条连接的网盘设置已自动降下来",
+                    SpeedTier.Name(tier), ceiling));
+        }
+
+        /// <summary>把当前档位画到滑块上（首次赋值不做动画）。</summary>
+        private void ApplySpeedTierVisual(bool animate)
+        {
+            if (SpeedThumb == null) return;
+
+            Color target;
+            switch (SpeedTier.Normalize(_settings.SpeedTier))
+            {
+                case SpeedTier.Boost: target = SpeedBoostColor; break;
+                case SpeedTier.Overload: target = SpeedOverloadColor; break;
+                default: target = SpeedStandardColor; break;
+            }
+
+            SolidColorBrush brush = SpeedThumb.Background as SolidColorBrush;
+            if (brush == null || brush.IsFrozen)
+            {
+                SpeedThumb.Background = new SolidColorBrush(target);
+                return;   // 还没有可动画的画刷 → 直接落定
+            }
+
+            if (!animate || brush.Color == target)
+            {
+                brush.BeginAnimation(SolidColorBrush.ColorProperty, null);
+                brush.Color = target;
+                return;
+            }
+
+            var anim = new ColorAnimation
+            {
+                From = brush.Color,
+                To = target,
+                Duration = new Duration(TimeSpan.FromMilliseconds(200)),
+                // 🚨 用 Stop + Completed 回写，而不是 HoldEnd：
+                //    动画对象会保留在属性上并持有 base value，下次切档会从"旧基础值"开始，
+                //    出现"金→红→再切标准时先闪一下白"的跳变。
+                FillBehavior = FillBehavior.Stop,
+            };
+            anim.Completed += (s, e) =>
+            {
+                brush.BeginAnimation(SolidColorBrush.ColorProperty, null);
+                brush.Color = target;
+            };
+            brush.BeginAnimation(SolidColorBrush.ColorProperty, anim);
+        }
+
+        /// <summary>把配置里的档位回填到三个单选上（不触发 OnSpeedTierChanged）。</summary>
+        private void SyncSpeedTierRadios()
+        {
+            int tier = SpeedTier.Normalize(_settings.SpeedTier);
+            bool prev = _applyingSettings;
+            _applyingSettings = true;
+            try
+            {
+                SpeedStandardRadio.IsChecked = tier == SpeedTier.Standard;
+                SpeedBoostRadio.IsChecked = tier == SpeedTier.Boost;
+                SpeedOverloadRadio.IsChecked = tier == SpeedTier.Overload;
+            }
+            finally
+            {
+                _applyingSettings = prev;
+            }
+            // 回填时不做动画：窗口刚起来，动画只会让人以为"刚才变了什么"。
+            ApplySpeedTierVisual(false);
+        }
+
+        /// <summary>在一组候选档位里找与 <paramref name="value"/> 最接近的下标。</summary>
+        private static int PresetIndexIn(int[] presets, int value)
+        {
+            if (presets == null || presets.Length == 0) return 0;
+            int best = 0;
+            int bestDiff = int.MaxValue;
+            for (int i = 0; i < presets.Length; i++)
+            {
+                int d = Math.Abs(presets[i] - value);
+                if (d < bestDiff)
+                {
+                    bestDiff = d;
+                    best = i;
+                }
+            }
+            return best;
         }
 
 

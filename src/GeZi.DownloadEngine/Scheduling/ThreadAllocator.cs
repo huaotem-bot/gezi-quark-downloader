@@ -34,13 +34,13 @@ namespace GeZi.DownloadEngine
     public static class ThreadAllocator
     {
         /// <summary>
-        /// 单网盘的总连接预算（2026-11-07 测试期从 512 提到 3000，与
+        /// 单网盘的总连接预算（2026-11-08 测试期从 512 提到 4096，与
         /// <c>PanConnBudget</c> 和 <c>ChunkSplitter.MaxRealConcurrency</c> 同步）。
         /// 这个值只是「分配器可用的水池」，真正的天花板仍是各网盘自己的预算：
-        /// 夸克 / UC / 阿里 / 迅雷 现均为 3000（测试期全放开），
+        /// 夸克 / UC / 阿里 / 迅雷 现均为 4096（测试期全放开），
         /// 由 <c>PanConnBudget.BudgetFor</c> 决定。
         /// </summary>
-        public const int DefaultBudget = 3000;
+        public const int DefaultBudget = 4096;
 
         /// <summary>单个文件至少给几条连接 —— 保证小文件也下得动，不会被大文件挤成 0。</summary>
         public const int MinPerFile = 4;

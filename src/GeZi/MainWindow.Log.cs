@@ -180,46 +180,38 @@ namespace GeZi
         }
 
 
-        /// <summary>来自下载工作线程的日志。入队线程安全，无需再切 UI 线程。</summary>
         /// <summary>
-        /// 每个网盘能承受的最大并发连接数（0 = 不限，交给全局预算均分）。
+        /// 这个网盘**当前允许**的并发天花板。
         ///
         /// <para>
-        /// 这是「不同网盘不同策略」的落点。**正常态**实测依据：
-        /// </para>
+        /// 🚨🚨 2026-11-08 改造：不再按网盘硬编码 16 / 64 / 256 / 0，
+        /// 而是由设置页的三档速度档位（<see cref="GeZi.Core.Support.SpeedTier"/>）统一决定，
+        /// 再与引擎物理上限 <see cref="ChunkSplitter.MaxRealConcurrency"/> 取 min：
         /// <list type="bullet">
-        /// <item><b>迅雷 = 16</b>：单 IP 并发上限。137 分片全开时 CDN 大面积 503，
-        /// 重试退避把速度压到 1 MB/s；16 并发实测 12.98 MB/s。</item>
-        /// <item><b>阿里云盘 = 64</b>：单 IP 约 2.5~2.7 MB/s 硬限速，64 并发已到顶，
-        /// 128 只多 11% 却更容易触发限流。</item>
-        /// <item><b>夸克 = 0（不限）</b>：没有这个限制，256 并发能跑 20+ MB/s。</item>
-        /// <item><b>UC = 256</b>：单 IP 总带宽约 7~8 MB/s，连接再多只会把每条摊薄到看门狗下限以下。</item>
+        /// <item><b>标准</b>（滑块白色）= 512</item>
+        /// <item><b>输出</b>（滑块金色）= 2048</item>
+        /// <item><b>超载</b>（滑块红色）= 4096</item>
         /// </list>
+        /// </para>
         ///
         /// <para>
-        /// 🚨 2026-11-07 用户要求「四家全部放开，最高 3000」做实测，
-        /// 所以现在**四家统一返回 <see cref="ChunkSplitter.MaxRealConcurrency"/>（3000）**，
-        /// 不再按网盘区分。各家服务端真实限额交给运行时去撞：
-        /// 日志里「在飞 vs 目标」的差、以及 503 / 掉速出现的位置，就是撞出来的结果。
-        /// 这是**测试期取值**，不是新的实测结论。
-        /// 恢复安全默认就把下面四个分支改回 16 / 64 / 0 / 256（原始依据见上方列表）。
+        /// ⚠️ 原来是四家各一个常量（迅雷 16 / 阿里 64 / UC 256 / 夸克 0 不限），
+        /// 那是 2026-10 的实测结论，现在用户要求做成可在界面上切换的三档，
+        /// 所以挪到档位里。**要恢复按网盘区分**，就把下面的 return 换回那个 switch
+        /// （原始依据：迅雷单 IP 封 16 条再多 503、阿里单 IP 约 2.5~2.7 MB/s、
+        /// UC 单 IP 7~8 MB/s 超 256 掉到 13 KB/s，见 AGENTS.md 第四节）。
+        /// </para>
+        ///
+        /// <para>
+        /// 🚨 必须是**实例方法**（要读 <c>_settings.SpeedTier</c>），原来那个是 static。
+        /// 调用点只有 <see cref="ThreadsFor"/> 与 <see cref="DefaultThreadsFor"/>，都已同步。
         /// </para>
         /// </summary>
-        private static int MaxParallelFor(PanKind kind)
+        private int MaxParallelFor(PanKind kind)
         {
-            // 测试期：四家一律放开到天花板，由 user 在弹窗里自己决定具体用多少。
-            // 注意保留 switch 结构，方便以后一键恢复分网盘上限。
-            switch (kind)
-            {
-                case PanKind.Xunlei:
-                    return GeZi.DownloadEngine.Planning.ChunkSplitter.MaxRealConcurrency;
-                case PanKind.Aliyun:
-                    return GeZi.DownloadEngine.Planning.ChunkSplitter.MaxRealConcurrency;
-                case PanKind.Uc:
-                    return GeZi.DownloadEngine.Planning.ChunkSplitter.MaxRealConcurrency;
-                default:
-                    return GeZi.DownloadEngine.Planning.ChunkSplitter.MaxRealConcurrency;
-            }
+            int tierCap = GeZi.Core.Support.SpeedTier.Ceiling(_settings.SpeedTier);
+            int hard = GeZi.DownloadEngine.Planning.ChunkSplitter.MaxRealConcurrency;
+            return tierCap < hard ? tierCap : hard;
         }
 
 
@@ -316,6 +308,7 @@ namespace GeZi
         }
 
 
+        /// <summary>来自下载工作线程的日志。入队线程安全，无需再切 UI 线程。</summary>
         private void LogFromWorker(string msg)
         {
             // 🚨 引擎的「调试」级日志一律不进界面。
