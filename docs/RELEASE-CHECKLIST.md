@@ -35,7 +35,7 @@ python tools/package_release.py --from-build --out artifacts
 ## 4. 代码签名（**当前未完成**）
 
 - [ ] 准备代码签名证书（OV/EV）与时间戳服务。
-- [ ] 在 CI 中对 `GeZi.exe` 与 `GeZi.Core.dll` 执行 `signtool sign /fd SHA256 /tr <ts> /td SHA256`。
+- [ ] 在 CI 中对 `GeZi-download.exe` 与 `GeZi.Core.dll` 执行 `signtool sign /fd SHA256 /tr <ts> /td SHA256`。
 - [ ] 签名后重新生成 `SHA256SUMS.txt` 与 `<zip>.sha256`（签名会改字节）。
 - [ ] Release 说明里给出证书指纹，便于用户核对。
 
