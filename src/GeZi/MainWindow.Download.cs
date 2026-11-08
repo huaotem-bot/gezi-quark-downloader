@@ -1128,7 +1128,7 @@ namespace GeZi
 
             // 明确告诉用户分片怎么落盘 ——
             // 用户问过「默认不是先下载引擎吗，先下载引擎有没有分片」。
-            LogDetail("下载引擎：融合引擎（分片并发 + 分块顺序写入单文件，支持断点续传）");
+            LogDetail("下载引擎：融合引擎（多连接并发 + 顺序写入单文件，支持断点续传）");
 
             SetBusy(true);
             try
@@ -2319,7 +2319,7 @@ namespace GeZi
                 //  磁盘上就一直躺着（用户机器上实测残留 59 MB）。
                 //  → 按用户选定的方案：**取消 = 彻底放弃，立刻清理本地残留**。
                 //    想保留进度以后再续传，请用「暂停」。
-                Log("已请求取消: " + t.Name + "（将清理本地分片与未下完的部分）");
+                Log("已请求取消: " + t.Name + "（将清理本地未下完的部分）");
                 CleanupCanceledTaskAsync(t.Job.Dest, t.Name);
             }
             else
@@ -2508,7 +2508,7 @@ namespace GeZi
                     if (removed > 0)
                     {
                         LogFromWorker(string.Format(
-                            "已清理历史遗留分片 {0} 个（{1}），跳过 {2} 个被占用的。",
+                            "已清理历史遗留的临时下载文件 {0} 个（{1}），跳过 {2} 个被占用的。",
                             removed, Util.FormatSize(freed), skipped));
                     }
 
@@ -2525,7 +2525,7 @@ namespace GeZi
                 }
                 catch (Exception ex)
                 {
-                    try { LogFromWorker("分片清扫失败（已忽略）: " + ex.Message); } catch { }
+                    try { LogFromWorker("临时下载文件清扫失败（已忽略）: " + ex.Message); } catch { }
                 }
             })
             {

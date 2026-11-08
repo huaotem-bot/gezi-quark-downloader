@@ -546,8 +546,13 @@ namespace GeZi
             // 🚨 2026-11-07：不再加「跟随全局」这一项 —— 设置页的全局并发下拉已删，
             //    四家直接显示各自当前生效的默认线程数（按各家服务端上限取好）。
             // 🚨 2026-11-08：候选档位由调用方按速度档位的天花板过滤后传进来。
+            //    等于「默认值」的那一档额外标上 (默认)，让用户一眼知道哪个是默认。
+            int def = DefaultThreadsFor(kind);
             foreach (int v in presets)
-                box.Items.Add(new ComboBoxItem { Content = v.ToString() + " 条" });
+                box.Items.Add(new ComboBoxItem
+                {
+                    Content = v == def ? v.ToString() + " 条 (默认)" : v.ToString() + " 条"
+                });
             Grid.SetColumn(box, 2);
             line.Children.Add(box);
 

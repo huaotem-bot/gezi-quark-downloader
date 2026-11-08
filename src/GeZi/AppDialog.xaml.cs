@@ -109,7 +109,7 @@ namespace GeZi
         /// 右边 <paramref name="secondaryText"/>（次按钮，返回 <see cref="MessageBoxResult.Cancel"/>）。
         /// </summary>
         /// <param name="dontAskAgain">输出：用户是否勾选了「此后不再提示」</param>
-        /// <returns>主按钮 = OK，次按钮 = Cancel，右上角 X / Esc = Cancel</returns>
+        /// <returns>主按钮 = OK，次按钮 = Cancel，右上角 X / Esc = None（没点任何按钮，调用方可区分「反悔」与「点了次按钮」）</returns>
         public static MessageBoxResult ShowWithDontAsk(Window owner, string text, string title,
                                                        string primaryText, string secondaryText,
                                                        MessageBoxImage icon, out bool dontAskAgain)
@@ -296,13 +296,12 @@ namespace GeZi
 
         private void OnCancel(object sender, RoutedEventArgs e)
         {
-            // 点右上角 X：行为跟"取消/否"一致
-            switch (_result)
-            {
-                default:
-                    _result = MessageBoxResult.Cancel;
-                    break;
-            }
+            // 点右上角 X / Esc：没点任何按钮 → 返回 None，让调用方有机会区别对待。
+            // 若此处返回 Cancel，调用方（如 MainWindow.Tray 的 OnWindowClosing）会把
+            // 「点弹窗叉号」当成「点了次按钮（直接退出）」→ 关掉主窗口/进程。
+            // 语义上 X = 放弃这次选择，既不是 OK 也不是 Cancel。
+            _result = MessageBoxResult.None;
+
             // 如果是 OK-only 的提示窗，关闭即视为已读
             if (Btn2.Visibility == Visibility.Collapsed && Btn3.Visibility == Visibility.Collapsed)
                 _result = MessageBoxResult.OK;

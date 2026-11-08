@@ -684,7 +684,7 @@ namespace GeZi
                   + (list.Count > 8 ? "\n…" : "");
             var ans = AppDialog.Show(this,
                 string.Format("确定删除{0}本地文件吗？\n\n{1}\n\n" +
-                              "（正在下载的会先取消；分片与续传元数据一并清理，不可撤销）",
+                              "（正在下载的会先取消；本地进度与续传信息一并清理，不可撤销）",
                     list.Count == 1 ? "以下" : list.Count + " 个任务的", body),
                 "删除本地文件", MessageBoxButton.YesNo, MessageBoxImage.Warning,
                 MessageBoxResult.No);

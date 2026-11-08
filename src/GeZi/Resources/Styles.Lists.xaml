@@ -268,7 +268,6 @@
         <Setter Property="Height" Value="28"/>
         <Setter Property="Cursor" Value="Hand"/>
         <Setter Property="FocusVisualStyle" Value="{x:Null}"/>
-        <Setter Property="ToolTip" Value="暂停这个任务"/>
         <Setter Property="Template">
             <Setter.Value>
                 <ControlTemplate TargetType="Button">
@@ -294,7 +293,6 @@
                                     Value="{StaticResource IconPlay}"/>
                             <Setter TargetName="Ico" Property="Stroke"
                                     Value="{DynamicResource WarningBrush}"/>
-                            <Setter Property="ToolTip" Value="继续这个任务"/>
                         </DataTrigger>
                         <!-- 终态：没有暂停/恢复的意义，收起按钮（Collapsed 不占位） -->
                         <DataTrigger Binding="{Binding State}" Value="Completed">

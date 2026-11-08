@@ -685,7 +685,7 @@ namespace GeZi
                             }
                             else
                             {
-                                LogDetail("[" + (p.Name ?? "?") + "] 没有分片残留，目标文件可能是已下完的成品，保留不动："
+                                LogDetail("[" + (p.Name ?? "?") + "] 没有未完成的下载记录，目标文件可能是已下完的成品，保留不动："
                                     + p.Dest);
                             }
                         }
@@ -723,7 +723,7 @@ namespace GeZi
                 //   随时能点右上角「未完成」回来继续。
                 // ⚠️ 11-03 那版会在这里把入口静音藏掉，导致用户再也找不到续传入口，
                 //   已整体废弃（见 Settings.PendingReminderMuted 的注释）。
-                Log("未完成的任务已保留，随时可点右上角「未完成」继续（分片在，会自然续传）。");
+                Log("未完成的任务已保留，随时可点右上角「未完成」继续（进度记录在，会自然续传）。");
                 RefreshPendingEntry();
                 return;
             }
@@ -1272,10 +1272,10 @@ namespace GeZi
             //   会用到它，必须保证传进去的是**同 kind** 的实例（见该方法的实现）。
             if (client == null && !IsLoggedInAny)
             {
-                Log("续传需要先登录。请登录后重新下载（分片在，会自然续传）。");
+                Log("续传需要先登录。请登录后重新下载（进度记录在，会自然续传）。");
                 AppDialog.Show(this,
                     "续传需要重新获取直链，得先登录。\n\n"
-                    + "分片都还在，登录后再点一次「继续下载」即可，不会重下。",
+                    + "进度记录都还在，登录后再点一次「继续下载」即可，不会重下。",
                     "需要先登录",
                     System.Windows.MessageBoxButton.OK,
                     System.Windows.MessageBoxImage.Information);
@@ -1593,7 +1593,7 @@ namespace GeZi
                     catch (OperationCanceledException)
                     {
                         Log("[" + (p.Name ?? "?") + "] 续传取链超时（45 秒无响应），已跳过这条。"
-                            + "可稍后重试，分片都在，不会重下。");
+                            + "可稍后重试，进度记录都在，不会重下。");
                         skipped.Add(p.Name ?? "?");
                     }
                     catch (Exception ex)
@@ -1635,7 +1635,7 @@ namespace GeZi
                         int n = skipped.Count;
                         RunOnUi(() => AppDialog.Show(this,
                             string.Format("这 {0} 个任务这次都没能取到直链。\n\n"
-                                + "记录和分片都保留着，登录后点任务页的「未完成」入口可以再试一次，"
+                                + "记录和进度都保留着，登录后点任务页的「未完成」入口可以再试一次，"
                                 + "不会从头重下。", n),
                             "没能开始续传",
                             System.Windows.MessageBoxButton.OK,

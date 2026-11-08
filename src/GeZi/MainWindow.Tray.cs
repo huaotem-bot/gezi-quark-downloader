@@ -90,6 +90,14 @@ namespace GeZi
                     "最小化到托盘", "直接退出",
                     MessageBoxImage.Question, out dontAsk);
 
+                if (r == MessageBoxResult.None)
+                {
+                    // 点了弹窗右上角 X / 按了 Esc：既没选「最小化」也没选「退出」，
+                    // 视为反悔 —— 什么都不做，窗口保持打开。
+                    e.Cancel = true;
+                    return;
+                }
+
                 action = (r == MessageBoxResult.OK)
                     ? CloseAction.MinimizeToTray : CloseAction.Exit;
 

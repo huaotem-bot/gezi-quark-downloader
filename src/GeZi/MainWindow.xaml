@@ -1920,12 +1920,7 @@
                                                             HorizontalAlignment="Left"
                                                             Style="{StaticResource SecondaryButton}"
                                                             Click="OnGuardedPerPanThreadsClick"
-                                                            ToolTip="给夸克 / UC / 阿里云盘 / 迅雷分别设置并发连接数，默认已按各家上限取好值。"/>
-                                                    <TextBlock Style="{StaticResource SettingsRowHint}"
-                                                               Margin="0,7,0,0" MaxWidth="360"
-                                                               HorizontalAlignment="Left"
-                                                               TextWrapping="Wrap"
-                                                               Text="分别设置夸克 / UC / 阿里云盘 / 迅雷四家的单文件并发连接数。默认已按各家服务端上限取好，调高不会超过上限；改完只对新任务生效。"/>
+                                                            ToolTip="给夸克 / UC / 阿里云盘 / 迅雷分别设置并发连接数。"/>
                                                 </StackPanel>
                                             </Grid>
 
@@ -3174,7 +3169,7 @@
                                                      Fill="{DynamicResource TextTertiaryBrush}"/>
                                             <TextBlock Grid.Column="1" Margin="10,0,0,0"
                                                        Style="{StaticResource ProseText}" TextWrapping="Wrap">
-                                                <Run Text="暂停或重启后进度不会丢：分片记录在本地，会从断点继续，已下载的部分不会重下。"/>
+                                                <Run Text="暂停或重启后进度不会丢：下载进度记录在本地，会从断点继续，已下载的部分不会重下。"/>
                                             </TextBlock>
                                         </Grid>
 
