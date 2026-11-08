@@ -22,13 +22,15 @@ namespace GeZi.Core.Support
     /// 🚨 2026-11-08 用户要求（原话）：「默认是标准，往右又可以选输出，再选就是超载…
     /// 标准模式就是让线程只能选择到最高 512，输出模式可以最高到 2048，
     /// 超载模式最高可选在线程至 4096」。
+    /// 同日实测后经用户拍板下调为：**标准 512 / 输出 1024 / 超载 2048**
+    /// （日志证据：4096 路峰值 23.09 MB/s，反而低于 3000 路的 24.20 MB/s，连接再多是负收益）。
     /// </para>
     ///
     /// <para>
     /// ⚠️ 语义是「**天花板**」而不是「预设值」：
-    /// 选标准档时，四家网盘的下拉里 1024 / 2048 / 4096 这些档位不出现（或者出现也选不出效果），
+    /// 选标准档时，四家网盘的下拉里 1024 / 2048 这些档位不出现（或者出现也选不出效果），
     /// 已配置的超额值会被夹到 512 —— 这样「界面能选、代码却夹不到」的假承诺不会出现。
-    /// 选超载档时天花板就是引擎的物理上限 <c>ChunkSplitter.MaxRealConcurrency</c>。
+    /// 引擎的物理上限仍是 <c>ChunkSplitter.MaxRealConcurrency</c>(4096)，两者取 min 生效。
     /// </para>
     ///
     /// <para>
@@ -41,10 +43,10 @@ namespace GeZi.Core.Support
         /// <summary>标准档：滑块白色，单文件最高 512 条连接（等于正常态夸克实测拐点）。</summary>
         public const int Standard = 0;
 
-        /// <summary>输出档：滑块金色，单文件最高 2048 条连接。</summary>
+        /// <summary>输出档：滑块金色，单文件最高 1024 条连接。</summary>
         public const int Boost = 1;
 
-        /// <summary>超载档：滑块红色，单文件最高 4096 条连接（= 引擎物理上限）。</summary>
+        /// <summary>超载档：滑块红色，单文件最高 2048 条连接。</summary>
         public const int Overload = 2;
 
         /// <summary>档位数量（滑块的分段数）。</summary>
@@ -53,11 +55,19 @@ namespace GeZi.Core.Support
         /// <summary>标准档的并发天花板（512）。</summary>
         public const int StandardCeiling = 512;
 
-        /// <summary>输出档的并发天花板（2048）。</summary>
-        public const int BoostCeiling = 2048;
+        /// <summary>输出档的并发天花板（1024）。</summary>
+        public const int BoostCeiling = 1024;
 
-        /// <summary>超载档的并发天花板（4096，与 <c>ChunkSplitter.MaxRealConcurrency</c> 一致）。</summary>
-        public const int OverloadCeiling = 4096;
+        /// <summary>
+        /// 超载档的并发天花板（2048）。
+        /// <para>
+        /// 🚨 2026-11-08 用户拍板降到 2048（原 4096）：日志实测 4096 路峰值 23.09 MB/s，
+        /// 反而低于 3000 路的 24.20 MB/s —— 4096 条连接对夸克是**负收益**。
+        /// 引擎物理上限 <c>ChunkSplitter.MaxRealConcurrency</c> 仍是 4096，
+        /// 这里只是「界面可选到的天花板」，两者取 min 生效。
+        /// </para>
+        /// </summary>
+        public const int OverloadCeiling = 2048;
 
         /// <summary>
         /// 把任意整数归一到合法档位。负数 / 0 以下 → 标准档，超过 2 → 超载档。
@@ -100,9 +110,9 @@ namespace GeZi.Core.Support
             switch (Normalize(tier))
             {
                 case Boost:
-                    return "输出：单文件最多 2048 条连接。连接多、并发高，适合大文件赶时间。";
+                    return "输出：单文件最多 1024 条连接。连接多、并发高，适合大文件赶时间。";
                 case Overload:
-                    return "超载：单文件最多 4096 条连接。极限压榨带宽，对路由器和网盘风控压力最大。";
+                    return "超载：单文件最多 2048 条连接。极限压榨带宽，对路由器和网盘风控压力最大。";
                 default:
                     return "标准：单文件最多 512 条连接。最稳，也最不容易触发网盘限流。";
             }

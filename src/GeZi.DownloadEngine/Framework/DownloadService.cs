@@ -155,18 +155,13 @@ public class DownloadService : AbstractDownloadService
     private readonly OverallSlowGate _overallSlow = new OverallSlowGate();
 
     /// <summary>
-    /// 连接数爬山控制器（2026-11-08，带迟滞）。
+    /// 当前允许的**在飞连接上限**（0 = 尚未接管，等于不限）。
     /// <para>
-    /// 用户原话：「每 30 秒最多调一次，只有『加完 N 路总量反而降 15% 以上』才回退并记住拐点」。
-    /// 规则本身在 <see cref="GeZi.Core.Support.ConnectionClimber"/>（纯计算、有自检），
-    /// 这里只负责「每轮喂一次实测总量，把结果落到 <see cref="_climbCap"/>」。
+    /// 🚨 2026-11-08 第二次修正：原来这里是「连接数爬山」的目标值，实测零收益（日志只有 2 条、
+    /// 两次都直接等于用户设的上限），已整段关闭。现在改由
+    /// <see cref="UpdateEndgameCap"/> 接管：可领片数不够时把上限压下来，
+    /// 避免几千个 worker 空转抢 <c>_tailRefillGate</c> 锁拖慢真正在跑的那几十路。
     /// </para>
-    /// </summary>
-    private readonly GeZi.Core.Support.ConnectionClimber _climber =
-        new GeZi.Core.Support.ConnectionClimber();
-
-    /// <summary>
-    /// 当前爬山允许的**在飞连接上限**（0 = 尚未接管，等于不限）。
     /// <para>
     /// 🚨 为什么是「限制在飞数」而不是「改 worker 数」：
     /// worker 池是一次性 <c>Task.Run</c> 开满的（见 <c>workerCount</c>），
@@ -176,6 +171,72 @@ public class DownloadService : AbstractDownloadService
     /// </para>
     /// </summary>
     private int _climbCap;
+
+    /// <summary>
+    /// 收尾期**主动降并发**（2026-11-08 新增，取代已关闭的连接数爬山）。
+    ///
+    /// <para>
+    /// 🚨 为什么必须降：分片表是下载开始前一次性切完的**静态片**，片数固定。于是
+    /// <c>在飞连接数 = min(目标并发, 可领片数)</c>，
+    /// <c>可领片数 ≈ 总片数 × (1 − 进度)</c>。
+    /// 442MB / 128KB 片 = 约 3380 片，设 2048 路时：
+    /// 进度超过 1 − 2048×128KB/442MB ≈ 39% 之后片就开始不够分；
+    /// 到 99% 只剩 4.4MB = 34 片，其余 2000 多个 worker 全部空转。
+    /// </para>
+    ///
+    /// <para>
+    /// 空转不是免费的：每个空转 worker 每轮都要抢 <c>_tailRefillGate</c> 锁、
+    /// 遍历 active 找最大片 —— 几千个 worker 每秒数万次无效加锁，
+    /// 真正在下载的那几十路反而抢不到 CPU（用户实测「卡 28 秒，暂停再恢复立刻跑完」）。
+    /// </para>
+    ///
+    /// <para>
+    /// 所以这里按「当前可领片数」把 <see cref="_climbCap"/> 压下来。它只限制**在飞上限**，
+    /// 不重连、不重排分片、不动续传 —— 已经在跑的连接完全不受影响。
+    /// 额外留 <see cref="RefillProbeHeadroom"/> 条余量，保证仍有空闲 worker
+    /// 能走到 <see cref="TryRefillTail"/> 去切大片（否则降并发会把补片一起锁死）。
+    /// </para>
+    /// </summary>
+    private void UpdateEndgameCap(ChunkQueue queue, ConcurrentDictionary<string, Chunk> active)
+    {
+        int target = Options.ParallelCount;
+        if (target < 1) target = 1;
+        if (target > ChunkSplitter.MaxRealConcurrency) target = ChunkSplitter.MaxRealConcurrency;
+
+        // 可领片数 = 正在跑的 + 队列里排着的。这就是「现在最多能喂饱几路」。
+        long afford = (long)active.Count + queue.Count;
+        long cap = afford + RefillProbeHeadroom;
+        if (cap > target) cap = target;
+        if (cap < EndgameMinCap) cap = EndgameMinCap;
+
+        int newCap = cap > int.MaxValue ? int.MaxValue : (int)cap;
+        if (newCap == _climbCap)
+            return;
+
+        int old = _climbCap;
+        _climbCap = newCap;
+
+        // 只在「真的降到了目标以下」时记一条：开局 cap 等于目标并发是正常态，不必刷日志。
+        // 收尾期只降不涨，所以一条就够，不会刷屏。
+        if (newCap < target && (old == 0 || newCap < old))
+        {
+            _logger?.LogInfo(string.Format(
+                "收尾期降并发：可领片数 {0}（在跑 {1} + 排队 {2}），目标 {3} 路，已把在飞上限压到 {4} 路以免空转抢锁。",
+                afford, active.Count, queue.Count, target, newCap));
+        }
+    }
+
+    /// <summary>
+    /// 收尾期降并发的下限：再怎么收尾也不压到 4 路以下，
+    /// 否则最后几 MB 会被压得比多开几条还慢。
+    /// </summary>
+    private const int EndgameMinCap = 4;
+
+    /// <summary>
+    /// 降并发时给「补片探针」留的余量：始终允许少量空闲 worker 越过上限去调
+    /// <see cref="TryRefillTail"/>，否则降并发会把「切大片救收尾」这条路一起锁死。
+    /// </summary>
+    private const int RefillProbeHeadroom = 8;
 
     /// <summary>
     /// 把字节/秒格式化成「12.3 KB/s」这种人类可读形式。
@@ -2026,10 +2087,22 @@ public class DownloadService : AbstractDownloadService
                     //   否则万一 _climbCap 很小而实际连接数上不去（比如全断了），
                     //   所有 worker 都在这儿排队 ⇒ 死锁。用 active.Count 而不是 _liveWorkers
                     //   也是同一个目的：active 才是「真正拿着连接」的那批。
+                    // 🚨 2026-11-08 第二次修正：降并发改按 **worker 序号** 放行。
+                    //
+                    // 之前那版用 `active.Count >= capNow` 做判据，数学上是死代码：
+                    //   cap = 可领片数 + 余量 = active + queue + 8 恒大于 active，
+                    //   判据永远不成立 ⇒ 一个 worker 都拦不住。
+                    //
+                    // 现在：只有序号前 _climbCap 的 worker 参与抢片，其余直接睡。
+                    //   · 收尾期可领片数只剩几十时 _climbCap 就是几十，
+                    //     几千个高序号 worker 全部睡死，不再每秒数万次抢 _tailRefillGate 锁；
+                    //   · 低序号 worker 里总有空闲的，照样能走到 TryRefillTail 补片，
+                    //     不会把「切大片救收尾」这条路锁死。
+                    //   · 不重连、不重排分片、不动续传 —— 已在跑的连接完全不受影响。
                     int capNow = _climbCap;
-                    if (capNow > 0 && active.Count >= capNow)
+                    if (capNow > 0 && workerIndex >= capNow)
                     {
-                        try { await Task.Delay(40, cancel).ConfigureAwait(false); }
+                        try { await Task.Delay(200, cancel).ConfigureAwait(false); }
                         catch (OperationCanceledException) { break; }
                         continue;
                     }
@@ -2319,6 +2392,16 @@ public class DownloadService : AbstractDownloadService
         if (active.Count == 0)
             return;
 
+        // 🚨🚨 2026-11-08 第二次修正：**收尾期主动降并发放在最前面**（取代已关闭的连接数爬山）。
+        //
+        // 为什么必须在最前面：下面有若干个早退（样本不足 2、中位数算不出等），
+        // 而「可领片数不够」这件事与速度无关 —— 放到中段就会在收尾期被早退跳过，
+        // 恰恰是它最该干活的时刻。用户实测日志（GeZi.log）证明：
+        //   全日志只有 2 条「连接数爬坡」，两次都直接等于用户设的上限，
+        //   收尾期因 inFlight < 64 完全跳过 ⇒ 爬山零收益。
+        // 现在改成纯「片数够不够分」的算术，每轮（2 秒）必算，与速度样本无关。
+        UpdateEndgameCap(queue, active);
+
         int now = Environment.TickCount;
 
         // 1) 采样：算出每个活跃分片本轮的速度（字节/秒）
@@ -2380,44 +2463,6 @@ public class DownloadService : AbstractDownloadService
         // 全员 13.5 KB/s → 6.75 KB/s，谁都不算慢；个别掉到 4 KB/s 才被抓。
         Options.DynamicSlowThresholdBps = GeZi.Core.Support.SlowWatchdog.DynamicFloorFromMedian(
             median, Options.DynamicSlowRatio);
-
-        // ---- 2026-11-08：连接数爬山（带迟滞）----
-        //
-        // 用户原话：「每 30 秒最多调一次，只有『加完 N 路总量反而降 15% 以上』才回退并记住拐点」。
-        //
-        // 🚨 只在「在飞数足够多」时才让它接管：
-        //   收尾期只剩几路在磨最后几 MB，这时的总速度本来就低，
-        //   拿它去判「加连接加错了」是纯噪声（会把爬坡目标无故砍半）。
-        //   所以要求 inFlight ≥ ClimberMinInflight(64)，且本轮总速度 > 0。
-        //
-        // 🚨 它只限制**在飞连接上限**（见 _climbCap 的注释），
-        //   不重连、不重排分片、不动续传 —— 所以随时可以整段关掉（_climbCap = 0）。
-        {
-            const int ClimberMinInflight = 64;
-            int inFlightNow = active.Count;
-            if (inFlightNow >= ClimberMinInflight)
-            {
-                long totalBps = 0;
-                foreach (var s in speeds)
-                {
-                    if (s.Value > 0) totalBps += (long)s.Value;
-                }
-
-                int hardCeiling = Options.ParallelCount;
-                if (hardCeiling < 1) hardCeiling = 1;
-
-                int want = _climber.Evaluate(
-                    now, totalBps, hardCeiling, inFlightNow);
-                if (want > 0 && want != _climbCap)
-                {
-                    _climbCap = want;
-                    _logger?.LogInfo(string.Format(
-                        "连接数爬坡：目标并发调到 {0} 路（当前在飞 {1} 路，总速度 {2}/s{3}）。",
-                        _climbCap, inFlightNow, FmtBps(totalBps),
-                        _climber.Ceiling == int.MaxValue ? "" : "，已记拐点 " + _climber.Ceiling + " 路"));
-                }
-            }
-        }
 
         // 3) 慢的判定阈值 = max(绝对下限, 中位数 × 比例)。
         //
