@@ -3,7 +3,7 @@
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:local="clr-namespace:GeZi"
         xmlns:shell="clr-namespace:System.Windows.Shell;assembly=PresentationFramework"
-        Title="鸽子下载 · 多网盘下载器"
+        Title="鸽子下载"
         Icon="/Resources/app.ico"
         Height="780" Width="1240" MinHeight="640" MinWidth="900"
         WindowStartupLocation="CenterScreen"
