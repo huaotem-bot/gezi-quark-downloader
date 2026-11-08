@@ -3073,8 +3073,8 @@ namespace GeZi.SelfTest
                 GeZi.Core.Support.SpeedTier.Ceiling(GeZi.Core.Support.SpeedTier.Boost) == 1024,
                 "输出档天花板应为 1024（2026-11-08 用户从 2048 下调）");
             Check("tier.overload_ceiling",
-                GeZi.Core.Support.SpeedTier.Ceiling(GeZi.Core.Support.SpeedTier.Overload) == 2048,
-                "超载档天花板应为 2048（2026-11-08 用户从 4096 下调，实测 4096 路反而更慢）");
+                GeZi.Core.Support.SpeedTier.Ceiling(GeZi.Core.Support.SpeedTier.Overload) == 3000,
+                "超载档天花板应为 3000（2026-11-08 用户定为实测拐点 3000，4096 路反而更慢）");
             Check("tier.ceiling_never_exceeds_hard_limit",
                 GeZi.Core.Support.SpeedTier.Ceiling(GeZi.Core.Support.SpeedTier.Overload)
                     <= GeZi.DownloadEngine.Planning.ChunkSplitter.MaxRealConcurrency,
@@ -3102,14 +3102,14 @@ namespace GeZi.SelfTest
                 GeZi.Core.Support.SpeedTier.Clamp(4096, GeZi.Core.Support.SpeedTier.Boost) == 1024,
                 "输出档下 4096 应被夹到 1024");
             Check("tier.clamp_overload_keeps",
-                GeZi.Core.Support.SpeedTier.Clamp(4096, GeZi.Core.Support.SpeedTier.Overload) == 2048,
-                "超载档下 4096 应被夹到 2048");
+                GeZi.Core.Support.SpeedTier.Clamp(4096, GeZi.Core.Support.SpeedTier.Overload) == 3000,
+                "超载档下 4096 应被夹到 3000");
             Check("tier.clamp_below_ceiling_keeps",
                 GeZi.Core.Support.SpeedTier.Clamp(64, GeZi.Core.Support.SpeedTier.Standard) == 64,
                 "低于天花板的合法值必须原样保留");
 
             // ④ VisiblePresets：下拉候选必须按档位过滤，否则标准档还能选到 4096
-            int[] all = { 16, 32, 64, 128, 256, 512, 1024, 2048, 4096 };
+            int[] all = { 16, 32, 64, 128, 256, 512, 1024, 2048, 3000, 4096 };
             int[] std = GeZi.Core.Support.SpeedTier.VisiblePresets(all, GeZi.Core.Support.SpeedTier.Standard);
             Check("tier.presets_standard", std.Length == 6 && std[std.Length - 1] == 512,
                 "标准档应只暴露到 512，实际档位=" + string.Join(",", std));
@@ -3117,8 +3117,8 @@ namespace GeZi.SelfTest
             Check("tier.presets_boost", boost.Length == 7 && boost[boost.Length - 1] == 1024,
                 "输出档应只暴露到 1024，实际档位=" + string.Join(",", boost));
             int[] over = GeZi.Core.Support.SpeedTier.VisiblePresets(all, GeZi.Core.Support.SpeedTier.Overload);
-            Check("tier.presets_overload_keeps_all", over.Length == 8 && over[over.Length - 1] == 2048,
-                "超载档应暴露到 2048，实际=" + string.Join(",", over));
+            Check("tier.presets_overload_keeps_all", over.Length == 9 && over[over.Length - 1] == 3000,
+                "超载档应暴露到 3000，实际=" + string.Join(",", over));
             int[] tiny = GeZi.Core.Support.SpeedTier.VisiblePresets(new[] { 4096 }, GeZi.Core.Support.SpeedTier.Standard);
             Check("tier.presets_never_empty", tiny.Length >= 1,
                 "一个档位都不满足时也必须返回至少一项，否则下拉会是空的");

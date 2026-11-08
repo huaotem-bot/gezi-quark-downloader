@@ -89,6 +89,15 @@ public class DownloadService : AbstractDownloadService
     /// </summary>
     private string _sourceKeyValue = "";
 
+    // 🚨 2026-11-08：md5 不可信的「源文件指纹」缓存（进程级，跨任务共享）。
+    //   夸克 getDownloadUrl 返回的 md5 字段与实际内容不符，但内容本身是好的；
+    //   这种「元数据问题」对同一个源文件（SourceKey 相同）每次都一样。
+    //   第一次复核确认「抽样逐字节一致」后记下指纹，后续同一源文件直接跳过抽样，
+    //   不再每个文件白跑十几秒网络复核。key = SourceKey（空时退回 ExpectedMd5）。
+    //   进程重启即失效（可接受：重启后第一次只跑 4 段，几秒就回来）。
+    private static readonly ConcurrentDictionary<string, byte> Md5Untrusted =
+        new ConcurrentDictionary<string, byte>(StringComparer.Ordinal);
+
     private CancellationTokenSource _resumeSaveCts;
     private Task _resumeSaveTask;
 
@@ -381,11 +390,30 @@ public class DownloadService : AbstractDownloadService
             // 先抽样逐字节复核：全一致 = 元数据不可信；有不一致 = 真损坏。
             if (verify.HashMismatch)
             {
-                // 复核也是网络活，可能几秒；给个可见阶段，别让界面看起来像死掉。
-                SchedulePhase("正在复核文件内容…");
-                int check = await CrossCheckAsync(_globalCancellationTokenSource.Token).ConfigureAwait(false);
-                CancelScheduledPhase();
-                Package.Phase = null;
+                // 🚨 2026-11-08：同一源文件「哈希不符」的复核结论做进程级缓存。
+                //   夸克 md5 元数据不可信是**确定性**的（同一 SourceKey 每次都一样），
+                //   第一次抽样确认后，后续同一源文件直接套用结论，跳过网络复核。
+                string md5CacheKey = string.IsNullOrEmpty(_sourceKeyValue)
+                    ? (Options.ExpectedMd5 ?? "")
+                    : _sourceKeyValue;
+                bool cachedUntrusted = !string.IsNullOrEmpty(md5CacheKey)
+                    && Md5Untrusted.ContainsKey(md5CacheKey);
+
+                int check = CrossCheckMatched;
+                if (cachedUntrusted)
+                {
+                    // 已确认过「元数据不可信、内容可用」，不再抽样。
+                    _logger?.LogInfo("哈希不符（同一源文件已确认元数据不可信），跳过抽样复核，按文件可用处理。");
+                }
+                else
+                {
+                    // 复核也是网络活，可能几秒；给个可见阶段，别让界面看起来像死掉。
+                    SchedulePhase("正在复核文件内容…");
+                    check = await CrossCheckAsync(_globalCancellationTokenSource.Token).ConfigureAwait(false);
+                    CancelScheduledPhase();
+                    Package.Phase = null;
+                }
+
                 if (check == CrossCheckDamaged)
                 {
                     await ClearResumeAsync().ConfigureAwait(false);
@@ -408,6 +436,13 @@ public class DownloadService : AbstractDownloadService
                     }
                     catch { }
                 }
+                else if (check == CrossCheckMatched)
+                {
+                    // 抽样逐字节一致 → 元数据不可信成立，记缓存供后续同源文件复用。
+                    if (!string.IsNullOrEmpty(md5CacheKey))
+                        Md5Untrusted.TryAdd(md5CacheKey, 1);
+                }
+
                 verify = VerifyOutcome.Warn(check == CrossCheckMatched
                     ? "内容已按服务器返回完整下载（抽样逐字节复核一致）；"
                       + "网盘接口给的哈希与实际内容不符，属元数据问题，文件可用"
@@ -826,15 +861,21 @@ public class DownloadService : AbstractDownloadService
 
     private async Task<int> CrossCheckAsync(CancellationToken cancel)
     {
-        const int Samples = 16;
+        // 🚨 2026-11-08：段数从 16 降到 4。
+        //   16 段 × 256KB = 4MB，但夸克直链单连接 ~51KB/s，16 段并发也要 20 秒才勉强出结果，
+        //   实测「一致 0 段，不一致 0 段，未取到 16 段」—— 纯白跑，还让界面挂「复核中」17 秒。
+        //   4 段横跨文件头/中/尾，采样点更分散、代表性不降反升，且 4 段并发约 5 秒就能回来。
+        //   真损坏时任意一段不一致即被抓到（损坏不是「正好避开 4 个采样点」能躲掉的）。
+        //   配合 md5 不可信缓存（见 Md5UntrustedCache），绝大多数夸克文件连这 4 段都不用跑。
+        const int Samples = 4;
 
         // 🚨 样本必须小。夸克分享直链单连接实测 ~51 KB/s：
         //   1 MB 一段要 20 秒，16 段并发也正好撞上预算边缘 —— 实测 16 段全部超时，
         //   日志出现「一致 0 段，不一致 0 段，未取到 16 段」。
-        //   256 KB 一段约 5 秒，4 MB 总量足以判定「是元数据问题还是真损坏」。
+        //   256 KB 一段约 5 秒，1 MB 总量足以判定「是元数据问题还是真损坏」。
         const int SampleBytes = 256 * 1024;
 
-        const int TotalBudgetMs = 20000;
+        const int TotalBudgetMs = 12000;
 
         long total = Package.TotalFileSize;
         string path = Package.FileName;

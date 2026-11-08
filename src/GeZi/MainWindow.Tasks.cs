@@ -89,7 +89,13 @@ namespace GeZi
                 long total = active.Sum(t => t.Total);
                 int running = active.Count(t => t.State == JobState.Downloading);
 
-                string pct = total > 0 ? (done * 100.0 / total).ToString("F1") + "%" : "—";
+                // 🚨 2026-11-08：日志里的总进度用**向下截断**，不是四舍五入。
+                //    F1 会把 99.95% 显示成 100.0%，误导用户以为「下完了却还在跑」。
+                //    与任务行的 TaskItem.PercentText（Math.Floor(_percent*10)/10）保持同一口径：
+                //    先放大 10 倍向下取整再除回来，只保留「真实跨过的」十分位。
+                string pct = total > 0
+                    ? (Math.Floor(done * 1000.0 / total) / 10.0).ToString("F1") + "%"
+                    : "—";
                 string line = string.Format("下载中：{0} 个任务（{1} 个在跑），总速度 {2}/s，总进度 {3}",
                     active.Count, running,
                     Util.FormatSize((long)speed), pct);

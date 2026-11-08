@@ -1831,8 +1831,8 @@
 
                                                      ⚠️ 语义是「**天花板**」不是「预设值」：
                                                        · 标准 = 最高 512（与改造前行为一致，默认）
-                                                       · 输出 = 最高 2048
-                                                       · 超载 = 最高 4096
+                                                       · 输出 = 最高 1024
+                                                       · 超载 = 最高 3000
                                                      实际并发仍由「线程设置」里四家网盘各自的值决定，
                                                      档位只是在上面再夹一道（见 SpeedTier.Clamp）。
 
@@ -1867,15 +1867,15 @@
                                                                          GroupName="SpeedTier"
                                                                          Checked="OnSpeedTierChanged"
                                                                          Style="{StaticResource SegmentedRadio}"
-                                                                         AutomationProperties.Name="输出速度档位，最高 2048 连接"
-                                                                         ToolTip="最高 2048 条连接。单文件大文件提速用。"
+                                                                         AutomationProperties.Name="输出速度档位，最高 1024 连接"
+                                                                         ToolTip="最高 1024 条连接。单文件大文件提速用。"
                                                                          Margin="2,0,0,0"/>
                                                             <RadioButton x:Name="SpeedOverloadRadio" Content="超载"
                                                                          GroupName="SpeedTier"
                                                                          Checked="OnSpeedTierChanged"
                                                                          Style="{StaticResource SegmentedRadio}"
-                                                                         AutomationProperties.Name="超载速度档位，最高 4096 连接"
-                                                                         ToolTip="最高 4096 条连接。抢带宽用，连接多容易被网盘限速。"
+                                                                         AutomationProperties.Name="超载速度档位，最高 3000 连接"
+                                                                         ToolTip="最高 3000 条连接。抢带宽用，连接多容易被网盘限速。"
                                                                          Margin="2,0,0,0"/>
                                                         </StackPanel>
                                                     </Grid>
