@@ -1790,11 +1790,6 @@
                                     <Grid Grid.Column="0" Margin="0,0,12,0">
                                         <Grid.RowDefinitions>
                                             <RowDefinition Height="Auto"/>
-                                            <!-- 🚨 2026-11-08 第二行 Auto → *：左列原来两行都是 Auto，
-                                                 右列比左列高时，左列 Grid 被拉到右列同高、但两张卡都是自然高度
-                                                 → 「窗口与后台」下方露出大片纯白（用户报「下方这么多空白」）。
-                                                 改成 * 让「窗口与后台」卡 stretch 填满左列剩余高度，
-                                                 与右列「播放器」卡（* 行）对称，两列底部严格对齐。 -->
                                             <RowDefinition Height="*"/>
                                         </Grid.RowDefinitions>
                                     <!-- ① 网络与下载 -->
@@ -2040,66 +2035,101 @@
                                             </Grid>
                                         </StackPanel>
                                     </Border>
-                                    <!-- ③ 窗口与后台 -->
+                                    <!-- ⑤ 播放器（边下边播用）—— 横跨两列，压成一行横条 -->
+                                    <!-- ④ 播放器：右列第三行（Row 2）。
+                                         🚨 2026-11-03：原来它横跨两列占满整行、内容只有一行，
+                                         下方大片空白。现在放进右列第三行，与左列「存储」对齐，
+                                         两列高度自然一致，整页也不需要滚动条了。 -->
                                     <Border Grid.Row="1" Style="{StaticResource SettingsCard}"
-                                            Margin="0" HorizontalAlignment="Stretch">
+                                            Margin="0" HorizontalAlignment="Stretch"
+                                            VerticalAlignment="Stretch"
+                                            MinHeight="132">
+                                        <!-- 🚨 2026-11-07 MinHeight="132" 是「加字把卡片顶大」的硬保护：
+                                             本卡高度 = 外层行高 H − (存储 + 外观)，H = max(左右列自然高)。
+                                             一旦文案再变长让右列反超左列，本卡会退回自然高 → 变大且左列短一截。
+                                             132 = 设计高度，超了宁可裁切也不要整卡撑开（见下方文案处的长注释）。 -->
                                         <StackPanel>
+                                            <!-- 标题行（与其它卡一致的图标+标题） -->
                                             <Grid Style="{StaticResource SettingsCardHeader}">
                                                 <StackPanel Orientation="Horizontal">
-                                                    <Path Data="{StaticResource IconSettings}" Stretch="Uniform"
+                                                    <Path Data="{StaticResource IconFileVideo}" Stretch="Uniform"
                                                           Width="16" Height="16" VerticalAlignment="Center"
                                                           Stroke="{DynamicResource TextTertiaryBrush}" StrokeThickness="1.7"/>
-                                                    <TextBlock Text="窗口与后台" Style="{StaticResource SettingsCardTitle}"
+                                                    <TextBlock Text="播放器" Style="{StaticResource SettingsCardTitle}"
                                                                Margin="10,0,0,0"/>
+                                                    <TextBlock Text="边下边播" FontSize="11.5" Margin="8,0,0,0"
+                                                               VerticalAlignment="Center"
+                                                               Foreground="{DynamicResource TextTertiaryBrush}"/>
                                                 </StackPanel>
                                             </Grid>
 
-                                            <Grid Style="{StaticResource SettingsRow3}">
+                                            <!-- 🚨 2026-11-04 重做（用户：这张卡「没有一点儿美感」）。
+                                                 旧版是三行字号几乎一样的小字 + 左下角孤零零一个按钮，
+                                                 读起来是一坨、没有视觉重心。
+                                                 新版：左侧状态徽章（圆点 + 结论）+ 下方一行灰字路径，
+                                                 右侧竖排按钮 —— 一眼就知道「能用 / 不能用」，动作在右边。 -->
+                                            <Grid>
                                                 <Grid.ColumnDefinitions>
-                                                    <ColumnDefinition Width="160"/>
                                                     <ColumnDefinition Width="*"/>
+                                                    <ColumnDefinition Width="Auto"/>
                                                 </Grid.ColumnDefinitions>
-                                                <TextBlock Grid.Column="0" Text="关闭按钮行为"
-                                                           Style="{StaticResource SettingsRowLabel}"/>
-                                                <StackPanel Grid.Column="1">
-                                                    <ComboBox x:Name="CloseActionBox" Width="260" Height="34"
-                                                              HorizontalAlignment="Left"
-                                                              Style="{StaticResource AppComboBox}"
-                                                              ItemContainerStyle="{StaticResource AppComboBoxItem}"
-                                                              SelectionChanged="OnSettingChanged">
-                                                        <ComboBoxItem Content="每次询问"/>
-                                                        <ComboBoxItem Content="最小化到托盘（后台继续下载）"/>
-                                                        <ComboBoxItem Content="直接退出程序"/>
-                                                    </ComboBox>
-                                                    <!-- 2026-11-04：这行小字**保留**（用户确认要留）。
-                                                         两列底部对齐不再靠「删内容」，
-                                                         改用下面两张末卡上的 MinHeight 精确配平。 -->
-                                                    <TextBlock Style="{StaticResource SettingsRowHint}"
-                                                               Margin="0,7,0,0" MaxWidth="300"
-                                                               HorizontalAlignment="Left"
-                                                               Text="选「最小化到托盘」后下载不会中断。"/>
+
+                                                <StackPanel Grid.Column="0" Margin="0,0,12,0">
+                                                    <!-- 状态徽章：绿点 = 已就绪，灰点 = 没检测到。
+                                                         圆点颜色与文字由 OnRecheckPlayer 在代码里同步（见 MainWindow.Settings.cs）。 -->
+                                                    <StackPanel Orientation="Horizontal">
+                                                        <Ellipse x:Name="PlayerStatusDot" Width="8" Height="8"
+                                                                 VerticalAlignment="Center" Margin="0,0,8,0"
+                                                                 Fill="{DynamicResource TextTertiaryBrush}"/>
+                                                        <TextBlock x:Name="PlayerStatusText"
+                                                                   FontSize="13.5" FontWeight="SemiBold"
+                                                                   TextTrimming="CharacterEllipsis"
+                                                                   VerticalAlignment="Center"
+                                                                   Foreground="{DynamicResource TextPrimaryBrush}"/>
+                                                    </StackPanel>
+
+                                                    <!-- 路径 / 提示：一行灰字，超长省略号，全文看 ToolTip -->
+                                                    <TextBlock x:Name="PlayerPathText"
+                                                               FontSize="11.5" Margin="16,6,0,0"
+                                                               TextTrimming="CharacterEllipsis"
+                                                               ToolTipService.ShowDuration="20000"
+                                                               Foreground="{DynamicResource TextTertiaryBrush}"/>
+                                                </StackPanel>
+
+                                                <StackPanel Grid.Column="1" VerticalAlignment="Center">
+                                                    <Button x:Name="RecheckPlayerBtn" Content="重新检测"
+                                                            Click="OnRecheckPlayer"
+                                                            Style="{StaticResource SecondaryButton}"
+                                                            HorizontalAlignment="Stretch" Margin="0,0,0,8"/>
+                                                    <Button x:Name="GetVlcBtn" Content="打开下载页" Click="OnGetVlc"
+                                                            Style="{StaticResource GhostButton}"
+                                                            HorizontalAlignment="Stretch"
+                                                            ToolTip="在浏览器里打开 VLC 官方下载页"/>
                                                 </StackPanel>
                                             </Grid>
 
-                                            <Grid Style="{StaticResource SettingsRow3}" Margin="0">
-                                                <Grid.ColumnDefinitions>
-                                                    <ColumnDefinition Width="160"/>
-                                                    <ColumnDefinition Width="*"/>
-                                                </Grid.ColumnDefinitions>
-                                                <TextBlock Grid.Column="0" Text="剪贴板"
-                                                           Style="{StaticResource SettingsRowLabel}"/>
-                                                <StackPanel Grid.Column="1">
-                                                    <CheckBox x:Name="ClipboardAutoParseCheck"
-                                                              Content="复制分享链接时自动解析"
-                                                              Style="{StaticResource AppCheckBox}"
-                                                              VerticalAlignment="Center"
-                                                              Click="OnClipboardAutoParseChanged"/>
-                                                    <TextBlock Style="{StaticResource SettingsRowHint}"
-                                                               Margin="0,7,0,0" MaxWidth="300"
-                                                               HorizontalAlignment="Left"
-                                                               Text="窗口在托盘时静默解析，不抢焦点。"/>
-                                                </StackPanel>
-                                            </Grid>
+                                            <!-- 🚨🚨 2026-11-07 修「加字之后卡片变大、左右两卡底部不对齐」。
+                                                 先纠正一条**错误结论**：我在上一版注释里写过
+                                                 「卡片尺寸由 Grid 行决定、完全不变」—— 那是错的。
+                                                 真实机制（纯算术，不是样式玄学）：
+                                                   外层 Grid 只有两列、没有 RowDefinition（隐式一行），
+                                                   H = max(左列自然高 L, 右列自然高 R)；
+                                                   右列第三行是 * 且本卡 VerticalAlignment=Stretch，
+                                                   ⇒ 本卡实际高度 = H − (存储 + 外观)。
+                                                 加字前 L > R ⇒ H = L，本卡被拉伸、富余空白被文字填满、两列严丝合缝；
+                                                 加字后右列自然高反超左列 ⇒ H = R，* 行没有余额可分
+                                                   ⇒ 本卡退回自然高（「卡片变大了」），左列只有 L（「底部不对齐」）。
+                                                 删字即复原。⇒ 三条约束（留着文案 / 卡片尺寸不变 / 底部对齐）
+                                                 同时成立的**唯一条件**是：右列自然高必须恒 ≤ 左列。
+                                                 所以这里：① 两段说明**合并成一段**并压到 2 行内，
+                                                 把右列自然高拉回左列之下；② 本 Border 加 MinHeight 做硬保护
+                                                 （将来再有人加字，卡片不会塌成内容高，而是保持设计高度、
+                                                 超出部分被裁切，肉眼立刻能发现，而不是悄悄错位）。 -->
+                                            <TextBlock Style="{StaticResource SettingsRowHint}"
+                                                       MaxWidth="9999" Margin="0,14,0,0"
+                                                       HorizontalAlignment="Left"
+                                                       TextWrapping="Wrap"
+                                                       Text="VLC 免费开源、几乎什么格式都能播；用它边下边播，没下完也能看已缓存的部分。没装 VLC 时用系统默认播放器打开。"/>
                                         </StackPanel>
                                     </Border>
                                     </Grid>
@@ -2307,101 +2337,66 @@
                                             </Grid>
                                         </StackPanel>
                                     </Border>
-                                    <!-- ⑤ 播放器（边下边播用）—— 横跨两列，压成一行横条 -->
-                                    <!-- ④ 播放器：右列第三行（Row 2）。
-                                         🚨 2026-11-03：原来它横跨两列占满整行、内容只有一行，
-                                         下方大片空白。现在放进右列第三行，与左列「存储」对齐，
-                                         两列高度自然一致，整页也不需要滚动条了。 -->
+                                    <!-- ③ 窗口与后台 -->
                                     <Border Grid.Row="2" Style="{StaticResource SettingsCard}"
-                                            Margin="0" HorizontalAlignment="Stretch"
-                                            VerticalAlignment="Stretch"
-                                            MinHeight="132">
-                                        <!-- 🚨 2026-11-07 MinHeight="132" 是「加字把卡片顶大」的硬保护：
-                                             本卡高度 = 外层行高 H − (存储 + 外观)，H = max(左右列自然高)。
-                                             一旦文案再变长让右列反超左列，本卡会退回自然高 → 变大且左列短一截。
-                                             132 = 设计高度，超了宁可裁切也不要整卡撑开（见下方文案处的长注释）。 -->
+                                            Margin="0" HorizontalAlignment="Stretch">
                                         <StackPanel>
-                                            <!-- 标题行（与其它卡一致的图标+标题） -->
                                             <Grid Style="{StaticResource SettingsCardHeader}">
                                                 <StackPanel Orientation="Horizontal">
-                                                    <Path Data="{StaticResource IconFileVideo}" Stretch="Uniform"
+                                                    <Path Data="{StaticResource IconSettings}" Stretch="Uniform"
                                                           Width="16" Height="16" VerticalAlignment="Center"
                                                           Stroke="{DynamicResource TextTertiaryBrush}" StrokeThickness="1.7"/>
-                                                    <TextBlock Text="播放器" Style="{StaticResource SettingsCardTitle}"
+                                                    <TextBlock Text="窗口与后台" Style="{StaticResource SettingsCardTitle}"
                                                                Margin="10,0,0,0"/>
-                                                    <TextBlock Text="边下边播" FontSize="11.5" Margin="8,0,0,0"
-                                                               VerticalAlignment="Center"
-                                                               Foreground="{DynamicResource TextTertiaryBrush}"/>
                                                 </StackPanel>
                                             </Grid>
 
-                                            <!-- 🚨 2026-11-04 重做（用户：这张卡「没有一点儿美感」）。
-                                                 旧版是三行字号几乎一样的小字 + 左下角孤零零一个按钮，
-                                                 读起来是一坨、没有视觉重心。
-                                                 新版：左侧状态徽章（圆点 + 结论）+ 下方一行灰字路径，
-                                                 右侧竖排按钮 —— 一眼就知道「能用 / 不能用」，动作在右边。 -->
-                                            <Grid>
+                                            <Grid Style="{StaticResource SettingsRow3}">
                                                 <Grid.ColumnDefinitions>
+                                                    <ColumnDefinition Width="160"/>
                                                     <ColumnDefinition Width="*"/>
-                                                    <ColumnDefinition Width="Auto"/>
                                                 </Grid.ColumnDefinitions>
-
-                                                <StackPanel Grid.Column="0" Margin="0,0,12,0">
-                                                    <!-- 状态徽章：绿点 = 已就绪，灰点 = 没检测到。
-                                                         圆点颜色与文字由 OnRecheckPlayer 在代码里同步（见 MainWindow.Settings.cs）。 -->
-                                                    <StackPanel Orientation="Horizontal">
-                                                        <Ellipse x:Name="PlayerStatusDot" Width="8" Height="8"
-                                                                 VerticalAlignment="Center" Margin="0,0,8,0"
-                                                                 Fill="{DynamicResource TextTertiaryBrush}"/>
-                                                        <TextBlock x:Name="PlayerStatusText"
-                                                                   FontSize="13.5" FontWeight="SemiBold"
-                                                                   TextTrimming="CharacterEllipsis"
-                                                                   VerticalAlignment="Center"
-                                                                   Foreground="{DynamicResource TextPrimaryBrush}"/>
-                                                    </StackPanel>
-
-                                                    <!-- 路径 / 提示：一行灰字，超长省略号，全文看 ToolTip -->
-                                                    <TextBlock x:Name="PlayerPathText"
-                                                               FontSize="11.5" Margin="16,6,0,0"
-                                                               TextTrimming="CharacterEllipsis"
-                                                               ToolTipService.ShowDuration="20000"
-                                                               Foreground="{DynamicResource TextTertiaryBrush}"/>
-                                                </StackPanel>
-
-                                                <StackPanel Grid.Column="1" VerticalAlignment="Center">
-                                                    <Button x:Name="RecheckPlayerBtn" Content="重新检测"
-                                                            Click="OnRecheckPlayer"
-                                                            Style="{StaticResource SecondaryButton}"
-                                                            HorizontalAlignment="Stretch" Margin="0,0,0,8"/>
-                                                    <Button x:Name="GetVlcBtn" Content="打开下载页" Click="OnGetVlc"
-                                                            Style="{StaticResource GhostButton}"
-                                                            HorizontalAlignment="Stretch"
-                                                            ToolTip="在浏览器里打开 VLC 官方下载页"/>
+                                                <TextBlock Grid.Column="0" Text="关闭按钮行为"
+                                                           Style="{StaticResource SettingsRowLabel}"/>
+                                                <StackPanel Grid.Column="1">
+                                                    <ComboBox x:Name="CloseActionBox" Width="260" Height="34"
+                                                              HorizontalAlignment="Left"
+                                                              Style="{StaticResource AppComboBox}"
+                                                              ItemContainerStyle="{StaticResource AppComboBoxItem}"
+                                                              SelectionChanged="OnSettingChanged">
+                                                        <ComboBoxItem Content="每次询问"/>
+                                                        <ComboBoxItem Content="最小化到托盘（后台继续下载）"/>
+                                                        <ComboBoxItem Content="直接退出程序"/>
+                                                    </ComboBox>
+                                                    <!-- 2026-11-04：这行小字**保留**（用户确认要留）。
+                                                         两列底部对齐不再靠「删内容」，
+                                                         改用下面两张末卡上的 MinHeight 精确配平。 -->
+                                                    <TextBlock Style="{StaticResource SettingsRowHint}"
+                                                               Margin="0,7,0,0" MaxWidth="300"
+                                                               HorizontalAlignment="Left"
+                                                               Text="选「最小化到托盘」后下载不会中断。"/>
                                                 </StackPanel>
                                             </Grid>
 
-                                            <!-- 🚨🚨 2026-11-07 修「加字之后卡片变大、左右两卡底部不对齐」。
-                                                 先纠正一条**错误结论**：我在上一版注释里写过
-                                                 「卡片尺寸由 Grid 行决定、完全不变」—— 那是错的。
-                                                 真实机制（纯算术，不是样式玄学）：
-                                                   外层 Grid 只有两列、没有 RowDefinition（隐式一行），
-                                                   H = max(左列自然高 L, 右列自然高 R)；
-                                                   右列第三行是 * 且本卡 VerticalAlignment=Stretch，
-                                                   ⇒ 本卡实际高度 = H − (存储 + 外观)。
-                                                 加字前 L > R ⇒ H = L，本卡被拉伸、富余空白被文字填满、两列严丝合缝；
-                                                 加字后右列自然高反超左列 ⇒ H = R，* 行没有余额可分
-                                                   ⇒ 本卡退回自然高（「卡片变大了」），左列只有 L（「底部不对齐」）。
-                                                 删字即复原。⇒ 三条约束（留着文案 / 卡片尺寸不变 / 底部对齐）
-                                                 同时成立的**唯一条件**是：右列自然高必须恒 ≤ 左列。
-                                                 所以这里：① 两段说明**合并成一段**并压到 2 行内，
-                                                 把右列自然高拉回左列之下；② 本 Border 加 MinHeight 做硬保护
-                                                 （将来再有人加字，卡片不会塌成内容高，而是保持设计高度、
-                                                 超出部分被裁切，肉眼立刻能发现，而不是悄悄错位）。 -->
-                                            <TextBlock Style="{StaticResource SettingsRowHint}"
-                                                       MaxWidth="9999" Margin="0,14,0,0"
-                                                       HorizontalAlignment="Left"
-                                                       TextWrapping="Wrap"
-                                                       Text="VLC 免费开源、几乎什么格式都能播；用它边下边播，没下完也能看已缓存的部分。没装 VLC 时用系统默认播放器打开。"/>
+                                            <Grid Style="{StaticResource SettingsRow3}" Margin="0">
+                                                <Grid.ColumnDefinitions>
+                                                    <ColumnDefinition Width="160"/>
+                                                    <ColumnDefinition Width="*"/>
+                                                </Grid.ColumnDefinitions>
+                                                <TextBlock Grid.Column="0" Text="剪贴板"
+                                                           Style="{StaticResource SettingsRowLabel}"/>
+                                                <StackPanel Grid.Column="1">
+                                                    <CheckBox x:Name="ClipboardAutoParseCheck"
+                                                              Content="复制分享链接时自动解析"
+                                                              Style="{StaticResource AppCheckBox}"
+                                                              VerticalAlignment="Center"
+                                                              Click="OnClipboardAutoParseChanged"/>
+                                                    <TextBlock Style="{StaticResource SettingsRowHint}"
+                                                               Margin="0,7,0,0" MaxWidth="300"
+                                                               HorizontalAlignment="Left"
+                                                               Text="窗口在托盘时静默解析，不抢焦点。"/>
+                                                </StackPanel>
+                                            </Grid>
                                         </StackPanel>
                                     </Border>
                                     </Grid>

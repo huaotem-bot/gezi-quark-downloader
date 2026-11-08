@@ -422,21 +422,23 @@ namespace GeZi
             // 🚨 2026-11-07 修「下方控件被盖住不完整」：
             //   原高度 360 的内容区放不下「标题 + 说明 + 4 行(每行34+14) + 卡片内边距 + 按钮行」，
             //   底部按钮行被挤出可视区。加高到 440，并让卡片行(Row 2)=Star 自适应、按钮行固定在底部。
-            DialogChrome.StyleWindow(dlg, 460, 440);
+            // 🚨 2026-11-08 第二次修正：窗口 440 → 340。
+            //   440 是「标题 + 说明 + 卡片 + 按钮」四行估出来的，但标题是重复的
+            //   （见下），且卡片行用了 Star 把四行网盘拉满整卡，多出约 150px 死白。
+            //   删掉重复标题 + 卡片贴内容（Auto）后，实际内容 ≈ 340，窗口跟着收。
+            DialogChrome.StyleWindow(dlg, 460, 340);
 
             var root = DialogChrome.DialogRoot();
-            root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-            root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-            root.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
-            root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+            // 🚨 2026-11-08 修「标题画两遍」：`StyleWindow` 的窗口标题已经画在自绘标题栏里，
+            //   内容区不能再调 `PageTitle`（DialogChrome.cs 注释明确写过这条规矩，
+            //   本弹窗是漏网之鱼）。删掉 title 行，hint / card / btns 依次上移一行。
+            root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });   // hint
+            root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });   // card（贴内容）
+            root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });   // btns
 
-            var title = DialogChrome.PageTitle("四网盘连接数");
-            Grid.SetRow(title, 0);
-            root.Children.Add(title);
-
-            var hint = DialogChrome.Hint("默认已按各家服务端上限取好连接数，可单独调整；选得太高会自动降下来。", 6, 12);
+            var hint = DialogChrome.Hint("默认已按各家服务端上限取好连接数，可单独调整；选得太高会自动降下来。", 0, 12);
             hint.TextWrapping = TextWrapping.Wrap;
-            Grid.SetRow(hint, 1);
+            Grid.SetRow(hint, 0);
             root.Children.Add(hint);
 
             var rows = new StackPanel { Margin = new Thickness(0, 0, 0, 0) };
@@ -453,7 +455,7 @@ namespace GeZi
             AddPerPanRow(rows, boxes, presets, PanKind.Xunlei, "迅雷云盘", "超过 16 条会大面积 503");
 
             var card = DialogChrome.Card(rows);
-            Grid.SetRow(card, 2);
+            Grid.SetRow(card, 1);
             root.Children.Add(card);
 
             // 🚨 2026-11-07：下拉里已没有「跟随全局」占位项，直接显示各家**当前生效**的连接数
@@ -477,7 +479,7 @@ namespace GeZi
 
             var btns = DialogChrome.ButtonRow(resetBtn, okBtn);
             btns.Margin = new Thickness(0, 14, 0, 0);
-            Grid.SetRow(btns, 3);
+            Grid.SetRow(btns, 2);
             root.Children.Add(btns);
 
             dlg.Content = root;
