@@ -115,5 +115,58 @@ namespace GeZi.Core.Support
             long chosen = dynamicFloor > 0 ? dynamicFloor : absoluteFloor;
             return chosen > death ? chosen : death;
         }
+
+        /// <summary>重连成本的保守估计（毫秒）：TCP + TLS 握手 + 请求头，实测 200~600ms。</summary>
+        public const long ReconnectCostMs = 1000;
+
+        /// <summary>
+        /// 判慢之后，这条连接**到底值不值得**断开重连。
+        ///
+        /// <para>
+        /// 🚨🚨 2026-11-08 修「收尾卡死、必须暂停再恢复才动」（用户实测坐实）：
+        /// 旧判据写在 <c>ChunkDownloader</c> 里，是
+        /// <c>bps &gt; 0 &amp;&amp; (EmptyLength / bps) &gt; 2.0</c>，两个致命缺陷：
+        /// </para>
+        /// <list type="number">
+        /// <item><description>
+        /// **窗口内读到 0 字节时 bps == 0**，第一项直接 false ⇒ 一条彻底挂死的连接
+        /// 永远不会被判慢、永远不重连，只能干等 <c>Chunk.Timeout</c>。
+        /// 用户日志「11:18:16 3.39 MB/s → 11:18:36 414 KB/s → 卡 28 秒无任何进展，
+        /// 手动暂停再恢复立刻跑完」正是它：最后的尾巴片挂在一条死连接上，看门狗闭着眼。
+        /// </description></item>
+        /// <item><description>
+        /// 固定 2 秒基准偏高。收尾每片只剩几十 KB，按 6 KB/s 算剩余时间远小于 2 秒
+        /// ⇒ 一律判「不值得重连」，于是收尾全是慢连接在啃，速度越掉越低。
+        /// 重连成本实测 200~600ms，所以剩余 1 秒以上就该换。
+        /// </description></item>
+        /// </list>
+        /// <para>
+        /// 新判据：
+        /// · 已经下完（剩余 ≤ 0）→ 不重连；
+        /// · 窗口内 0 字节 → 只要还有剩余就重连（死连接不能等超时）；
+        /// · 否则「按当前速度还要下 &gt; <see cref="ReconnectCostMs"/>」才重连。
+        /// </para>
+        /// </summary>
+        /// <param name="bps">本窗口实测速度（字节/秒）。</param>
+        /// <param name="remainingBytes">该分片剩余字节数。</param>
+        /// <param name="costMs">重连成本估计（毫秒）；≤0 时用 <see cref="ReconnectCostMs"/>。</param>
+        public static bool ShouldReconnect(double bps, long remainingBytes, long costMs)
+        {
+            if (remainingBytes <= 0)
+                return false;                       // 已经下完，没什么可换的
+
+            long cost = costMs > 0 ? costMs : ReconnectCostMs;
+            if (bps <= 0)
+                return true;                        // 窗口内 0 字节 = 彻底挂死，必须换
+
+            double remainMs = remainingBytes * 1000.0 / bps;
+            return remainMs > cost;
+        }
+
+        /// <summary><see cref="ShouldReconnect(double,long,long)"/> 的默认成本重载。</summary>
+        public static bool ShouldReconnect(double bps, long remainingBytes)
+        {
+            return ShouldReconnect(bps, remainingBytes, ReconnectCostMs);
+        }
     }
 }

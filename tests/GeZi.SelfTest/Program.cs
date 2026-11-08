@@ -134,6 +134,7 @@ namespace GeZi.SelfTest
     Run("pan_conn_budget", TestPanConnBudget);
     Run("chunk_splitter", TestChunkSplitter);
     Run("slow_watchdog", TestSlowWatchdog);
+    Run("connection_climber", TestConnectionClimber);
     Run("disk_conn_budget", TestDiskConnBudget);
     Run("range_downgrade_gate", TestRangeDowngradeGate);
     Run("speed_tier", TestSpeedTier);
@@ -2650,6 +2651,133 @@ namespace GeZi.SelfTest
                 && SlowWatchdog.Median(new List<double>()) == 0
                 && SlowWatchdog.Median(new List<double> { -100, -200 }) == 0,
                 "空集合 / null / 全负数都返回 0，不抛异常");
+
+            // ⑩🚨 2026-11-08「值得不值得重连」判据（用户实测：收尾卡 28 秒、暂停再恢复立刻跑完）
+            //
+            // 旧判据 `bps > 0 && (remaining / bps) > 2.0` 有两个致命缺陷：
+            //   ① 彻底挂死（bps == 0）时第一项为 false → 永远不重连，只能干等 Chunk.Timeout；
+            //   ② 固定 2 秒基准太高：收尾每片只剩几十 KB 时一律判「不值得重连」，
+            //      于是一路磨到超时。现在改成「按连接成本比时间」。
+            Check("watch.reconnect_when_dead",
+                SlowWatchdog.ShouldReconnect(0, 100 * 1024),
+                "速度读到 0（连接彻底挂死）必须立刻重连，不能干等超时");
+
+            Check("watch.reconnect_when_small_chunk",
+                SlowWatchdog.ShouldReconnect(5 * 1024, 40 * 1024),
+                "5KB/s 磨 40KB 要 8 秒，远超 1 秒的连接成本 → 必须重连（旧判据 8>2 也判重连，此处保持不变）");
+
+            Check("watch.no_reconnect_when_cheap",
+                !SlowWatchdog.ShouldReconnect(500 * 1024, 100 * 1024),
+                "500KB/s 下 100KB 只要 0.2 秒，重连成本 1 秒纯亏 → 不许重连");
+
+            Check("watch.no_reconnect_when_done",
+                !SlowWatchdog.ShouldReconnect(0, 0)
+                && !SlowWatchdog.ShouldReconnect(1000, -5),
+                "剩余字节已为 0 或负数时不许重连（片已经下完了）");
+
+            Check("watch.reconnect_cost_inclusive",
+                SlowWatchdog.ShouldReconnect(100 * 1024, 120 * 1024)
+                && !SlowWatchdog.ShouldReconnect(100 * 1024, 50 * 1024),
+                "100KB/s 下 120KB 要 1.2 秒 > 1 秒成本 → 重连；50KB 只要 0.5 秒 → 不重连");
+        }
+
+        /// <summary>
+        /// 2026-11-08：连接数爬山控制器（带迟滞）。
+        ///
+        /// <para>
+        /// 用户指定三条硬约束：
+        /// ① 每 30 秒最多调一次，绝不来回抖；
+        /// ② 只有「加完 N 路总量反而降 15% 以上」才回退并记住拐点；
+        /// ③ 拐点要记住，但**必须会过期**，否则一次 CDN 抖动就把当天钉死在低位。
+        /// </para>
+        /// </summary>
+        private static void TestConnectionClimber()
+        {
+            // ① 首次调用：回初值、不判涨跌
+            var c = new ConnectionClimber();
+            Check("climb.first_returns_start",
+                c.Evaluate(0, 10 * 1024 * 1024, 4096, 3000) == 4096,
+                "第一次进来只记录基准，目标 = 硬上限");
+
+            // ② 30 秒节流：没到点一律返回 0（不调整）
+            Check("climb.throttled_within_30s",
+                c.Evaluate(5_000, 20 * 1024 * 1024, 4096, 3000) == 0
+                && c.Evaluate(29_000, 20 * 1024 * 1024, 4096, 3000) == 0,
+                "30 秒内不许调整，否则会来回抖");
+
+            // ③ 到了点、速度没降 → 小步加 25%
+            int up = c.Evaluate(30_000, 12 * 1024 * 1024, 50000, 3000);
+            Check("climb.step_up_25_percent",
+                up == 5120,
+                "4096 × 1.25 = 5120（给 50000 的上限，避免被硬上限夹住看不出比例）");
+
+            // ④ 加完反而掉 15% 以上 → 回退到上一档并记拐点
+            var c2 = new ConnectionClimber();
+            c2.Reset(1000);
+            c2.Evaluate(0, 10_000_000, 4096, 1000);
+            int jumped = c2.Evaluate(30_000, 10_500_000, 4096, 1200);   // 涨了 → 加
+            bool grew = jumped > 1000;
+            int back = c2.Evaluate(60_000, 10_500_000 * 70 / 100, 4096, 1500);   // 掉 30% → 回退
+            Check("climb.revert_on_drop",
+                grew && back < jumped && back >= ConnectionClimber.MinTarget,
+                "总速度掉 30%（> 15%）必须回退到上一档");
+
+            Check("climb.ceiling_remembered",
+                c2.Ceiling != int.MaxValue && c2.Ceiling <= jumped,
+                "回退后必须记住拐点，后续不再越过");
+
+            // ⑤ 拐点会过期（否则一次抖动钉死当天）
+            var c3 = new ConnectionClimber();
+            c3.Reset(1000);
+            c3.Evaluate(0, 10_000_000, 4096, 1000);
+            c3.Evaluate(30_000, 10_500_000, 4096, 1200);
+            c3.Evaluate(60_000, 3_000_000, 4096, 1500);              // 记拐点
+            int ceilingBefore = c3.Ceiling;
+            c3.Evaluate(60_000 + ConnectionClimber.CeilingForgetMs + 1, 3_100_000, 4096, 1500);
+            Check("climb.ceiling_expires",
+                ceilingBefore != int.MaxValue && c3.Ceiling == int.MaxValue,
+                "拐点超过 CeilingForgetMs 必须忘掉，允许重新试探（CDN 会换策略）");
+
+            // ⑥ 小幅波动（< 15%）不算加错，继续爬
+            var c4 = new ConnectionClimber();
+            c4.Reset(1000);
+            c4.Evaluate(0, 10_000_000, 4096, 1000);
+            int s1 = c4.Evaluate(30_000, 10_000_000, 4096, 1200);
+            int s2 = c4.Evaluate(60_000, 10_000_000 * 90 / 100, 4096, 1500);   // 只掉 10%
+            Check("climb.small_dip_not_reverted",
+                s2 >= s1 && c4.Ceiling == int.MaxValue,
+                "掉 10%（< 15% 容许）不许回退，也不许记拐点");
+
+            // ⑦ 停滞：总速度连续 20 秒为 0 且仍有在飞 → 立刻降半（不受 30 秒限制）
+            var c5 = new ConnectionClimber();
+            c5.Reset(1000);
+            c5.Evaluate(0, 1_000_000, 4096, 1000);
+            c5.Evaluate(1_000, 0, 4096, 1000);                       // 开始停滞计时
+            int stalled = c5.Evaluate(1_000 + ConnectionClimber.StallResetMs + 1, 0, 4096, 1000);
+            Check("climb.stall_halves",
+                stalled > 0 && stalled == 500,
+                "停滞 20 秒必须立刻降到一半（这是「必须手动暂停再恢复」的对症解）");
+
+            // ⑧ 永不超过硬上限、永不降到 MinTarget 以下
+            var c6 = new ConnectionClimber();
+            c6.Reset(16);
+            int last = c6.Evaluate(0, 1_000_000, 16, 16);
+            for (int i = 1; i <= 40; i++)
+            {
+                int v = c6.Evaluate(i * 30_000L, 1_000_000 + i, 16, 16);
+                if (v > 0) last = v;
+                if (last > 16 || last < ConnectionClimber.MinTarget)
+                    break;
+            }
+            Check("climb.never_exceeds_ceiling",
+                last <= 16 && last >= ConnectionClimber.MinTarget,
+                "任何情况下不许超过硬上限，也不许低于最小目标");
+
+            // ⑨ 重置清空拐点记忆
+            c6.Reset(256);
+            Check("climb.reset_clears",
+                c6.Target == 256 && c6.Ceiling == int.MaxValue,
+                "换任务 / 改档位后必须彻底重来");
         }
 
         /// <summary>

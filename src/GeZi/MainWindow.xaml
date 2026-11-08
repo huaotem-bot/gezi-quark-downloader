@@ -1807,9 +1807,13 @@
                                             Margin="0,0,0,12" HorizontalAlignment="Stretch">
                                         <StackPanel>
                                             <Grid Style="{StaticResource SettingsCardHeader}">
+                                                <!-- 🚨 2026-11-08 用户要求：「把滑块往左边挪，让左边与下方的空间对齐」。
+                                                     第一列固定 160 与下方每一行（SettingsRow3 的标签列）完全一致，
+                                                     滑块放第二列并左对齐，于是它的左边缘正好压在下拉框/按钮的左边缘上。
+                                                     不要改回 * / Auto —— 那样滑块会贴到卡片最右侧，和下方控件错位。 -->
                                                 <Grid.ColumnDefinitions>
+                                                    <ColumnDefinition Width="160"/>
                                                     <ColumnDefinition Width="*"/>
-                                                    <ColumnDefinition Width="Auto"/>
                                                 </Grid.ColumnDefinitions>
                                                 <StackPanel Grid.Column="0" Orientation="Horizontal">
                                                     <Path Data="{StaticResource IconActivity}" Stretch="Uniform"
@@ -1840,7 +1844,7 @@
                                                         对冻结画刷做 ColorAnimation 会直接抛异常。
                                                         颜色由 MainWindow.Settings.cs 的 ApplySpeedTierVisual()
                                                         在代码里赋 new SolidColorBrush 并做 200ms 动画。 -->
-                                                <Border Grid.Column="1" HorizontalAlignment="Right"
+                                                <Border Grid.Column="1" HorizontalAlignment="Left"
                                                         VerticalAlignment="Center"
                                                         CornerRadius="8"
                                                         Background="{DynamicResource SurfaceSunkenBrush}"

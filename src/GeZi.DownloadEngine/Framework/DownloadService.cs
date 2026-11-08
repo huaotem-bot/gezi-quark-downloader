@@ -155,6 +155,29 @@ public class DownloadService : AbstractDownloadService
     private readonly OverallSlowGate _overallSlow = new OverallSlowGate();
 
     /// <summary>
+    /// 连接数爬山控制器（2026-11-08，带迟滞）。
+    /// <para>
+    /// 用户原话：「每 30 秒最多调一次，只有『加完 N 路总量反而降 15% 以上』才回退并记住拐点」。
+    /// 规则本身在 <see cref="GeZi.Core.Support.ConnectionClimber"/>（纯计算、有自检），
+    /// 这里只负责「每轮喂一次实测总量，把结果落到 <see cref="_climbCap"/>」。
+    /// </para>
+    /// </summary>
+    private readonly GeZi.Core.Support.ConnectionClimber _climber =
+        new GeZi.Core.Support.ConnectionClimber();
+
+    /// <summary>
+    /// 当前爬山允许的**在飞连接上限**（0 = 尚未接管，等于不限）。
+    /// <para>
+    /// 🚨 为什么是「限制在飞数」而不是「改 worker 数」：
+    /// worker 池是一次性 <c>Task.Run</c> 开满的（见 <c>workerCount</c>），
+    /// 运行中无法增减。所以降连接只能让多余 worker 在取片前排队等待 ——
+    /// 效果等价（真正在跑的连接数就是 <see cref="_liveWorkers"/>），
+    /// 而且完全不打扰已经在跑的那些连接（不重连、不重排分片、续传零影响）。
+    /// </para>
+    /// </summary>
+    private int _climbCap;
+
+    /// <summary>
     /// 把字节/秒格式化成「12.3 KB/s」这种人类可读形式。
     /// <para>只用于日志，不进界面 —— 界面速度格式化走 <c>Util.FormatSize</c> 那一套。</para>
     /// </summary>
@@ -1989,9 +2012,28 @@ public class DownloadService : AbstractDownloadService
                 }
 
                 bool tookFirstChunk = false;
+                // 连续空转轮数（2026-11-08）：用于空闲 worker 指数退避，见下面的 Task.Delay 分支。
+                int idleRounds = 0;
 
                 while (!cancel.IsCancellationRequested)
                 {
+                    // 🚨 2026-11-08：连接数爬坡的「刹车」。
+                    //   爬山控制器（ConnectionClimber）只允许 ≤ _climbCap 条连接同时在飞，
+                    //   这里让超额的 worker 在取片前等一等 —— 效果等于降低并发，
+                    //   但**不打断任何已经在跑的连接**（不重连、不重排分片、续传零影响）。
+                    //
+                    // ⚠️ 安全阀：只有在「真的已有 _climbCap 条在飞」时才等。
+                    //   否则万一 _climbCap 很小而实际连接数上不去（比如全断了），
+                    //   所有 worker 都在这儿排队 ⇒ 死锁。用 active.Count 而不是 _liveWorkers
+                    //   也是同一个目的：active 才是「真正拿着连接」的那批。
+                    int capNow = _climbCap;
+                    if (capNow > 0 && active.Count >= capNow)
+                    {
+                        try { await Task.Delay(40, cancel).ConfigureAwait(false); }
+                        catch (OperationCanceledException) { break; }
+                        continue;
+                    }
+
                     Chunk chunk;
                     if (!queue.TryTake(out chunk))
                     {
@@ -2005,9 +2047,33 @@ public class DownloadService : AbstractDownloadService
                         //    现在让**第一个发现空闲的 worker** 主动把剩余大片切碎填回队列，
                         //    其余 worker 下一轮就能领到活。
                         if (TryRefillTail(queue, active))
+                        {
+                            idleRounds = 0;
                             continue;
+                        }
 
-                        try { await Task.Delay(50, cancel).ConfigureAwait(false); }
+                        // 🚨🚨 2026-11-08 新增：空闲 worker **指数退避**。
+                        //
+                        // 用户实测（443MB / 4096 路）：收尾只剩 1% 时队列里最多几十片，
+                        //   其余 4000+ 个 worker 全部空转。原来它们每 50ms 醒一次，
+                        //   每次都要抢 `_tailRefillGate` 锁、遍历 active 找最大片 ——
+                        //   一秒钟 8 万次无效加锁 + 8 万次字典遍历，纯烧 CPU，
+                        //   反而让那几十条真正在下载的连接抢不到 CPU 时间片。
+                        //   日志里「3.39 MB/s → 845 KB/s → 414 KB/s」的下坡路，
+                        //   有一部分就是这么来的（不是网盘给的更少）。
+                        //
+                        // 做法：连续空转的轮数越多，睡得越久（50→100→200→400，封顶 500ms）。
+                        //   一旦领到活就清零。3000+ 空转 worker 的唤醒次数从 8 万次/秒
+                        //   降到 6 千次/秒，两个数量级的下降。
+                        //   ⚠️ 封顶 500ms 而不是更长：真有人切出新片时，最坏多等半秒，
+                        //      相对「收尾阶段本身就要几秒」可接受。
+                        if (idleRounds < 6)
+                            idleRounds++;
+                        int idleDelayMs = 50 << Math.Min(idleRounds, 3);   // 50/100/200/400
+                        if (idleDelayMs > 500)
+                            idleDelayMs = 500;
+
+                        try { await Task.Delay(idleDelayMs, cancel).ConfigureAwait(false); }
                         catch (OperationCanceledException) { break; }
                         continue;
                     }
@@ -2019,6 +2085,7 @@ public class DownloadService : AbstractDownloadService
                         tookFirstChunk = true;
                         Interlocked.Increment(ref slowStartStarted);
                     }
+                    idleRounds = 0;
                     active[chunk.Id] = chunk;
                     Interlocked.Increment(ref _liveWorkers);
                     try
@@ -2313,6 +2380,44 @@ public class DownloadService : AbstractDownloadService
         // 全员 13.5 KB/s → 6.75 KB/s，谁都不算慢；个别掉到 4 KB/s 才被抓。
         Options.DynamicSlowThresholdBps = GeZi.Core.Support.SlowWatchdog.DynamicFloorFromMedian(
             median, Options.DynamicSlowRatio);
+
+        // ---- 2026-11-08：连接数爬山（带迟滞）----
+        //
+        // 用户原话：「每 30 秒最多调一次，只有『加完 N 路总量反而降 15% 以上』才回退并记住拐点」。
+        //
+        // 🚨 只在「在飞数足够多」时才让它接管：
+        //   收尾期只剩几路在磨最后几 MB，这时的总速度本来就低，
+        //   拿它去判「加连接加错了」是纯噪声（会把爬坡目标无故砍半）。
+        //   所以要求 inFlight ≥ ClimberMinInflight(64)，且本轮总速度 > 0。
+        //
+        // 🚨 它只限制**在飞连接上限**（见 _climbCap 的注释），
+        //   不重连、不重排分片、不动续传 —— 所以随时可以整段关掉（_climbCap = 0）。
+        {
+            const int ClimberMinInflight = 64;
+            int inFlightNow = active.Count;
+            if (inFlightNow >= ClimberMinInflight)
+            {
+                long totalBps = 0;
+                foreach (var s in speeds)
+                {
+                    if (s.Value > 0) totalBps += (long)s.Value;
+                }
+
+                int hardCeiling = Options.ParallelCount;
+                if (hardCeiling < 1) hardCeiling = 1;
+
+                int want = _climber.Evaluate(
+                    now, totalBps, hardCeiling, inFlightNow);
+                if (want > 0 && want != _climbCap)
+                {
+                    _climbCap = want;
+                    _logger?.LogInfo(string.Format(
+                        "连接数爬坡：目标并发调到 {0} 路（当前在飞 {1} 路，总速度 {2}/s{3}）。",
+                        _climbCap, inFlightNow, FmtBps(totalBps),
+                        _climber.Ceiling == int.MaxValue ? "" : "，已记拐点 " + _climber.Ceiling + " 路"));
+                }
+            }
+        }
 
         // 3) 慢的判定阈值 = max(绝对下限, 中位数 × 比例)。
         //

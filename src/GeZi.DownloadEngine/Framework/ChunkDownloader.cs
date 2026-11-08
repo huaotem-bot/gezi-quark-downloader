@@ -442,8 +442,21 @@ internal class ChunkDownloader
                             // 🚨 判据必须按「时间」而不是「字节数」：
                             // 固定 2MB 门槛会把 1MB 的小分片全部排除掉（8MB 文件切 8 片
                             // 就是 1MB/片），自适应分片器在网盘场景下每片常只有几百 KB 到几 MB。
-                            // 正确逻辑：按当前速度还要下 2 秒以上，重连才划算。
-                            bool worthReconnect = bps > 0 && (Chunk.EmptyLength / bps) > 2.0;
+                            //
+                            // 🚨🚨 2026-11-08 修「收尾卡死、必须暂停再恢复才动」：
+                            //   旧判据 `bps > 0 && (EmptyLength / bps) > 2.0` 有两个致命缺陷：
+                            //   ① 窗口内读到 0 字节时 bps == 0 → 第一项直接 false →
+                            //      一条彻底挂死的连接永远不会被判慢、永远不重连，只能干等超时。
+                            //      用户日志「11:18:16 3.39 MB/s → 11:18:36 414 KB/s →
+                            //      卡 28 秒无进展，手动暂停再恢复立刻跑完」就是它。
+                            //   ② 固定 2 秒基准偏高：收尾每片只剩几十 KB，按 6 KB/s 算
+                            //      剩余时间远小于 2 秒 → 一律判「不值得重连」，收尾全是慢连接在啃。
+                            //      重连成本实测 200~600ms，剩余 1 秒以上就该换。
+                            //   判据已抽到 GeZi.Core.Support.SlowWatchdog.ShouldReconnect（有自检）：
+                            //   · 已下完 → 不重连；· 零字节 → 只要还有剩余就重连；
+                            //   · 否则按当前速度还要下 > 1 秒才重连。
+                            bool worthReconnect = GeZi.Core.Support.SlowWatchdog.ShouldReconnect(
+                                bps, Chunk.EmptyLength);
                             if (bps < lowestSpeed && worthReconnect &&
                                 Chunk.SpeedReconnectCount < _configuration.MaxSpeedReconnects &&
                                 SpeedReconnectGovernor.TryAcquire())
