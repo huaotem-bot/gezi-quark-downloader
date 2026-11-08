@@ -1167,6 +1167,7 @@
                                      IsTextSearchEnabled="False"
                                      PreviewMouseLeftButtonDown="OnListPreviewMouseDown"
                                      MouseRightButtonUp="OnTaskListRightClick"
+                                     ContextMenuOpening="OnTaskListContextMenuOpening"
                                      >
                                 <ListBox.ContextMenu>
                                     <!-- 2026-11-01 重建：按 MainWindow.Tasks.cs 的

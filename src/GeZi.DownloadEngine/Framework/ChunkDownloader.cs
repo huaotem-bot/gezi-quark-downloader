@@ -456,7 +456,10 @@ internal class ChunkDownloader
                             //   · 已下完 → 不重连；· 零字节 → 只要还有剩余就重连；
                             //   · 否则按当前速度还要下 > 1 秒才重连。
                             bool worthReconnect = GeZi.Core.Support.SlowWatchdog.ShouldReconnect(
-                                bps, Chunk.EmptyLength);
+                                bps, Chunk.EmptyLength,
+                                _configuration.EndgameNow
+                                    ? GeZi.Core.Support.SlowWatchdog.EndgameReconnectCostMs
+                                    : GeZi.Core.Support.SlowWatchdog.ReconnectCostMs);
                             if (bps < lowestSpeed && worthReconnect &&
                                 Chunk.SpeedReconnectCount < _configuration.MaxSpeedReconnects &&
                                 SpeedReconnectGovernor.TryAcquire())

@@ -1381,19 +1381,8 @@ namespace GeZi
             public string Name;
         }
 
-        /// <summary>本次下载的任务序号（"任务 N" 里的 N）。</summary>
+        /// <summary>任务分组的单调自增序号，**只用于生成唯一 ID**，不再参与显示名。</summary>
         private int _taskGroupSeq;
-
-        /// <summary>
-        /// 🚨 2026-11-01 用户要求：任务序号必须**按网盘各自计数**。
-        /// <para>
-        /// 原来只有一个全局 _taskGroupSeq，于是「夸克→任务1、UC→任务2、夸克→任务3」，
-        /// 用户原话：「任务名应按其在对应网盘中的序号命名，而不是按当前分组序号；
-        /// 每个网盘分别按各自任务序列命名」。
-        /// </para>
-        /// <para>现在每家网盘一个独立计数器：夸克下永远是任务 1/2/3…，UC 也从任务 1 开始。</para>
-        /// </summary>
-        private readonly Dictionary<PanKind, int> _taskSeqByPan = new Dictionary<PanKind, int>();
 
         /// <summary>
         /// 已经用过的任务显示名。第二级分组键用的是**显示名**，
@@ -1433,7 +1422,10 @@ namespace GeZi
                     if (i == 0) top = seg;
                     else if (!string.Equals(top, seg, StringComparison.Ordinal)) { same = false; break; }
                 }
-                if (same && !string.IsNullOrWhiteSpace(top)) name = top.Trim();
+                if (same && !string.IsNullOrWhiteSpace(top))
+                    name = top.Trim();
+                else if (items.Count == 1 && !string.IsNullOrWhiteSpace(items[0]?.Name))
+                    name = items[0].Name.Trim();   // 单文件散选：用文件名兜底
             }
             return NewTaskGroupRef(name, DownloadPanKind);
         }
@@ -1449,15 +1441,14 @@ namespace GeZi
         /// </summary>
         private TaskGroupRef NewTaskGroupRef(string name, PanKind kind)
         {
-            // 序号按**网盘各自计数**（见 _taskSeqByPan 的注释）。
-            int panSeq;
-            _taskSeqByPan.TryGetValue(kind, out panSeq);
-            panSeq++;
-            _taskSeqByPan[kind] = panSeq;
-
             int seq = ++_taskGroupSeq;   // 仅用于生成唯一 ID，不参与显示
+
+            // 名字来源（用户 2026-11-08 拍板「任务 N 误导」）：
+            //   优先用调用方给的目录名/文件名；没给（散文件也取不到顶层目录名）时
+            //   不再叫「任务 N」——那是个「本会话累计下载次数」计数器，不是「当前并发序号」，
+            //   单组下载却显示「任务 3」纯属误导。兜底统一叫「下载任务」。
             if (string.IsNullOrWhiteSpace(name))
-                name = "任务 " + panSeq;
+                name = "下载任务";
 
             if (!_taskGroupNamesUsed.Add(name))
             {
@@ -1491,8 +1482,10 @@ namespace GeZi
                 }
                 if (dir != null && selected.Count == 1 && !string.IsNullOrWhiteSpace(dir.Name))
                     name = dir.Name.Trim();
+                else if (selected.Count == 1 && selected[0] != null && !selected[0].IsDir
+                         && !string.IsNullOrWhiteSpace(selected[0].Name))
+                    name = selected[0].Name.Trim();   // 单文件散选：用文件名兜底
             }
-            // 序号按「这次下载来自哪家网盘」计数（分享看 _panKind、自有看 _activeKind）。
             return NewTaskGroupRef(name, DownloadPanKind);
         }
 

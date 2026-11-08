@@ -2480,6 +2480,7 @@ public class DownloadService : AbstractDownloadService
         //   也无法判断谁掉队）；收尾期允许 1 个样本，改用**绝对下限**判定 ——
         //   只剩一路时没有同伴可比，只能问「它是不是真的慢」。
         bool endgameNow = active.Count <= Options.PreemptEndgameInflight;
+        Options.EndgameNow = endgameNow;   // 2026-11-08：同步给 ChunkDownloader，收尾期放缓慢重连
         if (speeds.Count < 2 && !(endgameNow && speeds.Count == 1))
             return;
 

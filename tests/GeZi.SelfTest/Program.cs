@@ -2679,6 +2679,21 @@ namespace GeZi.SelfTest
                 SlowWatchdog.ShouldReconnect(100 * 1024, 120 * 1024)
                 && !SlowWatchdog.ShouldReconnect(100 * 1024, 50 * 1024),
                 "100KB/s 下 120KB 要 1.2 秒 > 1 秒成本 → 重连；50KB 只要 0.5 秒 → 不重连");
+
+            // ⑪ 2026-11-08：收尾期放缓慢重连（EndgameReconnectCostMs = 5000ms）。
+            //    收尾只剩最后几片时换连接也大概率还是慢，还白丢握手时间，
+            //    所以「值得换」的门槛从 1 秒抬到 5 秒。
+            Check("watch.endgame_reconnect_relaxed",
+                !SlowWatchdog.ShouldReconnect(10 * 1024, 40 * 1024,
+                    SlowWatchdog.EndgameReconnectCostMs),
+                "10KB/s 磨 40KB 要 4 秒 < 5 秒收尾门槛 → 收尾期不再换连接，让它硬下完");
+            Check("watch.endgame_reconnect_still_when_very_slow",
+                SlowWatchdog.ShouldReconnect(1 * 1024, 40 * 1024,
+                    SlowWatchdog.EndgameReconnectCostMs),
+                "1KB/s 磨 40KB 要 40 秒 >> 5 秒 → 即使收尾期也得换");
+            Check("watch.endgame_dead_still_reconnect",
+                SlowWatchdog.ShouldReconnect(0, 40 * 1024, SlowWatchdog.EndgameReconnectCostMs),
+                "收尾期读到 0 字节（彻底挂死）仍必须换，不受门槛抬高影响");
         }
 
         /// <summary>

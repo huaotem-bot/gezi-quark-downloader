@@ -128,6 +128,8 @@ public class DownloadConfiguration : ICloneable, INotifyPropertyChanged
     private int _overallSlowHoldMs = 30_000;
     /// <summary>2026-11-05：整体限速进行中的实时标记（由 DownloadService 监控任务维护）。</summary>
     private volatile bool _overallSlowActive;
+    /// <summary>2026-11-08：收尾期标志（在飞连接数已很少），由 DownloadService 每轮 PreemptRound 维护，供 ChunkDownloader 放缓慢重连。</summary>
+    private volatile bool _endgameNow;
     /// <summary>2026-11-05：慢分片判定的绝对下限，默认 12 KB/s。</summary>
     private long _preemptMinBps = 12L * 1024;
     /// <summary>2026-11-05：收尾期在飞连接数门槛，默认 3。</summary>
@@ -563,6 +565,27 @@ public class DownloadConfiguration : ICloneable, INotifyPropertyChanged
         {
             if (value == _overallSlowActive) return;
             _overallSlowActive = value;
+            OnPropertyChanged();
+        }
+    }
+
+    /// <summary>
+    /// 收尾期标志（2026-11-08 新增）。由 <c>DownloadService.PreemptRound</c> 每轮维护：
+    /// 在飞连接数 ≤ <see cref="PreemptEndgameInflight"/> 即为收尾期。
+    ///
+    /// <para>
+    /// 用途：收尾期只剩最后几片时，每条慢连接都被反复「断开重连」是纯负收益 ——
+    /// 换连接也大概率还是慢（整条 IP 的供给没变），反而每次丢 TCP+TLS 握手 200~600ms
+    /// 且可能丢已下字节。此时放慢重连节奏，让它硬下完。
+    /// </para>
+    /// </summary>
+    public bool EndgameNow
+    {
+        get { return _endgameNow; }
+        set
+        {
+            if (value == _endgameNow) return;
+            _endgameNow = value;
             OnPropertyChanged();
         }
     }

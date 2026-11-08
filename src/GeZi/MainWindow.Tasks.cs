@@ -534,6 +534,18 @@ namespace GeZi
             lbi.IsSelected = true;
         }
 
+        /// <summary>
+        /// 右键菜单弹出前，先确认光标真的落在一个任务行上；点在列表空白处
+        /// 就 <c>e.Handled = true</c> 拦住，菜单不弹（用户反馈「右键空白位置也出现右键选项」）。
+        /// </summary>
+        private void OnTaskListContextMenuOpening(object sender, ContextMenuEventArgs e)
+        {
+            // 菜单弹哪取决于右击点在哪个 ListBoxItem 上；FindListBoxItem 返回 null 即空白处。
+            var lbi = FindListBoxItem(e.OriginalSource as DependencyObject);
+            if (lbi == null)
+                e.Handled = true;
+        }
+
 
         // ⚠️ 双击任务行**不再**打开文件（用户 m13541 要求）：
         //    原来 TaskList 绑了 MouseDoubleClick="OnTaskListDoubleClick"，

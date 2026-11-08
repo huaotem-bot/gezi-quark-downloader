@@ -109,7 +109,7 @@ namespace GeZi
             }
 
             double speed = active.Sum(t => t.Speed);          // 字节/秒
-            TotalSpeedText.Text = speed > 0 ? Util.FormatSize((long)speed) + "/s" : "0 B/s";
+            TotalSpeedText.Text = speed > 0 ? Util.FormatSpeed((long)speed) : "0 B/s";
         }
 
         // 标题栏拖动由 WindowChrome 的 CaptionHeight=38 接管（见 XAML），

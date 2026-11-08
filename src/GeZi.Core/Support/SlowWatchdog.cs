@@ -120,6 +120,14 @@ namespace GeZi.Core.Support
         public const long ReconnectCostMs = 1000;
 
         /// <summary>
+        /// 收尾期的重连成本门槛（毫秒）。2026-11-08 新增：收尾只剩最后几片时，
+        /// 每条慢连接反复「断开重连」是负收益（换连接也大概率还是慢、还白丢握手时间），
+        /// 所以把「值得换连接」的门槛从 1 秒抬高到 5 秒 —— 只有「按当前速度还要下 &gt; 5 秒」
+        /// 才换，几十 KB 的小尾巴就让它硬下完。
+        /// </summary>
+        public const long EndgameReconnectCostMs = 5000;
+
+        /// <summary>
         /// 判慢之后，这条连接**到底值不值得**断开重连。
         ///
         /// <para>

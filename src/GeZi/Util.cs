@@ -59,6 +59,27 @@ namespace GeZi
             return i == 0 ? n + " B" : v.ToString("F2") + " " + units[i];
         }
 
+        /// <summary>
+        /// 速度专用的紧凑格式（字节/秒）。2026-11-08 用户反馈小窗速度数字多时挤：
+        /// <see cref="FormatSize"/> 对 MB 保留两位小数（"5.43 MB/s" 9 字符），
+        /// 在 250px 宽的小窗等宽字体下叠字。这里最多保留 1 位小数，
+        /// ≥100 时取整（"24 MB/s" 7 字符），把速度列压回安全宽度。
+        /// </summary>
+        public static string FormatSpeed(long bytesPerSecond)
+        {
+            if (bytesPerSecond <= 0) return "0 B/s";
+            double v = bytesPerSecond;
+            string[] units = { "B/s", "KB/s", "MB/s", "GB/s" };
+            int i = 0;
+            while (v >= 1024 && i < units.Length - 1)
+            {
+                v /= 1024.0;
+                i++;
+            }
+            if (i == 0) return bytesPerSecond + " B/s";
+            return v.ToString(v >= 100 ? "F0" : "F1") + " " + units[i];
+        }
+
         [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
         private static extern int SHGetKnownFolderPath(ref Guid rfid, uint dwFlags, IntPtr hToken, out string ppszPath);
 
