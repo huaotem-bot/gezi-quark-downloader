@@ -1908,13 +1908,14 @@
                                                     <ColumnDefinition Width="*"/>
                                                 </Grid.ColumnDefinitions>
                                                 <!-- 🚨 2026-11-07 用户要求（原话）：「我是想让文字本身改成
-                                                     线程设置——XXXX 介绍文字，这种和下方控件一样的格式」。
-                                                     ⇒ 标签就叫「线程设置」，说明文字跟「关闭按钮行为」那几行
-                                                     一样**放在控件下方**，不再挤在按钮右边被压成省略号。 -->
-                                                <TextBlock Grid.Column="0" Text="线程设置"
+                                                     单文件并发连接数——XXXX 介绍文字，这种和下方控件一样的格式」。
+                                                     ⇒ 标签就叫「单文件并发连接数」，说明文字跟「关闭按钮行为」那几行
+                                                     一样**放在控件下方**，不再挤在按钮右边被压成省略号。
+                                                     2026-11-08 用户再要求：标签→「单文件并发连接数」，按钮→「网盘线程设置」。 -->
+                                                <TextBlock Grid.Column="0" Text="单文件并发连接数"
                                                            Style="{StaticResource SettingsRowLabel}"/>
                                                 <StackPanel Grid.Column="1">
-                                                    <Button x:Name="PerPanThreadsButton" Content="四家网盘分别设置"
+                                                    <Button x:Name="PerPanThreadsButton" Content="网盘线程设置"
                                                             MinWidth="150" Height="34" Padding="16,0"
                                                             HorizontalAlignment="Left"
                                                             Style="{StaticResource SecondaryButton}"
@@ -1924,7 +1925,7 @@
                                                                Margin="0,7,0,0" MaxWidth="360"
                                                                HorizontalAlignment="Left"
                                                                TextWrapping="Wrap"
-                                                               Text="四家网盘分别设置连接数。默认已按各家服务端上限取好，调高不会超过上限；改完只对新任务生效。"/>
+                                                               Text="分别设置夸克 / UC / 阿里云盘 / 迅雷四家的单文件并发连接数。默认已按各家服务端上限取好，调高不会超过上限；改完只对新任务生效。"/>
                                                 </StackPanel>
                                             </Grid>
 
