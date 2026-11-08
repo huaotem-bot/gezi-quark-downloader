@@ -1981,6 +1981,8 @@
                                                     <ComboBoxItem Content="128 — 默认，推荐"/>
                                                     <ComboBoxItem Content="192 — 较快"/>
                                                     <ComboBoxItem Content="256 — 最快，寻道压力大"/>
+                                                    <ComboBoxItem Content="512 — 极高并发"/>
+                                                    <ComboBoxItem Content="1024 — 极限"/>
                                                 </ComboBox>
                                             </Grid>
 

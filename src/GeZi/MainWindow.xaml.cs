@@ -1679,11 +1679,13 @@ namespace GeZi
         /// 「机械盘连接上限」的可选档位。顺序必须与 XAML 里 HddThreadsBox 的
         /// ComboBoxItem 顺序严格一致（与 ThreadPresets 同理）。
         /// <para>
-        /// 上限只到 256：机械盘超过这个数寻道就压不住了，再高没有意义。
+        /// 2026-11-08 用户要求：机械盘档位向上扩到 512、1024（原来封顶 256）。
+        /// 上限放宽后不再默认「寻道压不住就砍并发」，而是交给共写侧的大批量
+        /// 写合并（HddBatchMaxCount/HddBatchMaxBytes）+ 按盘聚合逻辑去照顾。
         /// 下限 32 保留给「特别在意硬盘寿命 / 笔记本机械盘」的用户。
         /// </para>
         /// </summary>
-        private static readonly int[] HddThreadPresets = { 32, 64, 96, 128, 192, 256 };
+        private static readonly int[] HddThreadPresets = { 32, 64, 96, 128, 192, 256, 512, 1024 };
 
 
         /// <summary>并发上限的单一事实来源，取自核心层常量。</summary>
