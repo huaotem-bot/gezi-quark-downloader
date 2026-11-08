@@ -1767,7 +1767,7 @@ namespace GeZi
                           || reason.IndexOf("拒绝", StringComparison.Ordinal) >= 0;
             string tip = denied
                 ? "这是 Windows 的权限限制：程序运行在受管目录里，被当作低权限进程。\n"
-                  + "把 GeZi.exe 复制到普通目录（例如 D:\\GeZi）再运行就能正常定位。"
+                  + "把 GeZi-download.exe 复制到普通目录（例如 D:\\GeZi）再运行就能正常定位。"
                 : "系统拒绝了资源管理器调用，请手动打开文件所在目录。";
 
             AppDialog.Show(this,

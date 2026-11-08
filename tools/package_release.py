@@ -32,8 +32,8 @@ import zipfile
 # 新增原生依赖时，这里必须同步（libssl/libcrypto 是 TLS 桥接用的，见 GeZi.Core.csproj）。
 # ---------------------------------------------------------------------------
 REQUIRED_BINARIES = [
-    "GeZi.exe",
-    "GeZi.exe.config",
+    "GeZi-download.exe",
+    "GeZi-download.exe.config",
     # 🚨 五层架构（2026-10-24 重构）之后的**全部托管程序集**。
     # 原来这里只列了 GeZi.Core.dll —— 而 GeZi.exe 现在依赖另外三个：
     #   GeZi.Application / GeZi.DownloadEngine / GeZi.Providers

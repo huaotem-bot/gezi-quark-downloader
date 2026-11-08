@@ -7,7 +7,7 @@
     <UseWindowsForms>true</UseWindowsForms>
     <LangVersion>latest</LangVersion>
     <Nullable>disable</Nullable>
-    <AssemblyName>GeZi</AssemblyName>
+    <AssemblyName>GeZi-download</AssemblyName>
     <RootNamespace>GeZi</RootNamespace>
     <!--
       ⚠️ 必须显式指定 x64（2026-10 修复）。
