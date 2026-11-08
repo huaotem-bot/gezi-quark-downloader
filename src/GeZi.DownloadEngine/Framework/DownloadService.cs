@@ -2436,15 +2436,21 @@ public class DownloadService : AbstractDownloadService
         if (active.Count == 0)
             return;
 
-        // 🚨🚨 2026-11-08 第二次修正：**收尾期主动降并发放在最前面**（取代已关闭的连接数爬山）。
+        // 🚨🚨 2026-11-08 第三次修正：**关闭「收尾期主动降并发」**（用户实测它才是尾部速度骤降的真凶）。
         //
-        // 为什么必须在最前面：下面有若干个早退（样本不足 2、中位数算不出等），
-        // 而「可领片数不够」这件事与速度无关 —— 放到中段就会在收尾期被早退跳过，
-        // 恰恰是它最该干活的时刻。用户实测日志（GeZi.log）证明：
-        //   全日志只有 2 条「连接数爬坡」，两次都直接等于用户设的上限，
-        //   收尾期因 inFlight < 64 完全跳过 ⇒ 爬山零收益。
-        // 现在改成纯「片数够不够分」的算术，每轮（2 秒）必算，与速度样本无关。
-        UpdateEndgameCap(queue, active);
+        // 日志铁证（GeZi.log 15:51~15:52）：
+        //   15:51:51 收尾期降并发：可领片数 157 → 压到 165   （89.7%，6.28 MB/s）
+        //   15:51:59 收尾期降并发：可领片数 70 → 压到 78     （97.2%，712 KB/s）
+        //   15:52:31 100.0%，98.53 KB/s                      （还在下）
+        //   15:52:45 任务已全部结束（没有「全部完成」）
+        // 服务端按 IP 限速、总带宽固定 ≈ 8 MB/s，而「可领片数 → 降并发」把 1024 路硬压到 78 路，
+        // 总速度 = 路数 × 单连接速度，路数越少总速度越低 —— 尾部从 6 MB/s 掉到 98 KB/s 主要不是
+        // 服务端变慢，而是这里主动砍了并发。
+        //
+        // 关闭后 worker 全开，末段补片（TryRefillTail）继续把剩余大片切碎，空闲 worker 的
+        // 指数退避（idleRounds，第 154 轮已加）继续防空转烧 CPU，两者互补，不需要再降并发。
+        // 回退方式：把下面这行取消注释即可恢复。
+        // UpdateEndgameCap(queue, active);
 
         int now = Environment.TickCount;
 
@@ -2480,7 +2486,13 @@ public class DownloadService : AbstractDownloadService
         //   也无法判断谁掉队）；收尾期允许 1 个样本，改用**绝对下限**判定 ——
         //   只剩一路时没有同伴可比，只能问「它是不是真的慢」。
         bool endgameNow = active.Count <= Options.PreemptEndgameInflight;
-        Options.EndgameNow = endgameNow;   // 2026-11-08：同步给 ChunkDownloader，收尾期放缓慢重连
+        // 🚨🚨 2026-11-08 第三次修正：关闭「收尾放缓慢重连」。
+        // 原来这行把 EndgameNow 同步给 ChunkDownloader，让收尾期重连成本从 1000ms 放大到 5000ms，
+        // 想「让慢连接硬下完别反复重连」。但实测尾部正是靠「快速换连接 + 多路并行」才冲得动，
+        // 放慢重连反而把最后几片钉死在几条慢连接上（日志 15:52 98.53 KB/s 磨 40 秒）。
+        // 关闭后重连成本统一回到 ReconnectCostMs=1000ms，由 ShouldReconnect 按剩余字节自行判断。
+        // （endgameNow 局部变量仍用于下面「收尾期允许 1 个样本抢占」的早退，那个是对的，保留。）
+        // Options.EndgameNow = endgameNow;
         if (speeds.Count < 2 && !(endgameNow && speeds.Count == 1))
             return;
 
