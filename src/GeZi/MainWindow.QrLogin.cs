@@ -334,9 +334,10 @@ namespace GeZi
                     Content = it.Item1,
                     HorizontalContentAlignment = HorizontalAlignment.Left,
                     HorizontalAlignment = HorizontalAlignment.Stretch,
+                    // 2026-11-08 用户反馈：鼠标悬停时默认 Button 的蓝色高亮「选中框太丑」。
+                    //   改用全局 GhostButton 样式（透明底 + 悬停浅灰圆角块），与其它行内按钮一致。
+                    Style = (Style)TryFindResource("GhostButton"),
                     Padding = new Thickness(14, 8, 14, 8),
-                    BorderThickness = new Thickness(0),
-                    Background = System.Windows.Media.Brushes.Transparent,
                     FontSize = 12.5,
                     Cursor = System.Windows.Input.Cursors.Hand,
                 };
@@ -471,13 +472,13 @@ namespace GeZi
             {
                 // 夸克：用户提供的分享链接（内含注册引导）
                 case PanKind.Quark:
-                    return "https://pan.quark.cn/s/2923c9dd7b2b";
+                    return "https://pan.quark.cn/s/234325c983b4";
                 // UC：public=1 表示公开分享页
                 case PanKind.Uc:
-                    return "https://drive.uc.cn/s/55e79ea88d684?public=1";
-                // 迅雷：带提取码 pwd=d8mb
+                    return "https://drive.uc.cn/s/0ba8ff14f51a4?public=1";
+                // 迅雷：带提取码 pwd=h279
                 case PanKind.Xunlei:
-                    return "https://pan.xunlei.com/s/VP5bB0PHw8CYbGCoIg12v22fA1?pwd=d8mb";
+                    return "https://pan.xunlei.com/s/VP5uYi2KNhi70haf2_c09hZFA1?pwd=h279#";
                 // 阿里：用户未提供，保持官网首页（注册入口在那里）
                 case PanKind.Aliyun:
                     return "https://www.alipan.com/";
