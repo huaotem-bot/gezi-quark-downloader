@@ -375,6 +375,12 @@ namespace GeZi
                 RefreshUcRuntimeStatus();
                 // 四张网盘卡的状态（已登录 / 凭证已保存 / 未登录）
                 RefreshPanCards();
+                // 🚨 2026-11-08 修「未登录冷启动时『当前状态』卡下面四行不显示」：
+                //    RefreshPanStateList 原来只在登录动作(SyncLoginPageState)/验证结束/
+                //    主题切换/阿里续期这几条路径被调，未登录冷启动时没有任何一条会触发它，
+                //    导致 PanStateList 一直是空 —— 四行网盘状态(未登录+切换)根本不渲染。
+                //    这里在启动回填设置时补一次，保证任何时候「当前状态」卡都画满四行。
+                RefreshPanStateList();
             }
             finally
             {
