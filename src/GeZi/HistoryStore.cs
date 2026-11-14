@@ -20,21 +20,10 @@ using System.Text;
 
 namespace GeZi
 {
-    /// <summary>一条下载历史记录。字段与 Python 版 records 对齐。</summary>
-    [DataContract]
-    public class HistoryRecord
-    {
-        [DataMember(Order = 1)] public string Name { get; set; }
-        [DataMember(Order = 2)] public string Size { get; set; }     // 显示用文本（"1.23 GB"），与 Python 一致
-        [DataMember(Order = 3)] public string Path { get; set; }     // 本地完整路径，供"打开/定位"
-        [DataMember(Order = 4)] public string Status { get; set; }   // 完成 / 失败 / 已取消 ...
-        [DataMember(Order = 5)] public string Time { get; set; }     // "yyyy-MM-dd HH:mm:ss"
-    }
-
     /// <summary>
     /// 一条「解析过的分享」记录（按 <c>h</c> 唤出的历史面板用）。
-    /// 那条是**下载**历史（记的是本地文件路径与大小），
-    /// 这条记的是**分享**（pwd_id / 提取码），两者字段没有交集，混在一起两边都要判空。
+    /// 记的是**分享**（pwd_id / 提取码），不是本地下载记录 ——
+    /// 下载历史已随「下载历史」弹窗一起删除（2026-10-31，失败/已完成筛选页即历史）。
     /// </summary>
     [DataContract]
     public class ShareHistoryEntry
@@ -56,7 +45,7 @@ namespace GeZi
         /// <summary>上面那个名字是不是文件夹 —— 决定面板里用文件夹图标还是文件图标。</summary>
         [DataMember(Order = 5)] public bool IsFolder { get; set; }
 
-        /// <summary>解析时刻。"yyyy-MM-dd HH:mm:ss"，与下载历史同一个格式。</summary>
+        /// <summary>解析时刻。"yyyy-MM-dd HH:mm:ss"。</summary>
         [DataMember(Order = 6)] public string Time { get; set; }
 
         /// <summary>
@@ -68,10 +57,9 @@ namespace GeZi
     }
 
     /// <summary>
-    /// 下载历史 + 未完成任务记录 + 解析历史的持久化。
-    /// 移植自 Python Flet 版的 `records`（历史，上限 200）与 `flet_pending`（未完成任务）。
-    /// 两者原先都存在 core 的 state 里（同一个 state.json），这里合并成一个文件，
-    /// 放在与配置同目录（`SettingsStore.FilePath` 的同级 `GeZi.state.json`），
+    /// 未完成任务记录 + 解析历史的持久化。
+    /// 移植自 Python Flet 版的 `flet_pending`（未完成任务），
+    /// 存在与配置同目录（`SettingsStore.FilePath` 的同级 `GeZi.state.json`），
     /// 保证便携（跟 exe 走）与可写回退（%LOCALAPPDATA%）行为一致。
     /// JSON 用 `DataContractJsonSerializer`（.NET Framework 自带，零 NuGet）。
     /// ⚠️ 不能用 `JavaScriptSerializer`：它所在的 System.Web.Extensions 依赖 System.Web，
@@ -79,10 +67,8 @@ namespace GeZi
     /// </summary>
     internal static class HistoryStore
     {
-        private const int MaxRecords = 200;   // 与 Python Flet 版一致
-
         /// <summary>
-        /// 解析历史的上限。比下载历史小得多：它是"最近打开过什么"，翻久了没意义，
+        /// 解析历史的上限。它是"最近打开过什么"，翻久了没意义，
         /// 而且每条都要在面板里画出来。
         /// </summary>
         private const int MaxShareHistory = 50;
@@ -90,10 +76,11 @@ namespace GeZi
         [DataContract]
         private sealed class State
         {
-            [DataMember(Order = 1)] public List<HistoryRecord> Records { get; set; }
             [DataMember(Order = 2)] public List<PendingTask> Pending { get; set; }
             /// <summary>解析历史。⚠️ 老 state.json 里没有这个字段 → 反序列化为 null，Load 里补空表。</summary>
             [DataMember(Order = 3)] public List<ShareHistoryEntry> Shares { get; set; }
+            // 下载历史 Records（原 Order=1）已删：老 state.json 里残留的该字段
+            // 反序列化时被忽略，下次 Save 起自然消失。
         }
 
         private static string StatePath
@@ -124,7 +111,6 @@ namespace GeZi
                         var s = ser.ReadObject(fs) as State;
                         if (s != null)
                         {
-                            if (s.Records == null) s.Records = new List<HistoryRecord>();
                             if (s.Pending == null) s.Pending = new List<PendingTask>();
                             if (s.Shares == null) s.Shares = new List<ShareHistoryEntry>();
                             return s;
@@ -135,7 +121,6 @@ namespace GeZi
             catch { }
             return new State
             {
-                Records = new List<HistoryRecord>(),
                 Pending = new List<PendingTask>(),
                 Shares = new List<ShareHistoryEntry>(),
             };
@@ -157,40 +142,6 @@ namespace GeZi
                 File.Move(tmp, path);
             }
             catch { }
-        }
-
-        // ---------------- 历史记录 ----------------
-
-        public static List<HistoryRecord> GetHistory()
-        {
-            var s = Load();
-            var list = new List<HistoryRecord>(s.Records);
-            list.Reverse();   // 新的在前
-            return list;
-        }
-
-        /// <summary>追加一条历史。超出上限时丢最旧的。</summary>
-        public static void AddHistory(string name, string size, string path, string status)
-        {
-            var s = Load();
-            s.Records.Add(new HistoryRecord
-            {
-                Name = name,
-                Size = size,
-                Path = path,
-                Status = status,
-                Time = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"),
-            });
-            if (s.Records.Count > MaxRecords)
-                s.Records.RemoveRange(0, s.Records.Count - MaxRecords);
-            Save(s);
-        }
-
-        public static void ClearHistory()
-        {
-            var s = Load();
-            s.Records.Clear();
-            Save(s);
         }
 
         // ---------------- 解析历史（按 h 唤出的面板用） ----------------

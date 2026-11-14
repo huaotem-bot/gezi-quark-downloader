@@ -23,7 +23,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
-using System.Windows.Controls.Primitives;   // ToggleButton（续传列表的真复选框）
+using System.Windows.Controls.Primitives;   // Popup / PlacementMode
 using System.Windows.Data;                  // Binding（同上）
 using System.Windows.Input;
 using System.Windows.Media;
@@ -60,11 +60,12 @@ namespace GeZi
 
         // ─────────────────────────────────────────────────────────────
         // 任务分类过滤（参考 Motrix 的任务列表分类）
-        // 4 个分类**共用同一个 _tasks 集合**，只切换 ICollectionView 的过滤器 ——
-        // 这样任务状态变化时不需要重建列表，也不会出现"4 份列表副本状态不同步"。
-        // 分类：全部 / 进行中（Queued+Downloading+Paused）/ 失败（Failed+Cancelled）/ 已完成
+        // 3 个分类**共用同一个 _tasks 集合**，只切换 ICollectionView 的过滤器 ——
+        // 这样任务状态变化时不需要重建列表，也不会出现"3 份列表副本状态不同步"。
+        // 分类：正在下载（Queued+Downloading+Paused）/ 失败（Failed+Cancelled）/ 已完成
+        // 2026-10-31：按用户要求砍掉「全部」——默认停在「正在下载」。
         // ─────────────────────────────────────────────────────────────
-        private string _taskFilter = "all";
+        private string _taskFilter = "active";
         private System.ComponentModel.ICollectionView _taskView;
         private readonly List<string> _pathList = new List<string>();
         private readonly Stack<string> _fidStack = new Stack<string>();
@@ -358,7 +359,7 @@ namespace GeZi
                 Log("下载目录不可写（可能是 Windows「受控文件夹访问」拦截），已改用: " + resolved);
             }
 
-            _scheduler = new DownloadScheduler(_settings.ConcurrentTasks);
+            _scheduler = new DownloadScheduler(_settings.ConcurrentTasks, _settings.Threads);
             _scheduler.Log = LogFromWorker;
             _scheduler.Diagnostics = OnDiagnostics;
             LoadSettingsToUi();
@@ -387,9 +388,8 @@ namespace GeZi
                 // 但顺序上仍让清扫先跑，避免把刚被判定为待续的分片误伤（mtime 很新，实际不会）。
                 StartPartsSweep();
 
-                // 把续传询问推迟到 UI 完全渲染之后（Idle 优先级）再弹：
-                // 若直接在 Loaded 里 ShowDialog()，主窗还没画出来就先弹模态框，
-                // 用户会误以为"程序没打开"（尤其弹框被主窗或别的窗口挡住时）。
+                // 把「未完成任务摆进任务列表」推迟到 UI 完全渲染之后（Idle 优先级）：
+                // 摆完会切到任务页，主窗没画好就切会闪（原先弹模态框时有同类问题）。
                 Dispatcher.BeginInvoke(new Action(() =>
                 {
                     try { ShowPendingOnStartup(); } catch { }
@@ -1337,7 +1337,7 @@ namespace GeZi
                 _startFid = string.IsNullOrEmpty(info.StartFid) ? "0" : info.StartFid;
                 await LoadDirAsync(_curFid);
                 Log("解析成功。双击文件夹进入子目录；选中文件后点「下载选中」即可下载"
-                    + "（多选用 Shift / Ctrl+点击，或右键该行）。");
+                    + "（按住 Ctrl 点击可多选，或右键该行）。");
                 // 记入解析历史（原文案是「单击进入」，我们保留双击版）
                 RecordShareHistory(info.PwdId, passcode, info.StartFid);
                 NotifyIfHidden("已解析剪贴板里的分享链接",
@@ -1503,21 +1503,73 @@ namespace GeZi
             }
         }
 
+        // 设置页 ⚠ 注意事项浮层关闭时刻：用于防抖（见 ShowTipPopup 注释）。
+        // ⚠ 哨兵必须用 long.MinValue/2：若用 int.MinValue，TickCount - int.MinValue
+        //   在 int 域恒溢出为负 → 每次点击都被防抖拦下（实测过这个坑：点了没反应）。
+        private long _tipClosedTick = long.MinValue / 2;
+
         /// <summary>
-        /// 「单文件并发连接数」旁的 ⚠ 按钮：二级窗口解释 HDD 寻道问题。
-        /// 高并发 = 大量分片随机写同一文件 —— SSD 无感；机械盘磁头来回寻道，
-        /// 并发越高有效速度越低，长时间满负载还加速损耗。
+        /// 「下载与网络」卡片标题旁的 ⚠ 按钮：在按钮正下方展开「注意事项」浮层
+        /// （Popup，点击浮层外任意处自动关闭，不弹独立窗口）。
+        /// SSD 随机写无感；机械盘磁头来回寻道，并发越高有效速度越低。
         /// </summary>
         private void OnThreadsHddTip(object sender, RoutedEventArgs e)
+            => ShowTipPopup((Button)sender,
+                "· 固态硬盘（SSD）：随便造\n"
+             + "· 机械硬盘（HDD）：过高的连接数可能会因寻道问题从而使下载速度不升反降");
+
+        /// <summary>
+        /// 「播放器」卡片标题旁的 ⚠ 按钮（与 <see cref="OnThreadsHddTip"/> 同款浮层）：
+        /// 边下边播的两个前置条件 —— 独立分片写入 + 装了 VLC。
+        /// </summary>
+        private void OnPlayerTip(object sender, RoutedEventArgs e)
+            => ShowTipPopup((Button)sender, "需要使用独立分片写入，以及安装VLC播放器才能使用该功能");
+
+        /// <summary>
+        /// 「分片与缓存」卡片标题旁的 ⚠ 按钮（与 <see cref="OnThreadsHddTip"/> 同款浮层）。
+        /// 文案照用户原话（见 docs/设置-分片缓存注意事项浮层-交接.md）。
+        /// </summary>
+        private void OnWriteModeHddTip(object sender, RoutedEventArgs e)
+            => ShowTipPopup((Button)sender, "强烈建议机械硬盘（HDD）使用单一文件");
+
+        // 两个 ⚠ 共用同一个浮层构建与防抖哨兵：StaysOpen=false 下点任一 ⚠ 都会先
+        // 触发"点外部关闭"再进 Click，250ms 内忽略即可实现 toggle。
+        private void ShowTipPopup(Button btn, string text)
         {
-            AppDialog.Show(this,
-                "「单文件并发连接数」越高，文件被切得越碎、写入越随机：\n\n"
-                + "· 固态硬盘（SSD）：随机写入很快，高并发没有问题，可放心用默认的 256。\n"
-                + "· 机械硬盘（HDD）：磁头要在盘片上不停来回寻道，并发越高寻道越频繁，"
-                + "速度可能不升反降，长时间满负载还会加速硬盘损耗。\n\n"
-                + "下载目录在机械硬盘上时，建议把并发调低到 16～64，「同时下载任务数」也控制在 1～2；"
-                + "SSD 用户无需调整。",
-                "机械硬盘（HDD）提示");
+            // StaysOpen=false 时点本按钮会先走"点外部关闭"再进本 Click，
+            // 用关闭时刻做 250ms 防抖，浮层开着时再点 ⚠ = 关闭（toggle）。
+            if (Environment.TickCount - _tipClosedTick < 250) return;
+
+            var body = new TextBlock
+            {
+                Text = text,
+                FontFamily = btn.FontFamily,
+                FontSize = 13,
+                LineHeight = 21,
+                TextWrapping = TextWrapping.Wrap,
+                Foreground = TryFindResource("TextPrimaryBrush") as Brush,
+            };
+            var card = new Border
+            {
+                Child = body,
+                Width = 330,
+                Padding = new Thickness(16),
+                CornerRadius = new CornerRadius(12),
+                Background = TryFindResource("SurfaceBrush") as Brush,
+                BorderBrush = TryFindResource("BorderBrushSoft") as Brush,
+                BorderThickness = new Thickness(1),
+            };
+            var popup = new Popup
+            {
+                PlacementTarget = btn,
+                Placement = PlacementMode.Bottom,
+                VerticalOffset = 6,
+                StaysOpen = false,
+                AllowsTransparency = true,
+                Child = card,
+            };
+            popup.Closed += (_, _) => _tipClosedTick = Environment.TickCount;
+            popup.IsOpen = true;
         }
 
         /// <summary>收到「剪贴板内容变了」的系统通知。</summary>
@@ -1665,8 +1717,8 @@ namespace GeZi
                 if (ShareModeRadio.IsChecked != true)
                     ShareModeRadio.IsChecked = true;
 
-                // ② 结果只出现在「下载」页的分享面板里（NavList 顺序：0=下载 1=任务
-                //    2=设置 3=登录），所以把页面也指过去，否则用户在设置页复制的链接，
+                // ② 结果只出现在「网盘」页的分享面板里（NavList 顺序：0=网盘 1=下载
+                //    2=设置；登录页索引 3 已不在侧栏），所以把页面也指过去，否则用户在设置页复制的链接，
                 //    程序在背后解析完他什么也看不见。
                 //    ⚠️ 只切页签，不 Show / 不 Activate —— 窗口藏在托盘时静默解析，不抢焦点。
                 Tabs.SelectedIndex = 0;
@@ -1959,8 +2011,7 @@ namespace GeZi
 
         /// <summary>
         /// 文件区工具栏上那个「解析历史」按钮（h 键之外看得见的入口）。
-        /// ⚠️ 别和任务页的「下载历史」（<c>HistoryBtn</c> / OnOpenHistory）搞混 ——
-        /// 那个是**本地下载记录**，这个是**解析过的分享**。
+        /// 记的是**解析过的分享**（pwd_id / 提取码），不是本地下载记录。
         /// </summary>
         private void OnShareHistoryButtonClick(object sender, RoutedEventArgs e)
         {
@@ -2036,55 +2087,6 @@ namespace GeZi
             if (item == null || !item.IsDir)
                 return;
             EnterFolder(item);
-        }
-
-        /// <summary>
-        /// 文件列表的左键点击策略（在 PreviewMouseLeftButtonDown / 隧道阶段统一裁决）：
-        ///   · **Shift+点击 = 离散多选**（只切换点中的这一项），**不做连选**；
-        ///   · **Ctrl+点击 = 只选中这一个**；
-        ///   · 单击 = WPF 默认行为（选中）；**进目录请双击**（见 <see cref="OnFileListDoubleClick"/>）。
-        /// WPF 的 `SelectionMode="Extended"` 里：
-        ///   · Ctrl+点击  = 切换单项（离散多选）
-        ///   · **Shift+点击 = 连选**：把"锚点项"到当前项**整段**都选上
-        /// 用户要的是「可以使用 shift 多选，但**不是连选**」——
-        /// 也就是 Shift 只作用于**点中的那一个**，不拉区间。
-        /// 所以在隧道阶段把它拦下来自己处理，并 `e.Handled = true` 阻止 WPF 的连选。
-        /// ⚠️ 不拦的话会怎样：选中第 1 个、Shift+点第 5 个 → 1~5 全被选上（连选）。
-        /// </summary>
-        private void OnListPreviewMouseDown(object sender, MouseButtonEventArgs e)
-        {
-            var mods = Keyboard.Modifiers;
-            var item = FindListBoxItem(e.OriginalSource as DependencyObject);
-            if (item == null)
-                return;   // 点在空白处：交给默认处理（清空选择）
-
-            // ① Shift+点击 = 离散多选（只切换点中的这一项）
-            if ((mods & ModifierKeys.Shift) != 0)
-            {
-                e.Handled = true;                    // 关键：阻止 WPF 的"连选"
-                item.IsSelected = !item.IsSelected;
-                try { item.Focus(); } catch { }
-                return;
-            }
-
-            // ② Ctrl+点击 = **按用户要求关掉**（原来它是"切换单项"）。
-            //    现在让它表现为"只选中这一个"，且**不进目录** ——
-            //    这是单击变"进入"之后，选中文件夹的主要入口之一。
-            if ((mods & ModifierKeys.Control) != 0)
-            {
-                e.Handled = true;
-                var lb = sender as ListBox;
-                if (lb != null) lb.SelectedItems.Clear();
-                item.IsSelected = true;
-                try { item.Focus(); } catch { }
-                return;
-            }
-
-            // ③ 不按修饰键、点是文件 = WPF 默认行为（选中）。
-            // 🚨 原版（第三方分支 v2.4）这里是「单击文件夹 = 直接进入」，
-            //    我们**不要**这个行为 —— 用户明确要求保留「双击进入」，单击只做选中。
-            //    所以这里直接落到 ④，不做任何拦截。
-            // ④ 单击 / 其它情况：完全走 WPF 默认行为（选中）
         }
 
         /// <summary>从鼠标命中的可视元素往上找 ListBoxItem。</summary>
@@ -3260,32 +3262,28 @@ namespace GeZi
             }
         }
 
-        // ---------------- 连接数按文件大小比例分配 ----------------
-        // Python Flet 版有「智能调度」：实际线程数 = min(下载线程数, 总连接预算 / 本批任务数)
-        // —— 也就是**多个文件平分**总预算。C# 版当初删掉「全局连接预算」设置项时，
-        // 连"多文件共享总预算"这件事一起没了，变成每个任务都开满自己的线程数
-        // （用户把单文件并发拉到 512、同时跑 3 个 = 1536 条连接，而夸克是按账号限总连接数的）。
-        // 「不要平均分配了，改成比例分配，按文件大小，文件越大分配越多，
-        // 文件越小分配越少，但有最低下限，不然别让小文件根本下不了了」。
+        // ---------------- 连接数上限：限制内按文件大小自动分配 ----------------
+        // 「连接数上限」（2026-10-31 起的语义）= 用户选的**同时在线总连接数**：
+        // 单个文件可以吃满整个上限；多个文件时在限制内按大小比例自动分配
+        // —— 大文件多分、小文件少分，每文件保底 MinThreadsPerFile 路
+        // （「不然别让小文件根本下不了了」）。
         // 具体算法在 GeZi.Core.Download.ThreadAllocator（纯函数，可单独测试）。
-
-        /// <summary>总连接预算。见 <see cref="GeZi.Core.Download.ThreadAllocator.DefaultBudget"/>。</summary>
-        private const int DownloadConnBudget = GeZi.Core.Download.ThreadAllocator.DefaultBudget;
 
         /// <summary>单个文件的最低连接数。见 <see cref="GeZi.Core.Download.ThreadAllocator.MinPerFile"/>。</summary>
         private const int MinThreadsPerFile = GeZi.Core.Download.ThreadAllocator.MinPerFile;
 
         /// <summary>
-        /// 按**文件大小比例**把总连接预算分给这一批任务，返回与入参等长的线程数数组。
+        /// 把「连接数上限」按**文件大小比例**分给这一批任务，返回与入参等长的线程数数组。
         /// </summary>
         private int[] AllocateThreads(IList<long> sizes)
         {
+            int cap = Math.Min(_settings.Threads, GeZi.Core.Download.SegmentedDownloader.MaxRealConcurrency);
             return GeZi.Core.Download.ThreadAllocator.Allocate(
                 sizes,
-                Math.Min(_settings.Threads, GeZi.Core.Download.SegmentedDownloader.MaxRealConcurrency),
-                DownloadConnBudget,
+                cap,   // 单文件上限：选中的总上限本身就是天花板（单文件可吃满）
+                cap,   // 总预算 = 同一个值 —— 即"限制内自动分配"
                 MinThreadsPerFile,
-                // 同时最多跑几个 —— 预算约束的是"同时并发"的量级，不是整批的账面总和
+                // 同时最多跑几个 —— 上限约束的是"同时在线"的量级，不是整批的账面总和
                 Math.Max(1, _settings.ConcurrentTasks));
         }
 
@@ -3310,8 +3308,8 @@ namespace GeZi
             }
             if (threads.Length > 12) sb.Append("…");
             LogDetail(string.Format(
-                "已按文件大小分配连接数（总预算 {0}）：{1} —— 大文件多分、小文件少分，每文件不低于 {2} 路。",
-                DownloadConnBudget, sb, MinThreadsPerFile));
+                "已按文件大小分配连接数（总上限 {0}）：{1} —— 大文件多分、小文件少分，每文件不低于 {2} 路。",
+                _settings.Threads, sb, MinThreadsPerFile));
         }
 
         /// <summary>
@@ -4141,17 +4139,6 @@ namespace GeZi
                 item.Phase = u.State == JobState.Downloading ? u.Progress.Phase : null;
             }
 
-            // ---- 历史记录：终态各记一条（只记一次）----
-            if (!item.HistoryRecorded
-                && (u.State == JobState.Completed || u.State == JobState.Failed || u.State == JobState.Cancelled))
-            {
-                item.HistoryRecorded = true;
-                string status = u.State == JobState.Completed ? "完成"
-                    : u.State == JobState.Failed ? "失败" : "已取消";
-                long sizeBytes = item.Total > 0 ? item.Total : item.Done;
-                HistoryStore.AddHistory(item.Name, Util.FormatSize(sizeBytes), item.Job.Dest, status);
-            }
-
             // ---- 未完成任务记录：仅在状态集合发生变化时同步（避免每帧进度都写盘）----
             SyncPending();
 
@@ -4183,7 +4170,8 @@ namespace GeZi
                     if (t.Job.SkipPersist)
                         continue;
                     if (t.State == JobState.Queued || t.State == JobState.Downloading
-                        || t.State == JobState.Paused || t.State == JobState.Failed)
+                        || t.State == JobState.Paused || t.State == JobState.Failed
+                        || t.State == JobState.AwaitingResume)
                     {
                         sb.Append(t.Name).Append('|').Append(t.State).Append(';');
                         var pi = t.Job.Pending;
@@ -4255,6 +4243,11 @@ namespace GeZi
                         t.Job.ResumeJob();
                         t.State = JobState.Downloading;
                     }
+                    // 待续传行一并恢复：点「恢复全部」= 旧启动弹窗的「全选可续传 + 继续下载」。
+                    else if (t.State == JobState.AwaitingResume)
+                    {
+                        ResumeTask(t);
+                    }
                 }
             }
             UpdatePauseAllButton(force: true);
@@ -4273,7 +4266,8 @@ namespace GeZi
             if (PauseAllBtn == null) return;
 
             bool anyRunning = _tasks.Any(t => t.State == JobState.Downloading || t.State == JobState.Queued);
-            bool anyPaused = _tasks.Any(t => t.State == JobState.Paused);
+            // 待续传也算「可恢复」：按钮亮起、点击走「恢复全部」。
+            bool anyPaused = _tasks.Any(t => t.State == JobState.Paused || t.State == JobState.AwaitingResume);
             string sig = anyRunning ? "run" : (anyPaused ? "pause" : "idle");
             if (!force && sig == _pauseAllSig) return;
             _pauseAllSig = sig;
@@ -4287,7 +4281,7 @@ namespace GeZi
             else if (anyPaused)
             {
                 PauseAllBtn.Content = BuildToolIconText("IconPlay", "恢复全部", 1.6);
-                PauseAllBtn.ToolTip = "恢复所有已暂停的任务";
+                PauseAllBtn.ToolTip = "恢复所有已暂停 / 待续传的任务";
             }
             else
             {
@@ -4358,21 +4352,6 @@ namespace GeZi
             return sp;
         }
 
-        private void OnClearDone(object sender, RoutedEventArgs e)
-        {
-            for (int i = _tasks.Count - 1; i >= 0; i--)
-            {
-                var s = _tasks[i].State;
-                // 含 Cancelling：用户点了取消就说明不想要它了，
-                // 不该逼他等下载器慢慢退出之后才能清掉。
-                if (s == JobState.Completed || s == JobState.Failed
-                    || s == JobState.Cancelled || s == JobState.Cancelling)
-                    _tasks.RemoveAt(i);
-            }
-            SyncPending();
-            UpdatePauseAllButton(force: true);
-        }
-
         // ---------------- 任务列表右键菜单（单任务操作） ----------------
         // 移植自 Python Flet 版的 _pause_single / _resume_single / _cancel_single /
         // _task_del_local / _file_menu_popup（右键菜单）。
@@ -4389,7 +4368,7 @@ namespace GeZi
             if (lbi == null) return;
 
             // ⚠️ 原来无条件 `TaskList.SelectedItem = ...` ——
-            //    这句会**把整个选择替换成这一个**，于是"Shift 离散多选之后再右键"
+            //    这句会**把整个选择替换成这一个**，于是"Ctrl 离散多选之后再右键"
             //    多选立刻被清掉，菜单里的暂停/删除只作用到一个文件
             //    （用户反馈：「根本无法完成多选的情况下右键使用功能」）。
             //    现在：点到**已选中**的行 → 保持整份多选不动；点到**没选中**的行 →
@@ -4409,7 +4388,7 @@ namespace GeZi
 
         /// <summary>
         /// 从右键菜单的动作里取出**要操作的全部任务**。
-        /// 原来只取 `SelectedItem`（一个）—— 于是"Shift 离散多选之后
+        /// 原来只取 `SelectedItem`（一个）—— 于是"Ctrl 离散多选之后
         /// 右键暂停/删除"只会作用于其中一个（用户反馈）。现在把选中的全取出来；
         /// 没选中任何行时回退到菜单项自己的 Tag（行内按钮那条路径）。
         /// </summary>
@@ -4447,7 +4426,8 @@ namespace GeZi
         {
             var t = (sender as System.Windows.Controls.Button)?.Tag as TaskItem;
             if (t == null) return;
-            if (t.State == JobState.Paused) ResumeTask(t);
+            // 待续传行（启动时摆进列表的未完成任务）：▶ 即「重新取链接着下」。
+            if (t.State == JobState.Paused || t.State == JobState.AwaitingResume) ResumeTask(t);
             else PauseTask(t);
         }
 
@@ -4489,11 +4469,13 @@ namespace GeZi
                 t.State = JobState.Downloading;
                 Log("已恢复: " + t.Name);
             }
-            else if (t.State == JobState.Failed && t.Job?.Pending != null)
+            else if ((t.State == JobState.Failed || t.State == JobState.AwaitingResume)
+                     && t.Job?.Pending != null)
             {
-                // 失败任务走真正的「续传」：直链已失效，必须重新取链；
+                // 失败/待续传任务走真正的「续传」：直链已失效，必须重新取链；
                 // 断点（.qmeta/分片）都还在磁盘上，新任务挂到同一 Dest 会自动接上。
                 // 复用启动续传那套链路（取链 + stoken 过期自动重解析），不做第二份实现。
+                // 待续传行 = 启动时从「未完成任务」记录摆进列表的（不再弹窗，2026-10-31）。
                 var pi = t.Job.Pending;
                 var p = new PendingTask
                 {
@@ -4534,12 +4516,18 @@ namespace GeZi
         {
             if (t == null) return;
             if (t.State == JobState.Downloading || t.State == JobState.Queued
-                || t.State == JobState.Paused || t.State == JobState.Cancelling)
+                || t.State == JobState.Paused || t.State == JobState.Cancelling
+                || t.State == JobState.AwaitingResume)
             {
                 t.Job.CancelJob();
                 // 与 CancelAll 同理：立即置「取消中」，否则窗口期内它看着还是
-                // 「下载中」，用户点「清空已完成」清不掉会以为按钮坏了。
-                t.State = JobState.Cancelling;
+                // 「正在下载」，用户以为取消没生效。
+                // 待续传行是占位壳、没有 worker：没有「取消中」的过渡期可言，
+                // 直接把行摘掉（残留清理在后台线程跑，结果写日志）。
+                if (t.State == JobState.AwaitingResume)
+                    _tasks.Remove(t);
+                else
+                    t.State = JobState.Cancelling;
                 // 「丢弃这些任务选择不进行续传的时候不会删除
                 //  取消续传的文件的分片和对应的其他文件」。
                 //  实测根因**不在"丢弃"那一步**（那条路径本来就删）：而是**被取消的任务
@@ -4552,6 +4540,8 @@ namespace GeZi
                 //    想保留进度以后再续传，请用「暂停」。
                 Log("已请求取消: " + t.Name + "（将清理本地分片与未下完的部分）");
                 CleanupCanceledTaskAsync(t.Job.Dest, t.Name);
+                // 摘掉待续传行后不会有任务更新来刷新按钮，这里补一次。
+                UpdatePauseAllButton(force: true);
             }
             else
             {
@@ -4653,7 +4643,7 @@ namespace GeZi
         /// <summary>「仅移除记录」：只把任务从列表拿掉，不动磁盘上的文件。</summary>
         private void OnTaskRemoveRecord(object sender, RoutedEventArgs e)
         {
-            // 支持 Shift 离散多选：一次移除多条记录。
+            // 支持 Ctrl 离散多选：一次移除多条记录。
             var all = TasksFromMenu(sender);
             if (all.Count == 0) return;
 
@@ -4725,7 +4715,7 @@ namespace GeZi
         /// `RunAllAsync` 就永不返回 → `_batchRunning` 一直 true
         /// → 退出时永远提示"还有任务在运行"、下次启动又被当成可续传任务。
         /// （同样的坑在「仅移除记录」上已经踩过一次，见那里的注释。）
-        /// ⚠️ 支持 Shift 离散多选后一次删多个。
+        /// ⚠️ 支持 Ctrl 离散多选后一次删多个。
         /// </summary>
         private void OnTaskDeleteLocal(object sender, RoutedEventArgs e)
         {
@@ -4969,122 +4959,6 @@ namespace GeZi
                 Log("定位失败：找不到该文件或所在目录（" + dest + "）");
         }
 
-        // ---------------- 下载历史 ----------------
-
-        /// <summary>
-        /// 「下载历史」：用最简单的窗口列出记录，支持打开/定位/清空。
-        /// 移植自 Python Flet 版 `_on_open_history`。
-        /// UI 刻意保持朴素（ListBox + 按钮），只求功能可用。
-        /// </summary>
-        private void OnOpenHistory(object sender, RoutedEventArgs e)
-        {
-            var win = new Window
-            {
-                Title = "下载历史",
-                Owner = this,
-            };
-            DialogChrome.StyleWindow(win, 760, 520);
-
-            var grid = new System.Windows.Controls.Grid { Margin = new Thickness(20, 18, 20, 18) };
-            grid.RowDefinitions.Add(new System.Windows.Controls.RowDefinition { Height = GridLength.Auto });
-            grid.RowDefinitions.Add(new System.Windows.Controls.RowDefinition { Height = GridLength.Auto });
-            grid.RowDefinitions.Add(new System.Windows.Controls.RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
-
-            var title = DialogChrome.PageTitle("下载历史");
-            System.Windows.Controls.Grid.SetRow(title, 0);
-            grid.Children.Add(title);
-
-            var bar = new System.Windows.Controls.StackPanel
-            {
-                Orientation = System.Windows.Controls.Orientation.Horizontal,
-                Margin = new Thickness(0, 8, 0, 12),
-            };
-            // 三个按钮「模板感太浓」→ 改成透明背景的幽灵按钮。
-            // 只保留文字 + 悬停反馈；「清空记录」是破坏性操作，用**红字**而不是红底
-            // （红底实心块在这一排里视觉重量过重，且和旁边的白底描边不在一个体系）。
-            var ghostStyle = TryFindResource("GhostButton") as Style;
-            var openBtn = new Button { Content = "打开", Style = ghostStyle };
-            var locateBtn = new Button { Content = "定位", Style = ghostStyle };
-            var clearBtn = new Button { Content = "清空记录", Style = ghostStyle };
-            var clearDanger = TryFindResource("DangerBrush") as Brush;
-            if (clearDanger != null) clearBtn.Foreground = clearDanger;
-            bar.Children.Add(openBtn);
-            locateBtn.Margin = new Thickness(8, 0, 0, 0);
-            bar.Children.Add(locateBtn);
-            clearBtn.Margin = new Thickness(8, 0, 0, 0);
-            bar.Children.Add(clearBtn);
-            System.Windows.Controls.Grid.SetRow(bar, 1);
-            grid.Children.Add(bar);
-
-            var list = DialogChrome.StyledList();
-            list.FontSize = 12;
-            var listCard = DialogChrome.Card(list);
-            listCard.Padding = new Thickness(0);
-            System.Windows.Controls.Grid.SetRow(listCard, 2);
-            grid.Children.Add(listCard);
-
-            // 每行：时间  状态  大小  名称（"名称"是主键，路径另存）
-            var records = new List<HistoryRecord>();
-            var display = new System.Collections.ObjectModel.ObservableCollection<string>();
-            list.ItemsSource = display;
-
-            Action reload = () =>
-            {
-                records = HistoryStore.GetHistory();
-                display.Clear();
-                foreach (var r in records)
-                {
-                    display.Add(string.Format("{0}   [{1}]   {2}   {3}",
-                        r.Time ?? "", r.Status ?? "", r.Size ?? "", r.Name ?? ""));
-                }
-                if (display.Count == 0)
-                    display.Add("（暂无历史记录）");
-            };
-            reload();
-
-            HistoryRecord Sel()
-            {
-                int i = list.SelectedIndex;
-                return (i >= 0 && i < records.Count) ? records[i] : null;
-            }
-
-            openBtn.Click += (s2, e2) =>
-            {
-                var r = Sel();
-                if (r == null || string.IsNullOrEmpty(r.Path)) { Log("请先选中一条记录"); return; }
-                if (!File.Exists(r.Path)) { Log("文件已不存在：" + r.Path); return; }
-                OpenTaskFileByPath(r.Path);
-            };
-            locateBtn.Click += (s2, e2) =>
-            {
-                var r = Sel();
-                if (r == null || string.IsNullOrEmpty(r.Path)) { Log("请先选中一条记录"); return; }
-                if (!ShellReveal.Reveal(r.Path))
-                    Log("定位失败：" + r.Path);
-            };
-            clearBtn.Click += (s2, e2) =>
-            {
-                var ans = AppDialog.Show(win,
-                    "确定清空全部下载记录吗？（不会删除磁盘上的文件）",
-                    "清空记录", MessageBoxButton.YesNo, MessageBoxImage.Question,
-                    MessageBoxResult.No);
-                if (ans != MessageBoxResult.Yes) return;
-                HistoryStore.ClearHistory();
-                reload();
-                Log("已清空下载历史");
-            };
-
-            win.Content = grid;
-            win.ShowDialog();
-        }
-
-        /// <summary>按路径打开文件（供历史窗口复用「打开」逻辑）。</summary>
-        private void OpenTaskFileByPath(string path)
-        {
-            if (!ShellLaunch.OpenFile(path))
-                Log("打开失败，请手动到下载目录查看：" + path);
-        }
-
         // ---------------- 启动时的未完成任务提示 ----------------
 
         // ---------------- 诊断面板 ----------------
@@ -5106,15 +4980,13 @@ namespace GeZi
             if (t == null) return false;
             switch (_taskFilter)
             {
-                case "active":
-                    return t.State == JobState.Queued || t.State == JobState.Downloading
-                        || t.State == JobState.Paused;
                 case "failed":
                     return t.State == JobState.Failed || t.State == JobState.Cancelled;
                 case "done":
                     return t.State == JobState.Completed;
-                default:
-                    return true;
+                default: // "active"：Queued / Downloading / Paused / 待续传
+                    return t.State == JobState.Queued || t.State == JobState.Downloading
+                        || t.State == JobState.Paused || t.State == JobState.AwaitingResume;
             }
         }
 
@@ -5124,13 +4996,12 @@ namespace GeZi
         /// 单纯改 item.State（INPC 属性）不会触发 —— 用户停在「失败/已完成」页上时，
         /// 刚失败/完成的任务永远不出现，页面看起来像坏的（用户反馈「完全不显示」）。
         /// State 已在 TaskItem 里同值去重，这里只会被真正的状态翻转打到，
-        /// 不会吃进度帧；Refresh 仅在非「全部」页才需要（全部页本就都显示，
-        /// 且 Refresh 会重建视图，白白打断滚动位置和多选）。
+        /// 不会吃进度帧；已无「全部」页，任何分类变化都需要 Refresh。
         /// </summary>
         private void OnTaskItemStateChanged(object sender, PropertyChangedEventArgs e)
         {
             if (e.PropertyName != nameof(TaskItem.State)) return;
-            if (_taskFilter == "all" || _taskView == null) return;
+            if (_taskView == null) return;
             _taskView.Refresh();
             UpdateTaskFilterCounts();
         }
@@ -5144,10 +5015,9 @@ namespace GeZi
             try
             {
                 if (TaskFilterActive == null) return;   // 初始化期间控件尚未就绪
-                if (TaskFilterAll.IsChecked == true) _taskFilter = "all";
-                else if (TaskFilterActive.IsChecked == true) _taskFilter = "active";
-                else if (TaskFilterFailed.IsChecked == true) _taskFilter = "failed";
-                else _taskFilter = "done";
+                if (TaskFilterFailed.IsChecked == true) _taskFilter = "failed";
+                else if (TaskFilterDone.IsChecked == true) _taskFilter = "done";
+                else _taskFilter = "active";
                 if (_taskView != null) _taskView.Refresh();
                 UpdateTaskFilterCounts();
             }
@@ -5167,15 +5037,13 @@ namespace GeZi
                     bool hit;
                     switch (_taskFilter)
                     {
-                        case "active":
-                            hit = t.State == JobState.Queued || t.State == JobState.Downloading
-                               || t.State == JobState.Paused; break;
                         case "failed":
                             hit = t.State == JobState.Failed || t.State == JobState.Cancelled; break;
                         case "done":
                             hit = t.State == JobState.Completed; break;
-                        default:
-                            hit = true; break;
+                        default: // "active"
+                            hit = t.State == JobState.Queued || t.State == JobState.Downloading
+                               || t.State == JobState.Paused || t.State == JobState.AwaitingResume; break;
                     }
                     if (hit) n++;
                 }
@@ -5493,28 +5361,6 @@ namespace GeZi
             LogDetail("已启动分片自动清扫（阈值 " + PartsSweeper.DefaultMaxAgeDays + " 天）。扫描范围: " + rootSnapshot);
         }
 
-        /// <summary>
-        /// 启动时读取未完成任务记录，让用户决定**逐条/批量续传**，而不是只提示一句。
-        /// <para></para>
-        /// <para>
-        /// 原实现只弹「有 N 个未完成任务，是否打开下载目录？」—— 用户点「是」也只是
-        /// 打开文件夹，要真正继续还得自己重新走一遍解析/选文件的流程，很别扭。
-        /// Python Flet 版在这里是**逐条询问 + 支持一键全部继续**，体验明显更好。
-        /// </para>
-        /// <para></para>
-        /// <para>
-        /// 直链带时效签名，重启后必然失效，所以必须**重新取链**。为此
-        /// <see cref="PendingTask"/> 补齐了 fid / token / 分享上下文（见其注释），
-        /// 使这里可以脱离界面上下文重走「取链 → 入队」。分片与 .qmeta 都在原地，
-        /// 下载器会自动接着下，不会重下已完成的部分。
-        /// </para>
-        /// <para></para>
-        /// <para>
-        /// 批量续传会一次性打出若干取链请求 —— 与"一次误选几万个文件"是同类风险。
-        /// 因此数量超过 <see cref="ConfirmThreshold"/> 时先让用户确认；
-        /// 无法续传的（免转存/信息不全）单独列出并说明，不会静默丢弃。
-        /// </para>
-        /// </summary>
         // ---------------- 检查更新（2026-10-11 新增） ----------------
 
         /// <summary>
@@ -5539,6 +5385,24 @@ namespace GeZi
             catch { }
         }
 
+        /// <summary>
+        /// 启动时读取「未完成任务」记录，**直接摆进任务列表**（不弹窗）。
+        /// <para></para>
+        /// <para>
+        /// 原实现弹一个「未完成的任务」对话框让用户勾选（更早之前只弹"是否打开下载目录"）。
+        /// 2026-10-31 按用户要求改为：每个未完成任务以 <see cref="JobState.AwaitingResume"/>
+        /// （「待续传」）状态进「正在下载」列表，点行内 ▶ / 右键「恢复」即重新取链接着下，
+        /// 「恢复全部」= 旧弹窗的「全选可续传 + 继续下载」，右键「取消」= 旧弹窗的「丢弃」。
+        /// </para>
+        /// <para></para>
+        /// <para>
+        /// 直链带时效签名，重启后必然失效，所以点继续时必须**重新取链**：
+        /// 恢复链路完全复用 <see cref="ResumeTask"/> 的失败任务分支（取链 +
+        /// stoken 过期自动重解析），此处只摆一个承载 Pending 上下文的占位 Job 壳，
+        /// 永不进入调度器。信息不全（如免转存）的行也能摆进来，点了会明确告知
+        /// 「需重新下载」—— 与旧弹窗的置灰复选框同义，但不静默丢弃。
+        /// </para>
+        /// </summary>
         private void ShowPendingOnStartup()
         {
             List<PendingTask> all;
@@ -5547,261 +5411,38 @@ namespace GeZi
             if (all == null || all.Count == 0)
                 return;
 
+            int n = 0;
             foreach (var p in all)
-                LogDetail("  - " + p.Name + "  [" + (p.Status ?? "") + "]");
-
-            var resumable = all.Where(p => p != null && p.CanResume).ToList();
-            var notResumable = all.Where(p => p == null || !p.CanResume).ToList();
-
-            var dlg = new Window
             {
-                Owner = this,
-                Title = "未完成的任务",
-                ResizeMode = ResizeMode.CanResize,
-            };
-            DialogChrome.StyleWindow(dlg, 600, 480);
-
-            var root = new Grid { Margin = new Thickness(20, 18, 20, 18) };
-            root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-            root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-            root.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
-            root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-
-            var title = DialogChrome.PageTitle("未完成的任务");
-            Grid.SetRow(title, 0);
-            root.Children.Add(title);
-
-            var head = DialogChrome.Hint(string.Format(
-                "上次有 {0} 个任务未完成，其中 {1} 个可以继续下载。\n"
-                + "勾选后点「继续下载」会重新获取直链并接着已下载的部分继续（不会重下）。",
-                all.Count, resumable.Count), 0, 12);
-            Grid.SetRow(head, 1);
-            root.Children.Add(head);
-
-            // 「续传界面的文件前面有个对勾太误导人了，
-            //  让人以为已经自动勾选了」。
-            //  原来是在 Display 字符串前面拼了一个 "✓"（表示"可续传"），可它长得
-            //  就像"已勾选"；再加上 ListBox 的选中蓝底，整行看起来就是"已经选好了"，
-            //  于是用户以为可以直接点「继续下载」，结果按钮是灰的（一个都没真勾上）。
-            //  → 换成**真正的复选框**：默认全部不勾，勾选态与按钮可用性直接联动。
-            var wrappers = new List<PendingRow>();
-            foreach (var p in all) wrappers.Add(new PendingRow(p));
-
-            var selAll = DialogChrome.SecondaryButton("全选可续传");
-            var resumeBtn = DialogChrome.PrimaryButton("继续下载");
-            var discardBtn = DialogChrome.DangerButton("丢弃这些任务");
-            var closeBtn = DialogChrome.SecondaryButton("稍后再说");
-
-            // 用 ListBox + 复选（ItemsSource 为包装对象，便于双向绑定 IsChecked）
-            var box = new ListBox
-            {
-                SelectionMode = SelectionMode.Single,
-                BorderThickness = new Thickness(0),
-                Padding = new Thickness(4),
-            };
-            var plainStyle = TryFindResource("PlainListBox") as Style;
-            if (plainStyle != null) box.Style = plainStyle;
-            // ⚠️ **必须**给 ItemTemplate：ListBox 的项没有模板时会调 ToString()，
-            //    而 PendingRow 没重写它 → 用户看到一列
-            //    「GeZi.MainWindow+PendingRow」（用户反馈：「续传的时候为什么都
-            //    显示同样的东西，不应该显示需要续传的文件名吗」）。
-            box.ItemTemplate = BuildPendingRowTemplate();
-            foreach (var w in wrappers) box.Items.Add(w);
-
-            var boxCard = DialogChrome.Card(box);
-            boxCard.Padding = new Thickness(0);
-            Grid.SetRow(boxCard, 2);
-            root.Children.Add(boxCard);
-
-            var btns = DialogChrome.ButtonRow(selAll, resumeBtn, discardBtn, closeBtn);
-            btns.Margin = new Thickness(0, 14, 0, 0);
-            Grid.SetRow(btns, 3);
-            root.Children.Add(btns);
-
-            dlg.Content = root;
-
-            // 「没勾任何文件时『继续下载』是灰的，用不了」。
-            // 这个禁用态本身是对的（一个都没勾时点它没有任何意义），
-            // 真正的问题是上面那个假对勾让人以为已经勾好了 —— 现在换成真复选框，
-            // 并让按钮状态**实时跟着勾选走**：勾一个立刻变亮，全取消立刻变灰。
-            Action syncResumeBtn = () =>
-            {
-                resumeBtn.IsEnabled = wrappers.Any(w => w.IsChecked && w.CanResume);
-            };
-            foreach (var w in wrappers)
-            {
-                w.PropertyChanged += (s, e) =>
+                if (p == null) continue;
+                var job = new DownloadJob
                 {
-                    if (e.PropertyName == nameof(PendingRow.IsChecked)) syncResumeBtn();
-                };
-            }
-            syncResumeBtn();
-
-            bool doResume = false;
-            bool doDiscard = false;
-
-            selAll.Click += (s, e) =>
-            {
-                foreach (var w in wrappers)
-                    if (w.CanResume) w.IsChecked = true;
-            };
-            resumeBtn.Click += (s, e) => { doResume = true; dlg.DialogResult = true; };
-            discardBtn.Click += (s, e) => { doDiscard = true; dlg.DialogResult = true; };
-            closeBtn.Click += (s, e) => { dlg.DialogResult = false; };
-
-            // 默认**一个都不勾**（原来是"全部设 false"，效果一样，但写在这里容易被
-            // 误读成"有默认勾选"）。勾选完全交给用户，按钮状态跟着走。
-            syncResumeBtn();
-
-            dlg.ShowDialog();
-
-            if (doDiscard)
-            {
-                // 丢弃 = 清 pending + 清该任务的全部本地残留
-                //（分片目录 / 续传元数据 / **未下完的目标文件**；网盘上的文件保留）。
-                // 「丢弃这些任务的时候不会删除分片和对应的其他文件」。
-                //  这里补两处：
-                //   ① 原来只删分片目录与 .qmeta，**没删目标文件** —— 而共写模式的目标文件
-                //      是预分配的满尺寸文件（可能是几百 MB 的空洞文件），留着最占地方；
-                //   ② 原来 `TryDeletePath` 静默吞异常、`n++` 无条件自增，
-                //      于是"删失败"和"删成功"在日志里长得一模一样 —— 用户报的正是
-                //      "删没删不知道"。现在分开统计成功/失败，并把失败情况写进日志。
-                int n = 0, failed = 0;
-                long freed = 0;
-                var roots = AllPartsRoots();
-                foreach (var p in all)
-                {
-                    if (p == null) continue;
-                    bool anyFail = false;
-                    try
+                    Name = p.Name ?? Path.GetFileName(p.Dest),
+                    Dest = p.Dest ?? "",
+                    // 占位壳 Job：不取链、不进调度器（没人对它调 RunJobs），
+                    // 只为 TaskItem 提供 Pending 上下文（ResumeTask 从这里重建 PendingTask）
+                    // 与写盘方式（决定「播放」按钮显隐）。参数与真任务入队时保持同一来源。
+                    WriteMode = _settings.WriteMode,
+                    PartsRoot = string.IsNullOrWhiteSpace(_settings.PartsRoot) ? null : _settings.PartsRoot,
+                    Pending = new PendingInfo
                     {
-                        foreach (string path in SegmentedDownloader.EnumeratePartialPaths(p.Dest, roots))
-                        {
-                            if (!Directory.Exists(path) && !File.Exists(path)) continue;
-                            freed += PathSizeSafe(path);
-                            TryDeletePath(path);
-                            if (Directory.Exists(path) || File.Exists(path)) anyFail = true;
-                        }
-                        // 目标文件本身（未下完的残件）
-                        if (!string.IsNullOrEmpty(p.Dest) && File.Exists(p.Dest))
-                        {
-                            freed += PathSizeSafe(p.Dest);
-                            try { File.Delete(p.Dest); } catch { }
-                            if (File.Exists(p.Dest)) anyFail = true;
-                        }
-                    }
-                    catch { anyFail = true; }
-
-                    if (anyFail) failed++;
-                    else n++;
-                }
-                HistoryStore.ClearPending();
-                _pendingSig = null;
-                Log(failed == 0
-                    ? string.Format("已丢弃 {0} 个未完成任务，本地残留已清理（释放 {1}），网盘文件保留。",
-                        n, Util.FormatSize(freed))
-                    : string.Format("已丢弃 {0} 个未完成任务（释放 {1}）；其中 {2} 个有文件正被占用未能删除，"
-                        + "下次启动的自动清扫会兜底回收。网盘文件保留。",
-                        n + failed, Util.FormatSize(freed), failed));
-                return;
+                        PwdId = p.PwdId, Stoken = p.Stoken, Passcode = p.Passcode,
+                        Fid = p.Fid, Token = p.Token, FromShare = p.FromShare,
+                        RelDir = p.RelDir, Dest = p.Dest, Size = p.Size,
+                        StartFid = p.StartFid, ShareRelDir = p.ShareRelDir,
+                    },
+                };
+                // State 在进集合**前**置好：进列表时过滤器一眼就把它分进「正在下载」页。
+                _tasks.Add(new TaskItem(job, job.Name) { Total = p.Size, State = JobState.AwaitingResume });
+                n++;
+                LogDetail("  - " + job.Name + "  [" + (p.Status ?? "") + "]");
             }
 
-            if (!doResume)
-            {
-                Log("未完成的任务已保留记录，稍后可从下载页重新下载（分片在，会自然续传）。");
-                return;
-            }
-
-            var chosen = wrappers.Where(w => w.IsChecked && w.CanResume)
-                                 .Select(w => w.Task).ToList();
-            if (chosen.Count == 0)
-            {
-                Log("没有勾选任何可续传的任务。");
-                return;
-            }
-
-            if (chosen.Count > ConfirmThreshold)
-            {
-                var ans = AppDialog.Show(this,
-                    string.Format("将续传 {0} 个任务，会一次性发出相应数量的取链请求。\n\n确认继续吗？",
-                        chosen.Count),
-                    "确认续传", MessageBoxButton.YesNo, MessageBoxImage.Question, MessageBoxResult.No);
-                if (ans != MessageBoxResult.Yes)
-                {
-                    Log("已取消批量续传。");
-                    return;
-                }
-            }
-
-            Log(string.Format("开始续传 {0} 个任务…", chosen.Count));
+            Log(string.Format(
+                "上次有 {0} 个未完成任务，已放进任务列表（状态：待续传）——点 ▶ 或右键「恢复」即从断点继续，不会重下。",
+                n));
+            // 弹窗的「打扰」换成一个温和的页面切换：保证用户看得见这些行。
             Tabs.SelectedIndex = 1;
-            _ = ResumePendingBatchAsync(chosen);
-        }
-
-        /// <summary>
-        /// 续传列表的行模板：**真正的复选框** + 文件名（+ 大小 / 不可续传的说明）。
-        /// <para></para>
-        /// <para>
-        /// 原来用 <c>DisplayMemberPath = "Display"</c>，只能在文字里拼一个 "✓" 冒充勾选态，
-        /// 用户明确反馈「文件前面有个对勾太误导人了，让人以为已经自动勾选了」。
-        /// 换成 ItemTemplate 才能放真的 CheckBox，并把勾选态双向绑回 PendingRow.IsChecked
-        /// （「继续下载」按钮的可用性就是靠它驱动的）。
-        /// </para>
-        /// </summary>
-        private DataTemplate BuildPendingRowTemplate()
-        {
-            var cb = new FrameworkElementFactory(typeof(CheckBox));
-            var st = TryFindResource("AppCheckBox") as Style;
-            if (st != null) cb.SetValue(FrameworkElement.StyleProperty, st);
-            cb.SetValue(FrameworkElement.VerticalAlignmentProperty, VerticalAlignment.Center);
-            cb.SetValue(FrameworkElement.HorizontalAlignmentProperty, HorizontalAlignment.Left);
-            // 不可续传的行：复选框置灰（文案里已说明原因）
-            cb.SetBinding(UIElement.IsEnabledProperty,
-                new Binding("CanResume") { Mode = BindingMode.OneWay });
-            cb.SetBinding(ToggleButton.IsCheckedProperty,
-                new Binding("IsChecked")
-                {
-                    Mode = BindingMode.TwoWay,
-                    UpdateSourceTrigger = UpdateSourceTrigger.PropertyChanged,
-                });
-            cb.SetBinding(ContentControl.ContentProperty, new Binding("Display"));
-
-            return new DataTemplate { VisualTree = cb };
-        }
-
-        /// <summary>续传对话框里的一行（带勾选）。</summary>
-        private sealed class PendingRow : INotifyPropertyChanged
-        {
-            public PendingTask Task { get; }
-            private bool _checked;
-            public bool IsChecked
-            {
-                get => _checked;
-                set { _checked = value; PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(IsChecked))); }
-            }
-            public string Display { get; }
-            public bool CanResume => Task != null && Task.CanResume;
-
-            public PendingRow(PendingTask t)
-            {
-                Task = t;
-                // 一行要能一眼看出"这是哪个文件、多大、能不能接着下"。
-                // 原来这里在文件名前面拼了一个 "✓"/"✕"，
-                // 那是"能不能续传"的标记，却长得就像"已经勾选" —— 用户以为文件被
-                // 自动勾上了，于是点了「继续下载」却发现按钮是灰的。
-                // 现在前缀去掉：能不能续传看**复选框是否可用**（不可续传的复选框置灰），
-                // 以及后面那句说明；勾选与否完全由用户点复选框决定。
-                string size = (t != null && t.Size > 0) ? "   " + Util.FormatSize(t.Size) : "";
-                string why = CanResume ? "" : "   （信息不全，需重新下载）";
-                Display = (t?.Name ?? "(未知)") + size + why;
-            }
-
-            public event PropertyChangedEventHandler PropertyChanged;
-
-            // ListBoxItem 的**无障碍名**取的是数据项的 ToString()（即使设了
-            // DisplayMemberPath，容器元素的名字仍走这条），不重写的话屏幕阅读器/
-            // UIA 读到的还是「GeZi.MainWindow+PendingRow」。
-            public override string ToString() { return Display; }
         }
 
         /// <summary>删除文件或目录，失败静默（供丢弃续传用）。</summary>
@@ -5985,6 +5626,14 @@ namespace GeZi
                     Log("没有任务成功取到直链。");
                     return;
                 }
+
+                // 「连接数上限」对续传批同样生效：按文件大小在限制内自动分配，
+                // 不能每个续传任务都开满所选值（否则 N 个任务 = N × 上限，总上限失守）。
+                // 已有进度的任务 SegmentedDownloader 会沿用 .qmeta 的分片规划，改线程数不动进度。
+                var alloc = AllocateThreads(jobs.Select(j => j.Pending.Size).ToList());
+                for (int i = 0; i < jobs.Count; i++)
+                    jobs[i].Threads = alloc[i];
+                LogAllocation(alloc);
 
                 // 先摘旧行再挂新行：失败/被接替的行不在了，列表不会出现同一文件两行。
                 foreach (var old in staleToRemove)
@@ -6648,7 +6297,7 @@ namespace GeZi
                 SettingsStore.Save(_settings);
                 RecreateScheduler();
 
-                Log(string.Format("设置已生效（单文件并发 {0} 路，同时下载 {1} 个）", threads, conc));
+                Log(string.Format("设置已生效（连接数上限 {0} 路，同时下载 {1} 个）", threads, conc));
             }
             catch (Exception ex)
             {
@@ -6883,19 +6532,51 @@ namespace GeZi
         {
             // 连接上限现在由 SegmentedDownloader / QuarkSession 各自显式设定，
             // 不再暴露"全局连接预算"给用户（原来的设置项实际不起作用）。
-            // NetworkConfig.Apply 仍在调度器构造里以固定值调用一次，兜底全局 DefaultConnectionLimit。
+            // NetworkConfig.Apply 仍在调度器构造里调用一次（传入「连接数上限」），兜底全局 DefaultConnectionLimit。
             if (_batchRunning)
             {
                 // 正在下载：绝不触碰现有 scheduler，避免上面描述的两种事故。
+                // 但「连接数上限」不必等下一批：job.Threads 是任务**真正开跑时**
+                // 才被 RunOneAsync 读去建 SegmentedDownloader 的，排队中的任务改它
+                // 立即生效；已开跑的任务 worker 数在 DownloadAsync 一开始就定了，
+                // 无法热改，保持原分配。
+                ReallocQueuedThreads();
                 Log("并发数已保存，将在下一批下载生效（当前批次正在运行，不打断）。");
                 return;
             }
 
             // 空闲：安全地重建
             try { _scheduler?.Dispose(); } catch { }
-            _scheduler = new DownloadScheduler(_settings.ConcurrentTasks);
+            _scheduler = new DownloadScheduler(_settings.ConcurrentTasks, _settings.Threads);
             _scheduler.Log = LogFromWorker;
             _scheduler.Diagnostics = OnDiagnostics;
+        }
+
+        /// <summary>
+        /// 下载中改「连接数上限」时，把**还没开跑的排队任务**按新上限重分一遍线程数。
+        /// 没有这一步，排队任务会沿用批次开始时的旧分配，用户改完上限看活跃连接没变化，
+        /// 只能重启应用才生效（2026-10-31 实测反馈）。
+        /// ponytail: 只重排排队任务、与在跑任务分开各算各的，瞬时总和可能仍超新上限 ——
+        /// 与 ThreadAllocator 既有「预算 × 波次」近似同一量级；要精确需调度器级统一重分配。
+        /// </summary>
+        private void ReallocQueuedThreads()
+        {
+            var queued = _tasks.Where(t => t.State == JobState.Queued && t.Job != null)
+                               .Select(t => t.Job).ToList();
+            if (queued.Count == 0) return;
+            var alloc = AllocateThreads(queued.Select(j => j.Pending != null ? j.Pending.Size : 0).ToList());
+            bool changed = false;
+            for (int i = 0; i < queued.Count; i++)
+            {
+                if (queued[i].Threads == alloc[i]) continue;
+                queued[i].Threads = alloc[i];
+                changed = true;
+            }
+            // 只在真的改了值时才说，避免改无关设置（如下载目录）时刷这句。
+            if (changed)
+                Log(string.Format(
+                    "「连接数上限」已对排队中的 {0} 个任务重新分配；正在下载的任务保持原分配，下一批全部按新上限。",
+                    queued.Count));
         }
 
         /// <summary>当前是否有下载批次在跑。用于阻止"运行中重建 scheduler"这类危险操作。</summary>
@@ -8221,6 +7902,14 @@ namespace GeZi
                 int i = Tabs.SelectedIndex;
                 if (i < 0 || i == NavList.SelectedIndex)
                     return;
+                // 登录页（索引 3）已不在侧栏里 —— 侧栏只有 3 项。
+                // 跳登录页时侧栏不选中任何项，不能把越界索引塞给 ListBox。
+                if (i >= NavList.Items.Count)
+                {
+                    _syncingNav = true;
+                    NavList.SelectedIndex = -1;
+                    return;
+                }
                 _syncingNav = true;
                 NavList.SelectedIndex = i;
             }

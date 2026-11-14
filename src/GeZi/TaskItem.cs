@@ -23,9 +23,6 @@ namespace GeZi
         public DownloadJob Job { get; }
         public string Name { get; }
 
-        /// <summary>是否已写入下载历史。终态只记一次，防止重复上报把历史刷屏。</summary>
-        public bool HistoryRecorded { get; set; }
-
         public TaskItem(DownloadJob job, string name)
         {
             Job = job;
@@ -38,7 +35,7 @@ namespace GeZi
             get => _state;
             // 同值不重发：核心层每 500ms 的进度帧都会重赋一次当前状态，
             // 无条件通知等于每帧白刷 5 个绑定，还会打进 MainWindow 的状态变化钩子。
-            set { if (_state == value) return; _state = value; OnChanged(nameof(State)); OnChanged(nameof(StatusText)); OnChanged(nameof(DetailText)); OnChanged(nameof(SpeedText)); OnChanged(nameof(CanPlay)); }
+            set { if (_state == value) return; _state = value; OnChanged(nameof(State)); OnChanged(nameof(StatusText)); OnChanged(nameof(DetailText)); OnChanged(nameof(SpeedText)); OnChanged(nameof(CanPlay)); OnChanged(nameof(ShowLanes)); }
         }
 
         // ─────────────────────────────────────────────────────────────
@@ -102,6 +99,14 @@ namespace GeZi
                 return arr;
             }
         }
+
+        /// <summary>
+        /// 是否显示「连接车道」。只在**真正下载中**显示：
+        /// 完成/失败/取消/暂停的行留着灰格子与「0/16 连接」没有任何信息量
+        /// （已完成的页面尤其突兀 —— 都下载完了还挂着连接数）。
+        /// 状态一变就整块收起，车道数据（ActiveConnections/WorkerCount）照常喂入无妨。
+        /// </summary>
+        public bool ShowLanes => _state == JobState.Downloading;
 
         /// <summary>车道文字："12/16 连接"。未开始（无并发上限）时为空串。</summary>
         /// <remarks>
@@ -263,6 +268,9 @@ namespace GeZi
                     case JobState.Failed: return "失败";
                     case JobState.Cancelled: return "已取消";
                     case JobState.Cancelling: return "取消中…";
+                    // 启动时从「未完成任务」记录摆进列表的行：断点在磁盘上，
+                    // 点 ▶ / 右键「恢复」会重新取链接着下（不是重新下载）。
+                    case JobState.AwaitingResume: return "待续传";
                     default: return "";
                 }
             }
@@ -275,6 +283,10 @@ namespace GeZi
             {
                 if (State == JobState.Failed && !string.IsNullOrEmpty(Error))
                     return "失败: " + Error;
+                // 信息不全的待续传行：一眼说明为什么点继续也没用（同旧弹窗的「信息不全」行）。
+                if (State == JobState.AwaitingResume
+                    && Job?.Pending != null && !Job.Pending.CanResume)
+                    return "待续传（信息不全，需重新下载）";
                 return StatusText;
             }
         }

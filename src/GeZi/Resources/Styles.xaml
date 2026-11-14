@@ -1163,6 +1163,15 @@
                                     Value="{DynamicResource WarningBrush}"/>
                             <Setter Property="ToolTip" Value="继续这个任务"/>
                         </DataTrigger>
+                        <!-- 待续传（启动时摆进列表的未完成任务）→ 同样亮 ▶：
+                             点它会重新取链并从断点续传（不是暂停恢复的"继续"）。 -->
+                        <DataTrigger Binding="{Binding State}" Value="AwaitingResume">
+                            <Setter TargetName="Ico" Property="Data"
+                                    Value="{StaticResource IconPlay}"/>
+                            <Setter TargetName="Ico" Property="Stroke"
+                                    Value="{DynamicResource WarningBrush}"/>
+                            <Setter Property="ToolTip" Value="继续下载（重新取链，从断点续传）"/>
+                        </DataTrigger>
                         <!-- 终态：没有暂停/恢复的意义，收起按钮（Collapsed 不占位） -->
                         <DataTrigger Binding="{Binding State}" Value="Completed">
                             <Setter Property="Visibility" Value="Collapsed"/>

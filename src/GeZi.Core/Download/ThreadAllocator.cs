@@ -31,7 +31,8 @@ namespace GeZi.Core.Download
     public static class ThreadAllocator
     {
         /// <summary>
-        /// 总连接预算。夸克按账号限制总连接数，Python 版实测 512 为最优总量。
+        /// 总连接预算的**库级默认值**（UI 现改为把用户选的「连接数上限」传作 budget）。
+        /// 夸克按账号限制总连接数，Python 版实测 512 为最优总量。
         /// </summary>
         public const int DefaultBudget = 512;
 
@@ -42,7 +43,7 @@ namespace GeZi.Core.Download
         /// 按大小比例分配线程数，返回与入参等长的数组。
         /// </summary>
         /// <param name="sizes">每个任务的文件字节数（未知填 0 或负数）。</param>
-        /// <param name="perFileCap">用户设的「单文件并发连接数」，同时是每项的上限。</param>
+        /// <param name="perFileCap">用户设的「连接数上限」，同时是每项的上限（UI 把同一个值也作为 budget 传入）。</param>
         /// <param name="budget">总预算。</param>
         /// <param name="minPerFile">每项下限。</param>
         /// <param name="concurrency">

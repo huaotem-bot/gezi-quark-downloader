@@ -22,21 +22,10 @@ namespace GeZi
     public class AppSettings
     {
         /// <summary>
-        /// 单任务下载线程数（= 单文件最大并发连接）。默认 64，与 Python Flet 版一致
-        /// （core 的 DOWNLOAD_THREADS 也是 64）。上限见 SegmentedDownloader.MaxRealConcurrency。
-        /// </summary>
-        /// <summary>
-        /// 单文件并发连接数。
-        /// 依据 `docs/CDN并发阈值-实测.md` 的实测拐点：
-        /// ```
-        ///  并发  总速中位    单连接速
-        ///   64   4.00 MB/s   64.0 KB/s
-        ///  128   7.98 MB/s   63.8 KB/s
-        ///  256  13.94 MB/s   55.7 KB/s   ← 拐点，最快
-        ///  512  13.31 MB/s   27.1 KB/s   ← 反而降（连接互相争抢，谁都涨不起来）
-        /// ```
-        /// 夸克 CDN **按连接限速**（单连接 ~64KB/s），所以加连接线性有效；
-        /// 但 256 以上开始出现争抢（TCP 慢启动叠加 + 服务端反制），**不是越高越好**。
+        /// 「连接数上限」：**同时在线的总连接数**。单个文件可吃满；多文件同时下载时
+        /// 由 ThreadAllocator 在限制内按文件大小比例自动分配（大文件多、小文件少、保底 4 路）。
+        /// 默认 256 —— 实测拐点（docs/CDN并发阈值-实测.md，SSD 目盘数据；HDD 用户请调低，
+        /// 见设置页「下载注意事项」）。硬上限见 SegmentedDownloader.MaxRealConcurrency。
         /// ⚠️ 默认值只影响新用户；老配置里已有的值不会被覆盖。
         /// </summary>
         public int Threads { get; set; } = 256;

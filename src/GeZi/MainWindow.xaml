@@ -182,16 +182,16 @@
                                  VerticalAlignment="Top">
                             <ListBoxItem>
                                 <StackPanel Orientation="Horizontal">
-                                    <Path Data="{StaticResource IconDownload}"
+                                    <Path Data="{StaticResource IconCloud}"
                                           Style="{StaticResource NavItemIcon}"/>
-                                    <TextBlock Text="下载" Style="{StaticResource NavItemText}"/>
+                                    <TextBlock Text="网盘" Style="{StaticResource NavItemText}"/>
                                 </StackPanel>
                             </ListBoxItem>
                             <ListBoxItem>
                                 <StackPanel Orientation="Horizontal">
-                                    <Path Data="{StaticResource IconActivity}"
+                                    <Path Data="{StaticResource IconDownload}"
                                           Style="{StaticResource NavItemIcon}"/>
-                                    <TextBlock Text="任务" Style="{StaticResource NavItemText}"/>
+                                    <TextBlock Text="下载" Style="{StaticResource NavItemText}"/>
                                 </StackPanel>
                             </ListBoxItem>
                             <ListBoxItem>
@@ -201,14 +201,11 @@
                                     <TextBlock Text="设置" Style="{StaticResource NavItemText}"/>
                                 </StackPanel>
                             </ListBoxItem>
-                            <ListBoxItem>
-                                <StackPanel Orientation="Horizontal">
-                                    <Path Data="{StaticResource IconUser}"
-                                          Style="{StaticResource NavItemIcon}"/>
-                                    <TextBlock Text="登录" Style="{StaticResource NavItemText}"/>
-                                </StackPanel>
-                            </ListBoxItem>
                         </ListBox>
+                        <!-- 「登录」项已删：左下角账号卡本身就是登录入口（点卡片进登录页），
+                             侧栏再放一个「登录」纯属重复。登录页 TabItem 保留（索引 3 不变），
+                             仅供账号卡跳转 —— 所以侧栏 3 项 vs Tabs 4 页，同步逻辑见
+                             OnTabsSelectionChanged 里的越界处理。 -->
 
                         <!-- ======== 账号卡（左下角）========
                              对应 code-behind 的 UpdateAccountCard()。
@@ -220,19 +217,14 @@
                              现在改成：**两种状态结构完全一致、高度恒定**，
                              未登录时容量条显示为 0 值的灰色空槽 + 一句占位文案。
                         -->
-                        <!-- 提示区（用户要求「在账号卡片的上方用好看不突兀的方式
-                                 加一句『按住 Shift 可多选文件』」，随后又要求
-                                 「在这个的上方用同样的方式写出文件右键可选择免转存下载」，
-                                 再后来要求「将上方的话放到下面因为它更长一些」，
-                                 并纠正为「我要的是文件右键不是右键文件」）。
-
-                                 → 现在是**两行**提示，都在账号卡上方（短句在上、长句在下）：
-                                   第一行（原有）：按住 Shift → 可多选文件
-                                   第二行（新增）：文件 → 右键 → 可选择免转存下载
+                        <!-- 提示区（账号卡上方两行提示；2026-10-31 多选键从 Shift 改为 Ctrl，
+                                 与 WPF Extended 的原生多选手势一致）：
+                                   第一行：按住 Ctrl → 可多选文件
+                                   第二行：文件 → 右键 → 可选择免转存下载
                                  两行共用同一套「键帽 + 说明」语言，字号 11、三级色，
                                  比账号卡的昵称弱一档 → 是"提示"而不是"告示"，不抢视线。 -->
                         <StackPanel Grid.Row="2" Margin="15,0,0,7">
-                            <!-- 第一行：按住 Shift 可多选文件（原有，较短句放上面） -->
+                            <!-- 第一行：按住 Ctrl 可多选文件（较短句放上面） -->
                             <StackPanel Orientation="Horizontal">
                                 <TextBlock Text="按住" FontSize="11" VerticalAlignment="Center"
                                            Foreground="{DynamicResource TextTertiaryBrush}"/>
@@ -241,7 +233,7 @@
                                         BorderThickness="1" CornerRadius="6"
                                         Padding="5,0" Margin="4,0" MinWidth="34"
                                         VerticalAlignment="Center">
-                                    <TextBlock Text="Shift" FontSize="11" FontWeight="SemiBold"
+                                    <TextBlock Text="Ctrl" FontSize="11" FontWeight="SemiBold"
                                                HorizontalAlignment="Center"
                                                Foreground="{DynamicResource TextSecondaryBrush}"/>
                                 </Border>
@@ -367,7 +359,7 @@
                         <!-- 页头：标题与副标题之间用 4px（紧凑），整块与下方内容之间 20px。
                              原来是 16px，改成 20px 让"标题区"与"操作区"分层更清楚。 -->
                         <StackPanel Grid.Row="0" Margin="0,0,0,20">
-                            <TextBlock Text="下载" Style="{StaticResource PageTitleText}"/>
+                            <TextBlock Text="网盘" Style="{StaticResource PageTitleText}"/>
                             <TextBlock Text="粘贴分享链接解析，或先登录后在「我的网盘」里选择文件"
                                        Style="{StaticResource TertiaryText}" Margin="0,3,0,0"/>
                         </StackPanel>
@@ -750,10 +742,8 @@
                                         <RowDefinition Height="*"/>
                                         <RowDefinition Height="Auto"/>
                                     </Grid.RowDefinitions>
-                                    <!-- ⚠️ SelectionMode=Extended 本来 Shift+点击 = **连选**（整段区间）。
-                                         用户要求「可以使用 shift 多选，但不是连选」——
-                                         即 Shift+点击只切换**这一个**项的选中态。
-                                         做法见 OnListPreviewMouseDown（拦下 Shift 点击自己处理）。
+                                    <!-- 多选 = **Ctrl+点击**离散切换，WPF SelectionMode=Extended
+                                         的原生行为，不再拦 Shift（原 OnListPreviewMouseDown 已删）。
                                          单击 = 选中，**双击文件夹才进目录**
                                          （OnFileListDoubleClick）。第三方分支 v2.4 曾改成
                                          「单击直接进入」并摘掉本事件，**我们不采纳**那个改动。 -->
@@ -761,7 +751,6 @@
                                              Style="{StaticResource PlainListBox}"
                                              ItemContainerStyle="{StaticResource FileListItem}"
                                              IsTextSearchEnabled="False"
-                                             PreviewMouseLeftButtonDown="OnListPreviewMouseDown"
                                              MouseDoubleClick="OnFileListDoubleClick"
                                              MouseRightButtonUp="OnFileListRightClick">
                                         <ListBox.ContextMenu>
@@ -1013,7 +1002,8 @@
                         </Grid.RowDefinitions>
 
                         <StackPanel Grid.Row="0" Margin="0,0,0,14">
-                            <TextBlock Text="任务" Style="{StaticResource PageTitleText}"/>
+                            <TextBlock Text="下载" Style="{StaticResource PageTitleText}"/>
+                            <!-- 页面标题跟随侧栏改名：侧栏「任务」→「下载」-->
                             <!-- 副标题一行：左边是操作说明（原有），右边小字补一句
                                  「文件需下载部分才可播放」（用户要求「在这个的右边，
                                  用美观的方式增加一行小字」）。
@@ -1033,10 +1023,12 @@
                             </StackPanel>
                             <!-- 任务分类 Tab（参考 Motrix 的任务列表分类）。
                                  原来所有任务混在一个列表里，"哪个失败了"得自己一行行扫。
-                                 4 个分类**共用同一个 TaskList**，只切换 ICollectionView 的过滤器
-                                 （用 TabItem 会需要 4 份列表副本 → 状态不同步）。 -->
+                                 3 个分类**共用同一个 TaskList**，只切换 ICollectionView 的过滤器
+                                 （用 TabItem 会需要 3 份列表副本 → 状态不同步）。
+                                 2026-10-31：按用户要求砍掉「全部」，只剩
+                                 正在下载 / 失败 / 已完成 三类，默认停在「正在下载」。 -->
                             <!-- 2026-10-17：滑块下划线指示器（FilterTabRadio 样式不再自绘下划线，
-                                 指示条长这样 Height=2 的滑块在四个筛选项间滑动） -->
+                                 指示条长这样 Height=2 的滑块在三个筛选项间滑动） -->
                             <Grid Margin="0,16,0,0"
                                   local:SegmentedSlider.IsEnabled="True"
                                   local:SegmentedSlider.Thumb="{x:Reference FilterThumb}">
@@ -1051,22 +1043,17 @@
                                         <ColumnDefinition Width="Auto"/>
                                     </Grid.ColumnDefinitions>
                                     <StackPanel Grid.Column="0" Orientation="Horizontal">
-                                        <RadioButton x:Name="TaskFilterAll" Content="全部"
+                                        <RadioButton x:Name="TaskFilterActive" Content="正在下载"
                                                      GroupName="TaskFilter" IsChecked="True"
                                                      Style="{StaticResource FilterTabRadio}"
                                                      Checked="OnTaskFilterChanged"
-                                                     AutomationProperties.Name="全部任务"/>
-                                        <RadioButton x:Name="TaskFilterActive" Content="进行中"
-                                                     GroupName="TaskFilter"
-                                                     Style="{StaticResource FilterTabRadio}"
-                                                     Checked="OnTaskFilterChanged"
-                                                     AutomationProperties.Name="进行中的任务"/>
+                                                     AutomationProperties.Name="正在下载的任务"/>
                                         <RadioButton x:Name="TaskFilterFailed" Content="失败"
                                                      GroupName="TaskFilter"
                                                      Style="{StaticResource FilterTabRadio}"
                                                      Checked="OnTaskFilterChanged"
                                                      AutomationProperties.Name="失败的任务"/>
-                                        <RadioButton Content="已完成"
+                                        <RadioButton x:Name="TaskFilterDone" Content="已完成"
                                                      GroupName="TaskFilter"
                                                      Style="{StaticResource FilterTabRadio}"
                                                      Checked="OnTaskFilterChanged"
@@ -1081,34 +1068,17 @@
                             </Grid>
                         </StackPanel>
 
-                        <StackPanel Grid.Row="1" Orientation="Horizontal" Margin="0,0,0,12">
+                        <DockPanel Grid.Row="1" Margin="0,0,0,12" LastChildFill="False">
                             <!-- 「暂停全部 / 恢复全部」合并成一个按钮：
                                  图标与文案按当前任务状态自动切换（有在跑的就显示"暂停全部"，
                                  否则显示"恢复全部"），由 UpdatePauseAllButton() 在代码里维护。
                                  「取消全部」按钮按用户要求移除 —— 单个任务的「取消」仍在右键菜单里。 -->
                             <Button x:Name="PauseAllBtn" Click="OnPauseAllOrResume"
                                     Style="{StaticResource ToolButton}"/>
-                            <Button Content="清空已完成" Click="OnClearDone"
-                                    Style="{StaticResource ToolButton}"/>
-                            <Button x:Name="HistoryBtn" Click="OnOpenHistory" Style="{StaticResource ToolButton}">
-                                <StackPanel Orientation="Horizontal">
-                                    <Path Data="{StaticResource IconHistory}" Stretch="Uniform" Width="12"
-                                          Height="12" VerticalAlignment="Center"
-                                          Stroke="{DynamicResource TextSecondaryBrush}" StrokeThickness="1.8"
-                                          StrokeStartLineCap="Round" StrokeEndLineCap="Round"/>
-                                    <TextBlock Text="下载历史" Margin="6,0,0,0" VerticalAlignment="Center"/>
-                                </StackPanel>
-                            </Button>
-                            <Button Click="OnOpenDiagnostics" Style="{StaticResource ToolButton}">
-                                <StackPanel Orientation="Horizontal">
-                                    <Path Data="{StaticResource IconDiagnostics}" Stretch="Uniform" Width="12"
-                                          Height="12" VerticalAlignment="Center"
-                                          Stroke="{DynamicResource TextSecondaryBrush}" StrokeThickness="1.8"
-                                          StrokeStartLineCap="Round" StrokeEndLineCap="Round"/>
-                                    <TextBlock Text="诊断面板" Margin="6,0,0,0" VerticalAlignment="Center"/>
-                                </StackPanel>
-                            </Button>
-                            <!-- 用户要求任务页也能直接打开下载目录（原来只有设置页有） -->
+                            <!-- 「清空已完成」已删（2026-10-31）：完成后不想要的任务右键删除即可；
+                                 失败/取消的任务也留在「失败」页里看原因，不做一键清空。 -->
+                            <!-- 「下载历史」已删（2026-10-31）：失败/已完成两个筛选页本身就是历史；
+                                 诊断面板挪到本行最右（用户要求）。 -->
                             <Button Click="OnOpenOutDir" Style="{StaticResource ToolButton}"
                                     Margin="0" ToolTip="在资源管理器中打开下载目录">
                                 <StackPanel Orientation="Horizontal">
@@ -1120,16 +1090,25 @@
                                     <TextBlock Text="打开下载目录" Margin="6,0,0,0" VerticalAlignment="Center"/>
                                 </StackPanel>
                             </Button>
-                        </StackPanel>
+                            <Button Click="OnOpenDiagnostics" DockPanel.Dock="Right"
+                                    Style="{StaticResource ToolButton}" Margin="0">
+                                <StackPanel Orientation="Horizontal">
+                                    <Path Data="{StaticResource IconDiagnostics}" Stretch="Uniform" Width="12"
+                                          Height="12" VerticalAlignment="Center"
+                                          Stroke="{DynamicResource TextSecondaryBrush}" StrokeThickness="1.8"
+                                          StrokeStartLineCap="Round" StrokeEndLineCap="Round"/>
+                                    <TextBlock Text="诊断面板" Margin="6,0,0,0" VerticalAlignment="Center"/>
+                                </StackPanel>
+                            </Button>
+                        </DockPanel>
 
                         <Grid Grid.Row="2">
                             <!-- 任务列表原来是默认的 SelectionMode=Single（根本多选不了），
-                                 改成 Extended + 同一套 Shift 处理，和文件列表行为一致。 -->
+                                 改成 Extended：多选 = Ctrl+点击（原生离散切换），和文件列表一致。 -->
                             <ListBox x:Name="TaskList" SelectionMode="Extended"
                                      Style="{StaticResource PlainListBox}"
                                      ItemContainerStyle="{StaticResource TaskListItem}"
                                      IsTextSearchEnabled="False"
-                                     PreviewMouseLeftButtonDown="OnListPreviewMouseDown"
                                      MouseRightButtonUp="OnTaskListRightClick"
                                      MouseDoubleClick="OnTaskListDoubleClick">
                                 <ListBox.ContextMenu>
@@ -1252,6 +1231,11 @@
                                                                         <Setter Property="Fill"
                                                                                 Value="{DynamicResource WarningBrush}"/>
                                                                     </DataTrigger>
+                                                                    <DataTrigger Binding="{Binding State}"
+                                                                                 Value="AwaitingResume">
+                                                                        <Setter Property="Fill"
+                                                                                Value="{DynamicResource WarningBrush}"/>
+                                                                    </DataTrigger>
                                                                 </Style.Triggers>
                                                             </Style>
                                                         </Ellipse.Style>
@@ -1313,6 +1297,16 @@
                                                 </Grid.ColumnDefinitions>
                                                 <ItemsControl Grid.Column="0" ItemsSource="{Binding Lanes}"
                                                               VerticalAlignment="Center" Margin="0,0,10,0">
+                                                    <ItemsControl.Style>
+                                                        <Style TargetType="ItemsControl">
+                                                            <Style.Triggers>
+                                                                <!-- 车道只在下载中显示：完成/暂停等状态整块收起（含 10px 边距） -->
+                                                                <DataTrigger Binding="{Binding ShowLanes}" Value="False">
+                                                                    <Setter Property="Visibility" Value="Collapsed"/>
+                                                                </DataTrigger>
+                                                            </Style.Triggers>
+                                                        </Style>
+                                                    </ItemsControl.Style>
                                                     <ItemsControl.ItemsPanel>
                                                         <ItemsPanelTemplate>
                                                             <UniformGrid Rows="1"/>
@@ -1340,8 +1334,17 @@
                                                 </ItemsControl>
                                                 <TextBlock Grid.Column="1" Text="{Binding LaneText}"
                                                            Margin="0,0,12,0" VerticalAlignment="Center"
-                                                           MinWidth="66" FontSize="11"
-                                                           Style="{StaticResource TertiaryText}"/>
+                                                           MinWidth="66" FontSize="11">
+                                                    <TextBlock.Style>
+                                                        <Style TargetType="TextBlock" BasedOn="{StaticResource TertiaryText}">
+                                                            <Style.Triggers>
+                                                                <DataTrigger Binding="{Binding ShowLanes}" Value="False">
+                                                                    <Setter Property="Visibility" Value="Collapsed"/>
+                                                                </DataTrigger>
+                                                            </Style.Triggers>
+                                                        </Style>
+                                                    </TextBlock.Style>
+                                                </TextBlock>
                                                 <ProgressBar Grid.Column="2"
                                                              Style="{StaticResource SlimProgressBar}"
                                                              Value="{Binding Percent}"
@@ -1424,7 +1427,7 @@
                 <TabItem Style="{StaticResource HeadlessTabItem}">
                     <ScrollViewer VerticalScrollBarVisibility="Auto" Padding="0,0,10,0">
                         <!-- 外边距统一 24px（与下载页/任务页一致） -->
-                        <StackPanel Margin="24,24,24,24" MaxWidth="900" HorizontalAlignment="Left">
+                        <StackPanel Margin="24,24,24,24">
 
                             <TextBlock Text="设置" Style="{StaticResource PageTitleText}" Margin="0,0,0,4"/>
                             <TextBlock Text="所有改动即时生效，无需保存"
@@ -1442,7 +1445,10 @@
                                     行对齐会让「矮卡」浪费整行高度（存储卡 100 vs 窗口卡 210），
                                     列堆叠把高度差留在列内消化，两列总高 592 / 575，取大 592。
                                      ════════════════════════════════════════════════════════════ -->
-                                <Grid MaxWidth="980" HorizontalAlignment="Left">
+                                <!-- 2026-10-31：去掉原作者遗留的 MaxWidth="980" + HorizontalAlignment="Left"
+                                     —— 窗口拉宽时内容贴左、右侧空一条大缝；卡片应随窗口自动铺满
+                                     （与下载页/任务页的裸 Grid Margin="24" 行为一致）。 -->
+                                <Grid>
                                     <Grid.ColumnDefinitions>
                                         <ColumnDefinition Width="*"/>
                                         <ColumnDefinition Width="*"/>
@@ -1463,50 +1469,46 @@
 
                                         <Border Grid.Row="0" Grid.Column="0" Style="{StaticResource Card}" Margin="0,0,7,14">
                                             <StackPanel>
-                                                <TextBlock Text="下载与网络" Style="{StaticResource CardTitleText}"
-                                                           FontSize="14" Margin="0,0,0,10"/>
+                                                <StackPanel Orientation="Horizontal" Margin="0,0,0,10">
+                                                    <TextBlock Text="下载与网络" Style="{StaticResource CardTitleText}"
+                                                               FontSize="14"/>
+                                                    <!-- ⚠ 入口：下载注意事项（按钮正下方下浮 Popup，
+                                                         点击外部关闭；图标用 IconWarning（描边几何），
+                                                         照 IconActivity 的 Stroke 写法渲染，
+                                                         别写成 Fill（! 两笔会消失）。 -->
+                                                    <Button Style="{StaticResource IconGhostButton}"
+                                                            Margin="8,0,0,0" VerticalAlignment="Center"
+                                                            Click="OnThreadsHddTip"
+                                                            AutomationProperties.Name="下载注意事项"
+                                                            ToolTip="下载注意事项（机械硬盘用户必读）">
+                                                        <Path Data="{StaticResource IconWarning}" Stretch="Uniform"
+                                                              Width="13" Height="13"
+                                                              Stroke="{DynamicResource TextSecondaryBrush}"
+                                                              StrokeThickness="1.5"
+                                                              StrokeStartLineCap="Round" StrokeEndLineCap="Round"
+                                                              StrokeLineJoin="Round"/>
+                                                    </Button>
+                                                </StackPanel>
 
                                                 <Grid Margin="0,0,0,6">
                                                     <Grid.ColumnDefinitions>
                                                         <ColumnDefinition Width="140"/>
                                                         <ColumnDefinition Width="*"/>
                                                     </Grid.ColumnDefinitions>
-                                                    <TextBlock Text="单文件并发连接数" Style="{StaticResource FieldLabel}"/>
+                                                    <TextBlock Text="连接数上限" Style="{StaticResource FieldLabel}"/>
                                                     <StackPanel Grid.Column="1" Orientation="Horizontal">
                                                         <ComboBox x:Name="ThreadsBox" MaxWidth="340"
                                                                   HorizontalAlignment="Left"
                                                                   Style="{StaticResource AppComboBox}"
                                                                   ItemContainerStyle="{StaticResource AppComboBoxItem}"
                                                                   SelectionChanged="OnSettingChanged">
-                                                            <ComboBoxItem Content="16  — 省网保守"/>
-                                                            <ComboBoxItem Content="32  — 保守，够用"/>
-                                                            <!-- 标注必须与 Settings.Threads 的默认值一致。
-                                                            默认值已按**实测拐点**从 64 改成 256
-                                                            （docs/CDN并发阈值-实测.md：64 路 4.00 MB/s、128 路 7.98、
-                                                            **256 路 13.94 ← 拐点**、512 路 13.31）。
-                                                            ⚠️ 之前这里一直写着"64 — 默认"，与代码默认值不符，会直接误导用户。
-                                                            ⚠️ 512 档：实测略慢于 256（13.31 vs 13.94），但那只是**当时那个时段**的
-                                                            数据（CDN 配额会浮动），所以文案写"可能会更快"而不写死结论。 -->
-                                                            <ComboBoxItem Content="64  — 省网，速度一般"/>
-                                                            <ComboBoxItem Content="128 — 较快"/>
-                                                            <ComboBoxItem Content="256 — 默认，实测最快"/>
-                                                            <ComboBoxItem Content="512 — 上限，可能会更快"/>
+                                                            <ComboBoxItem Content="16"/>
+                                                            <ComboBoxItem Content="32"/>
+                                                            <ComboBoxItem Content="64"/>
+                                                            <ComboBoxItem Content="128"/>
+                                                            <ComboBoxItem Content="256"/>
+                                                            <ComboBoxItem Content="512"/>
                                                         </ComboBox>
-                                                        <!-- ⚠ 入口：机械硬盘（HDD）高并发寻道说明（点开二级窗口）。
-                                                             图标用 IconWarning（描边几何），照 IconActivity 的
-                                                             Stroke 写法渲染，别写成 Fill（! 两笔会消失）。 -->
-                                                        <Button Style="{StaticResource IconGhostButton}"
-                                                                Margin="8,0,0,0" VerticalAlignment="Center"
-                                                                Click="OnThreadsHddTip"
-                                                                AutomationProperties.Name="机械硬盘高并发说明"
-                                                                ToolTip="用机械硬盘下载？点这里看说明">
-                                                            <Path Data="{StaticResource IconWarning}" Stretch="Uniform"
-                                                                  Width="13" Height="13"
-                                                                  Stroke="{DynamicResource TextSecondaryBrush}"
-                                                                  StrokeThickness="1.5"
-                                                                  StrokeStartLineCap="Round" StrokeEndLineCap="Round"
-                                                                  StrokeLineJoin="Round"/>
-                                                        </Button>
                                                     </StackPanel>
                                                 </Grid>
 
@@ -1749,8 +1751,23 @@
 
                                         <Border Grid.Row="1" Grid.Column="1" Style="{StaticResource Card}" Margin="7,0,0,14">
                                             <StackPanel>
-                                                <TextBlock Text="分片与缓存" Style="{StaticResource CardTitleText}"
-                                                           FontSize="14" Margin="0,0,0,10"/>
+                                                <StackPanel Orientation="Horizontal" Margin="0,0,0,10">
+                                                    <TextBlock Text="分片与缓存" Style="{StaticResource CardTitleText}"
+                                                               FontSize="14"/>
+                                                    <!-- ⚠ 入口：与「下载与网络」同款下浮 Popup，见 OnWriteModeHddTip。 -->
+                                                    <Button Style="{StaticResource IconGhostButton}"
+                                                            Margin="8,0,0,0" VerticalAlignment="Center"
+                                                            Click="OnWriteModeHddTip"
+                                                            AutomationProperties.Name="分片与缓存注意事项"
+                                                            ToolTip="写入方式注意事项（机械硬盘用户必读）">
+                                                        <Path Data="{StaticResource IconWarning}" Stretch="Uniform"
+                                                              Width="13" Height="13"
+                                                              Stroke="{DynamicResource TextSecondaryBrush}"
+                                                              StrokeThickness="1.5"
+                                                              StrokeStartLineCap="Round" StrokeEndLineCap="Round"
+                                                              StrokeLineJoin="Round"/>
+                                                    </Button>
+                                                </StackPanel>
 
                                                 <!-- 共写单一文件模式下没有分片/缓存目录，整块隐藏（UpdatePathRowsVisibility 联动） -->
                                                 <StackPanel x:Name="PartsRootRow">
@@ -1801,7 +1818,7 @@
                                                 <!-- 与顶部「分享链接/我的网盘」同构的分段选择（SegmentedSlider 滑块动画）。
                                                      共写 = v2.2.0 旧默认：无分片文件、无合并线程、下完即结束；
                                                      分片 = 2.3.1 方式：可边下边播，收尾有「正在合并分片」环节。 -->
-                                                <Border HorizontalAlignment="Left" CornerRadius="8"
+                                                <Border CornerRadius="8"
                                                         Background="{DynamicResource SurfaceSunkenBrush}"
                                                         Padding="3">
                                                     <Grid local:SegmentedSlider.IsEnabled="True"
@@ -1811,31 +1828,49 @@
                                                                 VerticalAlignment="Stretch"
                                                                 IsHitTestVisible="False"
                                                                 Background="{DynamicResource SurfaceBrush}"/>
-                                                        <StackPanel Orientation="Horizontal">
-                                                            <RadioButton x:Name="WriteModeSegmentedRadio" Content="独立分片（可边下边播）"
+                                                        <!-- 两段等分撑满卡片宽度（原说明文字删除后，
+                                                             控件右侧会留出一截空档，改为 * 列自适应） -->
+                                                        <Grid>
+                                                            <Grid.ColumnDefinitions>
+                                                                <ColumnDefinition Width="*"/>
+                                                                <ColumnDefinition Width="*"/>
+                                                            </Grid.ColumnDefinitions>
+                                                            <RadioButton x:Name="WriteModeSegmentedRadio" Content="独立分片"
+                                                                         Grid.Column="0"
                                                                          GroupName="WriteMode"
                                                                          Checked="OnSettingChanged"
-                                                                         Style="{StaticResource SegmentedRadio}"
-                                                                         Margin="0"/>
-                                                            <RadioButton x:Name="WriteModeSharedRadio" Content="共写单一文件（下完即结束）"
+                                                                         Style="{StaticResource SegmentedRadio}"/>
+                                                            <RadioButton x:Name="WriteModeSharedRadio" Content="单一文件"
+                                                                         Grid.Column="1"
                                                                          GroupName="WriteMode"
                                                                          Checked="OnSettingChanged"
-                                                                         Style="{StaticResource SegmentedRadio}"
-                                                                         Margin="2,0,0,0"/>
-                                                        </StackPanel>
+                                                                         Style="{StaticResource SegmentedRadio}"/>
+                                                        </Grid>
                                                     </Grid>
                                                 </Border>
-                                                <TextBlock Text="共写：所有连接直写同一个文件，下完即完成、无「合并分片」环节；下载中文件含未下载区间，不可边下边播。切换只影响新任务，进行中的任务不受影响。"
-                                                           Style="{StaticResource ProseText}" TextWrapping="Wrap"
-                                                           Margin="0,8,0,0"/>
                                             </StackPanel>
                                         </Border>
 
                                         <Border Grid.Row="2" Grid.Column="1" Style="{StaticResource Card}" Margin="7,0,0,0">
                                             <StackPanel>
-                                                <TextBlock Text="播放器（边下边播用）"
-                                                           Style="{StaticResource CardTitleText}"
-                                                           FontSize="14" Margin="0,0,0,10"/>
+                                                <StackPanel Orientation="Horizontal" Margin="0,0,0,10">
+                                                    <TextBlock Text="播放器（边下边播用）"
+                                                               Style="{StaticResource CardTitleText}"
+                                                               FontSize="14"/>
+                                                    <!-- ⚠ 入口：播放器注意事项（与「下载与网络」同款浮层） -->
+                                                    <Button Style="{StaticResource IconGhostButton}"
+                                                            Margin="8,0,0,0" VerticalAlignment="Center"
+                                                            Click="OnPlayerTip"
+                                                            AutomationProperties.Name="播放器注意事项"
+                                                            ToolTip="播放器注意事项（边下边播用户必读）">
+                                                        <Path Data="{StaticResource IconWarning}" Stretch="Uniform"
+                                                              Width="13" Height="13"
+                                                              Stroke="{DynamicResource TextSecondaryBrush}"
+                                                              StrokeThickness="1.5"
+                                                              StrokeStartLineCap="Round" StrokeEndLineCap="Round"
+                                                              StrokeLineJoin="Round"/>
+                                                    </Button>
+                                                </StackPanel>
                                                 <TextBlock x:Name="PlayerStatusText" TextWrapping="Wrap"
                                                            Style="{StaticResource ProseText}" Margin="0,0,0,10"/>
                                                 <StackPanel Orientation="Horizontal">

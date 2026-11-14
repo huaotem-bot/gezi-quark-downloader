@@ -40,13 +40,20 @@ namespace GeZi.Core.Download
         /// 为什么需要它：<see cref="DownloadJob.CancelJob"/> 只是发一个取消信号，
         /// 而 worker 可能正卡在 ReadAsync 里等数据，要等那次读返回才检查取消标志 ——
         /// 所以状态**不能立即**变成 Cancelled。
-        /// 在这个窗口期里，任务看起来还是"下载中"，用户点「清空已完成」清不掉它，
-        /// 会以为按钮坏了。
+        /// 在这个窗口期里，任务看起来还是"下载中"，用户点取消后它还赖在
+        /// 「正在下载」页不走，会以为取消没生效。
         ///
         /// 由 **UI 层**在调用 CancelJob 之后立即置位；下载器真正退出后，
         /// Core 会回一个 Cancelled 把它覆盖掉。Core 自身不会产生这个状态。
         /// </summary>
         Cancelling,
+
+        /// <summary>
+        /// 「断点还在，等用户点继续」的待续传态（仅 UI 层使用，Core 不会产生）。
+        /// 启动时把「未完成任务」记录直接摆进任务列表（不弹窗）用的占位状态：
+        /// 点 ▶ / 右键「恢复」会重新取链并从断点续传（见 MainWindow.ResumeTask）。
+        /// </summary>
+        AwaitingResume,
     }
 
     /// <summary>任务状态/进度更新事件。</summary>

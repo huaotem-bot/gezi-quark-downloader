@@ -14,6 +14,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Text.RegularExpressions;
 
 namespace GeZi.Core.Support
 {
@@ -176,8 +177,9 @@ namespace GeZi.Core.Support
         }
 
         /// <summary>
-        /// 是不是分片文件。与 Python 版判据一致（<c>.partmeta</c> 或文件名含 <c>.part</c>），
-        /// 另加 C# 版自己的两种：<c>.qmeta</c>（续传元数据）与 <c>meta.json</c>（自定义根目录下）。
+        /// 是不是分片文件。与 Python 版判据一致（<c>.partmeta</c>，或文件名**以
+        /// <c>.part</c>+数字结尾**的旧式分片），另加 C# 版自己的两种：
+        /// <c>.qmeta</c>（续传元数据）与 <c>meta.json</c>（自定义根目录下）。
         /// </summary>
         private static bool IsPartFile(string fullPath)
         {
@@ -187,8 +189,10 @@ namespace GeZi.Core.Support
             if (name.EndsWith(".partmeta", StringComparison.OrdinalIgnoreCase)) return true;
             if (name.EndsWith(".qmeta", StringComparison.OrdinalIgnoreCase)) return true;
             if (name.Equals("meta.json", StringComparison.OrdinalIgnoreCase)) return true;
-            if (name.IndexOf(".part", StringComparison.OrdinalIgnoreCase) >= 0) return true;
-            return false;
+            // 只认 .part 结尾 / .part+数字结尾。此前是“名字里含 .part 就算”，
+            // 会把文件名本身带 .part 的成品一起删（如 game.part12.rar，
+            // 2026-10-31 实际误删过用户 11 个已下完的分卷包）。
+            return Regex.IsMatch(name, @"\.part\d*$", RegexOptions.IgnoreCase);
         }
 
         private static bool SafeIsDir(string path)
